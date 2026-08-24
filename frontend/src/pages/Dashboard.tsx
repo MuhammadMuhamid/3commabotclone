@@ -11,6 +11,7 @@ import {
 import {
   Btn, Badge, StatusDot, LongBadge, Skeleton, toast,
 } from "../components/ui";
+import { Dialog } from "../components/Dialog";
 
 type BotFilter = "all" | "active" | "stopped";
 
@@ -256,26 +257,13 @@ function PartialCloseModal({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    <Dialog
+      open
+      onClose={onClose}
+      title="Partial Close"
+      icon={<Scissors size={15} className="text-[var(--color-accent)]" aria-hidden="true" />}
     >
-      <div className="bg-[var(--color-panel)] border border-[var(--color-border)] rounded-2xl w-full max-w-sm p-6 shadow-2xl">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-5">
-          <div className="flex items-center gap-2">
-            <Scissors size={15} className="text-[var(--color-accent)]" />
-            <h3 className="text-sm font-semibold text-white">Partial Close</h3>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-1 rounded text-[var(--color-muted)] hover:text-white transition-colors"
-          >
-            <X size={15} />
-          </button>
-        </div>
-
+      <>
         {/* Position summary */}
         <div className="bg-[var(--color-panel-2)] rounded-xl p-3 mb-5 text-xs space-y-1.5">
           <div className="flex justify-between">
@@ -318,6 +306,8 @@ function PartialCloseModal({
           max={99}
           value={pct}
           onChange={(e) => setPct(Number(e.target.value))}
+          aria-label="Percentage of the position to close"
+          aria-valuetext={`${pct} percent`}
           className="w-full accent-[var(--color-accent)] mb-1"
         />
         <div className="text-center text-lg font-bold text-[var(--color-accent)] mb-4">
@@ -353,8 +343,8 @@ function PartialCloseModal({
             Close {pct}%
           </Btn>
         </div>
-      </div>
-    </div>
+      </>
+    </Dialog>
   );
 }
 
