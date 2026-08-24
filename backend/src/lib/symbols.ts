@@ -3,7 +3,7 @@ export function normalizeSymbol(raw: string): string {
   let s = raw.trim().toUpperCase();
   const colon = s.lastIndexOf(":");
   if (colon >= 0) s = s.slice(colon + 1);
-  return s.replace(/[\/\-]/g, "");
+  return s.replace(/[/-]/g, "");
 }
 
 /** BTCUSDT -> { base: BTC, quote: USDT } */

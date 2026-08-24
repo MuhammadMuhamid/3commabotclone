@@ -110,7 +110,7 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
     }
 
     // Resolve client
-    let client = trade.bot.exchangeAccountId && trade.bot.exchangeAccount
+    const client = trade.bot.exchangeAccountId && trade.bot.exchangeAccount
       ? clientFromAccount(trade.bot.exchangeAccount)
       : clientFromEnv();
     if (!client) {
