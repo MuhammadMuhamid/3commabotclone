@@ -36,6 +36,52 @@ body {
 
 input, select, textarea, button { font-family: inherit; }
 
+/*
+ * Keyboard focus must be visible.
+ *
+ * Tailwind's preflight removes the browser outline and nothing here replaced
+ * it, so tabbing through the dashboard moved an invisible cursor — across the
+ * buttons that start a bot and close a position at market. `:focus-visible`
+ * rather than `:focus`, so a mouse click leaves no ring behind.
+ */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/*
+ * iOS Safari zooms any focused input whose text is under 16px and never zooms
+ * back out, leaving the page scrolled sideways. The forms here set their own
+ * smaller sizes, so the floor is set explicitly.
+ */
+@media (max-width: 640px) {
+  /*
+   * The `:not()` clauses raise this above Tailwind's `.text-sm` utility.
+   * Written as a bare element selector it loses — (0,0,1) against (0,1,0) — so
+   * the rule reads correctly and does nothing. Measured at 14px on the sibling
+   * platform application before the same fix.
+   */
+  input:not([type="checkbox"]):not([type="radio"]),
+  select:not([multiple]):not([size]),
+  textarea:not([readonly]):not([disabled]) {
+    font-size: 16px;
+  }
+}
+
+/*
+ * Respect a reduced-motion preference. The animations here are a pulsing status
+ * ring and hover tints; nothing is lost by stilling them.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* Custom scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
