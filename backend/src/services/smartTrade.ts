@@ -2,18 +2,27 @@ import { prisma } from "../lib/prisma.js";
 import type { BinanceClient } from "./binance.js";
 import { getTickerPrice, marketSellBase, clientFromAccount, clientFromEnv } from "./binance.js";
 import { recordPairClose } from "../lib/tradeCloseTracker.js";
+import {
+  acquireTradeClose,
+  isTradeClosing as isTradeClosingNow,
+  releaseTradeClose,
+} from "../lib/tradeCloseLock.js";
 import { sendExecutionNotification } from "./push.js";
 
 // F3: Binance charges 0.1% on each side. Factor both into every P&L calculation.
 const BUY_FEE  = 1.001; // effective buy cost multiplier
 const SELL_FEE = 0.999; // effective sell revenue multiplier
 
-// Per-trade lock: prevents TP/SL and manual-close from double-selling simultaneously
-const closingTrades = new Set<string>();
-
-export function isTradeClosing(tradeId: string): boolean {
-  return closingTrades.has(tradeId);
-}
+/*
+ * BOT-005: the lock moved to `lib/tradeCloseLock.ts`.
+ *
+ * It used to live here, and this file was the ONLY one that acquired it — the
+ * webhook sell path and both dashboard close paths merely read
+ * `isTradeClosing`, which reports whether someone else holds it without
+ * preventing you from proceeding. Moving it out means no caller has to import
+ * the TP/SL monitor to take it, which is why three of the four never did.
+ */
+export { isTradeClosing } from "../lib/tradeCloseLock.js";
 
 /** Net unrealized P&L after accounting for both buy and sell fees. */
 export function calcUnrealizedPnl(
@@ -129,7 +138,9 @@ export async function checkTakeProfitStopLoss(): Promise<void> {
     // F5: bot is null when the parent bot was deleted — skip TP/SL but still refresh PnL if possible
     if (!bot) continue;
 
-    if (closingTrades.has(trade.id)) continue;
+    // Cheap pre-check so a trade another path is already closing is skipped
+    // before any Binance call. The authoritative acquire happens below.
+    if (isTradeClosingNow(trade.id)) continue;
 
     let client: BinanceClient | undefined;
     if (bot.exchangeAccountId) {
@@ -163,8 +174,7 @@ export async function checkTakeProfitStopLoss(): Promise<void> {
 
     if (!hitTp && !hitSl) continue;
 
-    if (closingTrades.has(trade.id)) continue;
-    closingTrades.add(trade.id);
+    if (!acquireTradeClose(trade.id)) continue;
 
     try {
       const fresh = await prisma.smartTrade.findUnique({ where: { id: trade.id } });
@@ -173,12 +183,44 @@ export async function checkTakeProfitStopLoss(): Promise<void> {
       // Fetch prior partial closes so their P&L is included in the final total
       const partials = await prisma.partialClose.findMany({ where: { tradeId: trade.id } });
 
-      const sellResult = await marketSellBase(client, trade.pair, trade.quantity);
+      /*
+       * BOT-018: sell what the trade holds NOW.
+       *
+       * This re-fetched `fresh` and then used `trade.quantity` and
+       * `trade.quoteSpent` from the snapshot taken at the top of the loop. A
+       * partial close landing in between made both figures stale, so the sell
+       * asked for more base asset than remained (silently capped, leaving the
+       * trade marked closed with dust behind) and the P&L was computed against
+       * the wrong cost basis. The re-fetch was already there; it just was not
+       * used.
+       */
+      const sellResult = await marketSellBase(client, trade.pair, fresh.quantity, {
+        idempotencyScope: `tpsl:${trade.id}:${hitTp ? "tp" : "sl"}`,
+      });
       const { pnlUsdt, pnlPct } = calcFinalClosePnl(
         sellResult.cummulativeQuoteQty,
-        trade.quoteSpent,
+        fresh.quoteSpent,
         partials
       );
+
+      // BOT-006: a close that did not cover the position leaves the trade OPEN
+      // rather than marking it closed with the remainder stranded.
+      if (sellResult.executedQty < fresh.quantity * 0.999) {
+        const remaining = fresh.quantity - sellResult.executedQty;
+        await prisma.smartTrade.update({
+          where: { id: trade.id },
+          data: {
+            quantity: Math.max(0, remaining),
+            quoteSpent: Math.max(0, fresh.quoteSpent * (remaining / fresh.quantity)),
+            currentPrice: sellResult.avgPrice,
+          },
+        });
+        console.error(
+          `[tpsl] ${trade.pair}: close filled ${sellResult.executedQty} of ${fresh.quantity}; ` +
+          `trade ${trade.id} remains OPEN with ${remaining} outstanding`
+        );
+        continue;
+      }
 
       await prisma.smartTrade.update({
         where: { id: trade.id },
@@ -192,7 +234,7 @@ export async function checkTakeProfitStopLoss(): Promise<void> {
         },
       });
       // Record close so stale SELL webhooks don't close the next trade on this pair
-      if (trade.botId) recordPairClose(trade.botId, trade.pair);
+      if (trade.botId) await recordPairClose(trade.botId, trade.pair);
       void sendExecutionNotification({
         side: "sell", symbol: trade.pair, quantity: sellResult.executedQty,
         quoteAmount: sellResult.cummulativeQuoteQty, price: sellResult.avgPrice,
@@ -201,7 +243,7 @@ export async function checkTakeProfitStopLoss(): Promise<void> {
     } catch (e) {
       console.error("TP/SL close failed", trade.id, e);
     } finally {
-      closingTrades.delete(trade.id);
+      releaseTradeClose(trade.id);
     }
   }
 }

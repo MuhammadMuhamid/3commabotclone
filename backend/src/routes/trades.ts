@@ -1,7 +1,8 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { isTradeClosing, calcRealizedPnl, calcFinalClosePnl } from "../services/smartTrade.js";
+import { calcRealizedPnl, calcFinalClosePnl } from "../services/smartTrade.js";
+import { acquireTradeClose, isTradeClosing, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import { marketSellBase, resolveSellQuantity, clientFromAccount, clientFromEnv } from "../services/binance.js";
 import { sendExecutionNotification } from "../services/push.js";
 
@@ -64,10 +65,19 @@ tradesRouter.post("/:id/close", async (req, res) => {
         error: "This trade's bot was deleted. Close the position directly on Binance.",
       });
     }
+    /*
+     * BOT-005: this checked `isTradeClosing` read-only, which reports whether
+     * someone else holds the lock without preventing this path proceeding. A
+     * dashboard close racing the TP/SL monitor issued two market sells.
+     *
+     * `processWebhook` acquires the lock itself for its sell branch, so the
+     * check here is a fast, informative 409 rather than the guarantee — the
+     * guarantee is inside `processWebhook`.
+     */
     if (isTradeClosing(trade.id)) {
       return res
         .status(409)
-        .json({ error: "Trade is already being closed by TP/SL monitor. Please wait." });
+        .json({ error: "Trade is already being closed. Please wait." });
     }
     const { processWebhook } = await import("../services/webhook.js");
     const result = await processWebhook(
@@ -105,10 +115,17 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
         error: "This trade's bot was deleted. Close the position directly on Binance.",
       });
     }
-    if (isTradeClosing(trade.id)) {
+    /*
+     * BOT-005: hold the lock across the whole read-sell-write sequence, not
+     * just check it. This path reads the quantity, sells, then writes the
+     * reduced quantity back — a TP/SL close landing in between would sell the
+     * same base asset twice and, because a sell is capped against the shared
+     * WALLET balance, could eat another bot's position in the same asset.
+     */
+    if (!acquireTradeClose(trade.id)) {
       return res.status(409).json({ error: "Trade is being closed. Please wait." });
     }
-
+    try {
     // Resolve client
     const client = trade.bot.exchangeAccountId && trade.bot.exchangeAccount
       ? clientFromAccount(trade.bot.exchangeAccount)
@@ -121,7 +138,9 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
     const requestedQty = trade.quantity * (pct / 100);
     const sellQty = await resolveSellQuantity(client, trade.pair, requestedQty);
 
-    const orderResult = await marketSellBase(client, trade.pair, sellQty);
+    const orderResult = await marketSellBase(client, trade.pair, sellQty, {
+      idempotencyScope: `partial:${trade.id}:${pct}`,
+    });
 
     // Proportional cost of the slice being sold
     const proportionalCost = trade.quoteSpent * (sellQty / trade.quantity);
@@ -188,6 +207,11 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
     }).catch((e) => console.error("Partial-close notification failed", e));
 
     res.json({ partial, trade: updatedTrade });
+    } finally {
+      // A leaked lock makes the trade permanently uncloseable, which is worse
+      // than the double sell it prevents.
+      releaseTradeClose(trade.id);
+    }
   } catch (e) {
     if (e instanceof z.ZodError) {
       return res.status(400).json({ error: e.errors[0]?.message ?? "Invalid input" });
