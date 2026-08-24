@@ -68,17 +68,48 @@ function tradingViewSetup(): object {
   };
 }
 
+/**
+ * A webhook secret is the ONLY authentication on the order-placing endpoint:
+ * anyone holding it can cause real Binance Spot orders on this account. It must
+ * not be handed out casually.
+ *
+ * `mapBot` used to attach `entryWebhookJson` and `exitWebhookJson` — both
+ * containing the plaintext secret — to every bot in the list response, which
+ * the dashboard polls every 15 seconds. The frontend never read those fields
+ * from the list. So the secret was broadcast hundreds of times an hour, into
+ * every proxy log and browser cache along the way, for nothing.
+ *
+ * Now: the list masks it. The single-bot endpoint serves it only when the
+ * caller explicitly asks (`GET /api/bots/:id?reveal=1`), which is what the
+ * Reveal control in the UI does.
+ */
+export function maskSecret(secret: string): string {
+  if (secret.length <= 8) return "*".repeat(secret.length);
+  return `${secret.slice(0, 4)}${"*".repeat(secret.length - 8)}${secret.slice(-4)}`;
+}
+
 function mapBot(
   b: Awaited<ReturnType<typeof prisma.signalBot.findMany>>[0],
-  extra?: Record<string, unknown>
+  extra?: Record<string, unknown>,
+  opts: { reveal?: boolean } = {}
 ) {
+  const reveal = opts.reveal === true;
+  const { webhookSecret, ...rest } = b;
   return {
-    ...b,
+    ...rest,
     pairs: JSON.parse(b.pairs) as string[],
     maxInvestmentLabel: formatInvestmentLabel(b.maxInvestmentPct, b.maxInvestmentUnit),
     webhookUrl: webhookUrl(),
-    entryWebhookJson: entryJson(b.webhookSecret),
-    exitWebhookJson: exitJson(b.webhookSecret),
+    webhookSecret: reveal ? webhookSecret : maskSecret(webhookSecret),
+    secretRevealed: reveal,
+    // The ready-to-paste TradingView payloads embed the secret, so they exist
+    // only in a revealed response.
+    ...(reveal
+      ? {
+          entryWebhookJson: entryJson(webhookSecret),
+          exitWebhookJson: exitJson(webhookSecret),
+        }
+      : {}),
     tradingViewSetup: tradingViewSetup(),
     ...extra,
   };
@@ -158,7 +189,13 @@ botsRouter.get("/:id", async (req, res) => {
     include: { exchangeAccount: { select: { id: true, name: true } } },
   });
   if (!bot) return res.status(404).json({ error: "Not found" });
-  res.json(mapBot(bot));
+  // The secret is served only on an explicit request, which is what the
+  // dashboard's Reveal control sends. Routine reads get the masked form.
+  const reveal = req.query.reveal === "1" || req.query.reveal === "true";
+  if (reveal) {
+    console.warn(`[audit] webhook secret revealed for bot ${bot.id}`);
+  }
+  res.json(mapBot(bot, undefined, { reveal }));
 });
 
 botsRouter.post("/", async (req, res) => {
@@ -199,13 +236,19 @@ botsRouter.post("/", async (req, res) => {
     },
     include: { exchangeAccount: { select: { id: true, name: true } } },
   });
+  // The creation response is the one place the secret is genuinely needed
+  // unprompted: it is the only moment the operator has to copy it out.
   res.status(201).json(
-    mapBot(bot, {
-      totalProfit: 0,
-      activeSmartTrades: 0,
-      signalCount: 0,
-      tradingSince: bot.createdAt,
-    })
+    mapBot(
+      bot,
+      {
+        totalProfit: 0,
+        activeSmartTrades: 0,
+        signalCount: 0,
+        tradingSince: bot.createdAt,
+      },
+      { reveal: true }
+    )
   );
 });
 

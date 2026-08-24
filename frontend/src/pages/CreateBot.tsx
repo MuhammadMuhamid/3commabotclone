@@ -34,8 +34,10 @@ export default function CreateBot() {
   };
 
   if (created) {
-    const entryJson = JSON.stringify(created.entryWebhookJson, null, 2);
-    const exitJson  = JSON.stringify(created.exitWebhookJson, null, 2);
+    // The creation response is the one place the secret is served unprompted:
+    // this is the only moment the operator has to copy it out.
+    const entryJson = JSON.stringify(created.entryWebhookJson ?? {}, null, 2);
+    const exitJson  = JSON.stringify(created.exitWebhookJson ?? {}, null, 2);
     return (
       <div className="p-6 max-w-3xl mx-auto">
         {/* Success banner */}

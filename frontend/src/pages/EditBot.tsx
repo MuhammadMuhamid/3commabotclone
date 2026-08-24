@@ -36,6 +36,11 @@ export default function EditBot() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // The webhook secret is masked in every routine response, so the
+  // ready-to-paste JSON has to be fetched deliberately. See BOT-016.
+  const [revealed, setRevealed] = useState<SignalBot | null>(null);
+  const [revealing, setRevealing] = useState(false);
+  const [revealError, setRevealError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -88,8 +93,20 @@ export default function EditBot() {
     );
   }
 
+  const reveal = async () => {
+    if (!id) return;
+    setRevealing(true);
+    setRevealError(null);
+    try {
+      setRevealed(await api.bots.reveal(id));
+    } catch (e) {
+      setRevealError(e instanceof Error ? e.message : "Could not load the webhook secret");
+    } finally {
+      setRevealing(false);
+    }
+  };
+
   if (saved) {
-    const entryJson = JSON.stringify(saved.entryWebhookJson, null, 2);
     return (
       <div className="p-6 max-w-3xl mx-auto">
         <div className="flex items-center gap-3 mb-6 p-4 rounded-xl bg-[var(--color-success-dim)] border border-[var(--color-success)]/30">
@@ -108,7 +125,39 @@ export default function EditBot() {
           side={<Webhook size={16} className="text-[var(--color-muted)] mt-2" />}
         >
           <CopyField label="Webhook URL" value={saved.webhookUrl} />
-          <CopyField label="Entry signal JSON" value={entryJson} />
+
+          {revealed?.entryWebhookJson ? (
+            <>
+              <CopyField
+                label="Entry signal JSON"
+                value={JSON.stringify(revealed.entryWebhookJson, null, 2)}
+              />
+              {revealed.exitWebhookJson && (
+                <CopyField
+                  label="Exit signal JSON"
+                  value={JSON.stringify(revealed.exitWebhookJson, null, 2)}
+                />
+              )}
+              <p className="text-[11px] text-[var(--color-warning)] leading-relaxed">
+                These payloads contain the webhook secret — the only
+                authentication on the order-placing endpoint. Do not paste them
+                anywhere but your own TradingView alert.
+              </p>
+            </>
+          ) : (
+            <div>
+              <Btn onClick={reveal} disabled={revealing}>
+                {revealing ? "Loading…" : "Reveal signal JSON"}
+              </Btn>
+              <p className="text-[11px] text-[var(--color-muted)] mt-2 leading-relaxed">
+                The secret is masked by default and served only when you ask for
+                it. Your existing alerts already have it and keep working.
+              </p>
+              {revealError && (
+                <p className="text-[11px] text-[var(--color-danger)] mt-2">{revealError}</p>
+              )}
+            </div>
+          )}
         </Section>
 
         <div className="flex gap-3 justify-end mt-2">
