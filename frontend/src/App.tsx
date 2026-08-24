@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { ToastProvider } from "./components/ui";
 import Dashboard  from "./pages/Dashboard";
@@ -10,6 +11,12 @@ import Login      from "./pages/Login";
 
 export default function App() {
   return (
+    /*
+     * Outside AuthProvider, so a throw in auth bootstrapping is caught too —
+     * that is the failure that would otherwise blank the page before anything
+     * has rendered.
+     */
+    <ErrorBoundary>
     <AuthProvider>
       <ToastProvider />
 
@@ -29,5 +36,6 @@ export default function App() {
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </AuthProvider>
+    </ErrorBoundary>
   );
 }
