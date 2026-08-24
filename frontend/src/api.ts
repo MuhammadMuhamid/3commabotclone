@@ -95,10 +95,18 @@ export type SignalBot = {
   maxActiveSmartTradesEnabled: boolean;
   maxActiveSmartTrades?: number | null;
   status: string;
+  /**
+   * MASKED by default (`abcd****wxyz`). The full value is served only from
+   * `GET /api/bots/:id?reveal=1` and from the creation response, because it is
+   * the only authentication on the order-placing endpoint. Check
+   * `secretRevealed` before treating it as usable.
+   */
   webhookSecret: string;
+  secretRevealed: boolean;
   webhookUrl: string;
-  entryWebhookJson: object;
-  exitWebhookJson: object;
+  /** Present only in a revealed response — these embed the secret. */
+  entryWebhookJson?: object;
+  exitWebhookJson?: object;
   entryEnabled: boolean;
   entryVolumePct: number;
   entryOrderType: string;
@@ -173,10 +181,16 @@ export const api = {
     status: () =>
       request<{ setup: boolean }>("/api/auth/status"),
 
-    register: (username: string, password: string) =>
+    /**
+     * Creating the first account requires the out-of-band SETUP_TOKEN from the
+     * server environment. Registration used to be open to the internet until
+     * an account existed; no route is tenant-scoped, so a stranger who got
+     * there first would have been a co-admin with access to the exchange keys.
+     */
+    register: (setupToken: string, username: string, password: string) =>
       request<{ message: string }>("/api/auth/register", {
         method: "POST",
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ setupToken, username, password }),
       }),
 
     login: (username: string, password: string) =>
@@ -219,6 +233,12 @@ export const api = {
   bots: {
     list:   ()                   => request<BotListItem[]>("/api/bots"),
     get:    (id: string)         => request<SignalBot>(`/api/bots/${id}`),
+    /**
+     * Explicitly asks for the plaintext webhook secret and the ready-to-paste
+     * TradingView payloads. Call this only from a deliberate user action; the
+     * server logs every reveal.
+     */
+    reveal: (id: string)         => request<SignalBot>(`/api/bots/${id}?reveal=1`),
     create: (body: unknown)      => request<SignalBot>("/api/bots", { method: "POST", body: JSON.stringify(body) }),
     remove: (id: string)         => request<void>(`/api/bots/${id}`, { method: "DELETE" }),
     toggle: (id: string)         => request<SignalBot>(`/api/bots/${id}/toggle`, { method: "POST" }),

@@ -21,6 +21,9 @@ export default function Login() {
   const [confirmPw, setConfirmPw] = useState("");
   const [showPw, setShowPw] = useState(false);
 
+  // First-run registration token, supplied out of band by the server operator.
+  const [registerToken, setRegisterToken] = useState("");
+
   // MFA fields
   const [setupToken, setSetupToken] = useState("");
   const [qrCode, setQrCode] = useState("");
@@ -52,9 +55,9 @@ export default function Login() {
     if (password.length < 12) { err("Password must be at least 12 characters"); return; }
     setBusy(true); setError(null);
     try {
-      await api.auth.register(username, password);
+      await api.auth.register(registerToken, username, password);
       setStep("credentials");
-      setPassword(""); setConfirmPw("");
+      setPassword(""); setConfirmPw(""); setRegisterToken("");
     } catch (e) {
       err(e instanceof Error ? e.message : "Registration failed");
     }
@@ -171,6 +174,24 @@ export default function Login() {
           {/* ── Register ───────────────────────────────────────────────── */}
           {step === "register" && (
             <form onSubmit={handleRegister} className="space-y-4">
+              <Field label="Setup token" icon={<Shield size={14} />}>
+                <input
+                  type="password"
+                  value={registerToken}
+                  onChange={(e) => setRegisterToken(e.target.value)}
+                  placeholder="SETUP_TOKEN from the server environment"
+                  autoComplete="off"
+                  spellCheck={false}
+                  required
+                  className="auth-input"
+                />
+              </Field>
+              <p className="text-[10px] text-[var(--color-muted)] leading-relaxed">
+                The server operator sets <code>SETUP_TOKEN</code> in the backend
+                environment and passes it to you out of band. It is needed once,
+                to create this first account, and should be removed afterwards.
+              </p>
+
               <Field label="Username" icon={<KeyRound size={14} />}>
                 <input
                   type="text"

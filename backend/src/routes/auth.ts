@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 import { authenticator } from "otplib";
 import QRCode from "qrcode";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { encrypt, decrypt } from "../lib/crypto.js";
 import { signAccess, signSetup, verifySetup } from "../lib/jwt.js";
@@ -110,7 +111,22 @@ authRouter.get("/status", async (_req, res) => {
 // ─── POST /api/auth/register ──────────────────────────────────────────────────
 // Creates the one-and-only admin account. Locked once a user exists.
 
+class RegistrationClosed extends Error {}
+
+/** Length-tolerant constant-time comparison. */
+function timingSafeCompare(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) {
+    // Still do the work, so length is not leaked through timing.
+    crypto.timingSafeEqual(ab, ab);
+    return false;
+  }
+  return crypto.timingSafeEqual(ab, bb);
+}
+
 const registerSchema = z.object({
+  setupToken: z.string().min(1, "Setup token is required"),
   username: z
     .string()
     .min(3, "Username must be at least 3 characters")
@@ -123,9 +139,28 @@ const registerSchema = z.object({
 });
 
 authRouter.post("/register", async (req, res) => {
-  const count = await prisma.user.count();
-  if (count > 0) {
-    res.status(409).json({ error: "Registration is closed — an admin account already exists." });
+  /*
+   * Two problems the old shape had.
+   *
+   * 1. It was open to the internet until an account existed. Ports 80 and 443
+   *    are opened to 0.0.0.0/0 by the provisioning script, and the hostname is
+   *    published by certificate transparency the moment certbot runs — so the
+   *    window between "server is up" and "owner has registered" was a race
+   *    against strangers. No route is tenant-scoped, so a second account would
+   *    have been a co-admin with access to the exchange keys.
+   *
+   * 2. `count()` then `create()` was a TOCTOU race: two concurrent requests
+   *    both read zero and both created a user.
+   *
+   * Fixed by requiring an out-of-band SETUP_TOKEN, and by making the database
+   * enforce single-account-ness inside a transaction.
+   */
+  if (!config.setupToken) {
+    res.status(503).json({
+      error:
+        "Registration is disabled: SETUP_TOKEN is not configured. Set it in the " +
+        "server environment, restart, then register with it. Remove it afterwards.",
+    });
     return;
   }
 
@@ -141,8 +176,33 @@ authRouter.post("/register", async (req, res) => {
     return;
   }
 
+  // Constant-time, and checked before the account count so an unauthenticated
+  // caller cannot use the response to learn whether setup has happened.
+  if (!timingSafeCompare(body.setupToken, config.setupToken)) {
+    console.warn("[auth] registration attempt with an incorrect setup token");
+    res.status(401).json({ error: "Invalid setup token" });
+    return;
+  }
+
   const passwordHash = await bcrypt.hash(body.password, 12);
-  await prisma.user.create({ data: { username: body.username, passwordHash } });
+  try {
+    await prisma.$transaction(async (tx) => {
+      const count = await tx.user.count();
+      if (count > 0) throw new RegistrationClosed();
+      await tx.user.create({ data: { username: body.username, passwordHash } });
+    });
+  } catch (e) {
+    if (e instanceof RegistrationClosed) {
+      res.status(409).json({ error: "Registration is closed — an admin account already exists." });
+      return;
+    }
+    // A unique-constraint violation is the same outcome under a concurrent race.
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+      res.status(409).json({ error: "Registration is closed — an admin account already exists." });
+      return;
+    }
+    throw e;
+  }
   res.status(201).json({ message: "Account created. Please log in and complete MFA setup." });
 });
 
