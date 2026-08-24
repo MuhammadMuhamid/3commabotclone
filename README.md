@@ -4,6 +4,61 @@ Full-stack signal trading bot: connect **Binance Spot**, receive **TradingView w
 
 > **Risk:** Live trading can lose money. Start with `DRY_RUN=true` and tiny position sizes.
 
+## What this repository is, and what it is not
+
+This is the **execution** half of a two-repository system.
+
+| | This repository | Platform (`MuhammadMuhamid/pythoncryptobacktesingsystems`) |
+|---|---|---|
+| Decides when to trade | no | **yes** |
+| Places exchange orders | **yes** | no |
+| Holds Binance API keys | yes, AES-256-GCM encrypted at rest | **never** |
+
+It receives buy/sell instructions over HTTP from two independent senders — the
+platform's live runner, and TradingView alerts — and turns them into Binance
+Spot market orders. It has no opinion about whether an instruction is a good
+idea.
+
+**Keeping exchange credentials in this process alone is the point of the split.**
+Do not move credential handling into the platform, and do not merge the two
+repositories.
+
+The cross-repository payload contract is documented in the platform repository
+at `docs/WEBHOOK-CONTRACT.md`. Change it on both sides, and in that document, in
+one commit. Both repositories carry a contract test that mirrors the other side;
+this one is `backend/tests/webhookContract.test.ts`.
+
+### Repository status
+
+`MuhammadMuhamid/3commabotclone` is authoritative for the bot. There is no
+superseded duplicate of this repository.
+
+## Local quality gates
+
+Neither gate needs a network, an exchange, or a database with real data.
+
+```bash
+cd backend
+npm ci
+npx prisma generate
+npm run lint        # eslint, zero warnings tolerated
+npm run typecheck   # tsc --noEmit
+npm test            # node:test against fixtures; DRY_RUN forced true
+npm run build
+npm run verify      # all of the above, in order
+
+cd ../frontend
+npm ci
+npm run lint && npm run typecheck && npm test && npm run build
+```
+
+`npm test` loads `backend/tests/test.env`, which holds non-secret fixture values
+only. Never point it at a real database or a real key.
+
+`scripts/ci/scan-secrets.sh` runs in CI and fails the build on
+credential-shaped literals in tracked source. It reports file and line only,
+never the value.
+
 ## Project layout
 
 ```
