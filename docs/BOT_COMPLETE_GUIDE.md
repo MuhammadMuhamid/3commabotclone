@@ -1092,23 +1092,37 @@ signature fixture above are what a replacement would have to satisfy.
 
 ## 13. Known gaps and TODOs
 
-Issues discovered during codebase audit (not necessarily bugs, but important for AI/operators):
+**Rewritten 2026-08-24.** The table this replaces listed thirteen gaps, of which
+seven had been fixed and were still being described as open — which is the same
+failure mode the audit found across this codebase's documentation. Each row
+below was re-checked against this checkout.
+
+### Still true
 
 | # | Area | Gap |
 |---|------|-----|
-| 1 | **Webhook** | `exitEnabled` is stored but **never checked** before processing sells. |
-| 2 | **Binance** | `entryOrderType: "limit"` in UI/DB; only **MARKET** orders implemented. |
-| 3 | **Direction** | `short` and `reversal` in UI; spot short selling **not fully implemented** (README notes futures later). |
-| 4 | **Sizing** | `pct_trade` / `usdt_trade` labels imply per-trade split; `calcOrderQuoteUsdt` does **not** divide by active trade count. |
-| 5 | **Security** | No API authentication on REST routes; anyone with network access can manage bots if exposed. Webhook relies on secret only. |
-| 6 | **WebhookLog** | Success path does not update log row from `processing` to `ok`. |
-| 7 | **Dedupe** | In-memory only; restarts clear cache; multiple backend replicas would not share dedupe. |
-| 8 | **TP/SL close** | `checkTakeProfitStopLoss` updates `closedReason` but may not set final `pnlUsdt`/`pnlPct` on close (sell happens, partial DB update). |
-| 9 | **Dashboard** | Trade row always shows "MY BINANCE" hardcoded, not actual exchange account name. |
-| 10 | **Docs** | Root `README.md` references `deploy/AWS.md` (exists); `remote-deploy.sh` hardcodes Mac path `/Users/muhammadmuhamid/Projects/tradingbot/`. |
-| 11 | **Pine** | `pine-exit-webhook.snippet.pine` marked deprecated; use `SR-Trend-v5-custom-webhook-ALERTS.pine`. |
-| 12 | **Tests** | No automated test suite in repository. |
-| 13 | **Webhook logs UI** | No frontend page for `WebhookLog` — DB only. |
+| 1 | **Binance** | `entryOrderType: "limit"` is accepted and stored; only **MARKET** orders are implemented. The form warns about it; the backend does not refuse it. |
+| 2 | **Sizing** | `pct_trade` / `usdt_trade` read as "per SmartTrade" and do **not** divide by the number of open trades. `*_bot` units DO aggregate across open positions (`BOT-013`); the `*_trade` units are per-signal by design, and the label is the ambiguity. |
+| 3 | **Money precision** | Every monetary column is a SQLite `REAL`. Writes are quantized to 8 decimal places and sums are compensated, which bounds the error; it is not exact decimal arithmetic (`BOT-023`). |
+| 4 | **Exchange SDK** | `binance-api-node@0.12.9` is unmaintained and signs every order. Pinned, surface-bounded and CI-asserted; replacing it needs Binance testnet credentials (`BOT-039`). |
+| 5 | **Protective orders** | The exchange-native stop adapter is **disabled by default**. Until it is enabled, protection is a 30-second in-process poll: a position is unprotected while this process is down, and a gap through the stop fills at the next tick (`BOT-017`). |
+| 6 | **Webhook logs UI** | No frontend page for `WebhookLog`. Database only. |
+| 7 | **Dedupe across replicas** | The close lock is in-process. Two backend replicas would not share it, and nothing prevents running two. |
+| 8 | **Pine** | `deploy/pine-exit-webhook.snippet.pine` is deprecated; use `deploy/SR-Trend-v5-custom-webhook-ALERTS.pine`. |
+
+### Fixed since the audit, and no longer true
+
+| Was | Now |
+|---|---|
+| `exitEnabled` stored but never checked before a sell | Enforced in `webhook.ts`; `skipExitCheck` exists only for a dashboard manual close (`BOT-015`) |
+| `short` and `reversal` offered in the UI with no caveat | Only `long` is accepted; the column keeps existing values readable (`BOT-012`) |
+| No API authentication on REST routes | `requireAuth` on every non-webhook route, plus an out-of-band setup token for first registration |
+| Dedupe in memory only, cleared by a restart | Durable `pairCloseMark` rows with a TTL (`BOT-019`) |
+| TP/SL close set `closedReason` without the final P&L | The close writes `status`, `closedAt`, `closedReason`, `currentPrice`, `pnlUsdt` and `pnlPct` in one update |
+| `remote-deploy.sh` hardcoded a Mac path | Derived from the script's own location, and `DRY_RUN` is no longer forced to `false` (`BOT-030`) |
+| No automated test suite | 122 tests across nine files, run by `npm test` with no network and no database |
+| Dashboard showed a hardcoded exchange name | The account's own name is shown |
+
 
 ---
 
