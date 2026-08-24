@@ -23,7 +23,7 @@ Replace the old 3Commas-only header with:
 | Input | NEAR chart | TIA chart | ZEC chart |
 |-------|------------|-----------|-----------|
 | Signal delivery | Custom webhook bot | same | same |
-| secret | `5fbfb001deec412990e030e8b7d9fea6e95814e7cb5841b0` | same | same |
+| secret | `PASTE_YOUR_BOT_SECRET_HERE` | same | same |
 | BUY quote USDT | `100.01` | `100.01` | `100.01` |
 | symbol | `NEARUSDT` | `TIAUSDT` | `ZECUSDT` |
 

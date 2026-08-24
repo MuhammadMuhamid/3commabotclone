@@ -239,8 +239,7 @@ tradingbot/
     ├── SR-Trend-v5-PINE-PATCH.md
     ├── SR-Trend-v5-custom-webhook-ALERTS.pine
     ├── pine-exit-webhook.snippet.pine  # deprecated pointer
-    ├── cloudshell-launch.sh
-    └── PASTE_IN_CLOUDSHELL.txt
+    └── cloudshell-launch.sh
 ```
 
 **Intentionally excluded from documentation depth:** `node_modules/`, `backend/dist/`, `frontend/dist/`, lockfiles.

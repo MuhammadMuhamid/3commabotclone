@@ -10,7 +10,7 @@
 //
 // Pine inputs (1 General):
 //   Signal delivery = Custom webhook bot
-//   secret  = 5fbfb001deec412990e030e8b7d9fea6e95814e7cb5841b0  (full line)
+//   secret  = PASTE_YOUR_BOT_SECRET_HERE  (copy it from Settings on the bot dashboard)
 //   symbol  = NEARUSDT / TIAUSDT / ZECUSDT per chart
 //   BUY quote USDT = 100.01  (or null in TV message — bot uses ~100 from settings)
 
