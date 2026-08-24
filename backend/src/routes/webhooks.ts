@@ -1,13 +1,8 @@
 import { Router } from "express";
 import { processWebhook } from "../services/webhook.js";
-import { z } from "zod";
+import { positionStatusSchema, webhookSchema } from "./webhookSchema.js";
 
 export const webhooksRouter = Router();
-
-const positionStatusSchema = z.object({
-  secret: z.string().min(32).max(256),
-  symbols: z.array(z.string().min(3).max(40)).min(1).max(100),
-}).strict();
 
 /**
  * Authenticated position-state endpoint for the local strategy runner.
@@ -37,27 +32,6 @@ webhooksRouter.post("/signal_bots/status", async (req, res) => {
     positions: Object.fromEntries(symbols.map((symbol) => [symbol, activeSet.has(symbol) ? "long" : "flat"])),
   });
 });
-
-const webhookSchema = z.object({
-  secret: z.string().min(32).max(256),
-  action: z.string().min(1).max(40),
-  symbol: z.string().min(3).max(40).optional(),
-  tv_instrument: z.string().min(3).max(40).optional(),
-  quote_order_qty: z.number().finite().positive().max(1_000_000).nullable().optional(),
-  quantity: z.number().finite().positive().max(1_000_000_000).nullable().optional(),
-  sell_percent: z.number().finite().positive().lt(100).nullable().optional(),
-  exit_leg: z.enum(["tp1", "tp2", "runner", "stop", "signal"]).optional(),
-  dedupe_key: z.string().min(1).max(256).optional(),
-}).strict()
-  .refine((b) => Boolean(b.symbol || b.tv_instrument), {
-    message: "symbol or tv_instrument required",
-  })
-  .refine((b) => !(b.sell_percent != null && b.quantity != null), {
-    message: "Use either sell_percent or quantity, not both",
-  })
-  .refine((b) => b.sell_percent == null || b.action.toLowerCase().includes("sell") || b.action.toLowerCase().includes("exit") || b.action.toLowerCase().includes("close"), {
-    message: "sell_percent is valid only for sell/exit actions",
-  });
 
 webhooksRouter.post("/signal_bots", async (req, res) => {
   try {

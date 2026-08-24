@@ -56,14 +56,14 @@ async function reservePersistentDedupe(key: string, ttlMs: number): Promise<bool
 }
 
 /** TradingView "Order fills" alert with Message {{alert_message}} sends literal placeholder → 401 */
-function isPlaceholderPayload(body: WebhookBody): boolean {
+export function isPlaceholderPayload(body: WebhookBody): boolean {
   const raw = JSON.stringify(body);
   if (raw.includes("{{alert_message}}") || raw.includes("{{strategy.order")) return true;
   if (!body.secret || body.secret === "REPLACE_ME") return true;
   return false;
 }
 
-function tradeEventKey(secret: string, symbol: string, side: "buy" | "sell", leg?: string): string {
+export function tradeEventKey(secret: string, symbol: string, side: "buy" | "sell", leg?: string): string {
   return `trade:${secret}:${symbol}:${side}${leg ? `:${leg}` : ""}`;
 }
 
@@ -81,7 +81,7 @@ export type WebhookBody = {
   dedupe_key?: string;
 };
 
-function resolveAction(action: string): "buy" | "sell" {
+export function resolveAction(action: string): "buy" | "sell" {
   const a = action.toLowerCase().replace(/[\s_-]/g, "");
   if (["buy", "enterlong", "long", "entrylong", "openlong"].includes(a)) return "buy";
   if (
@@ -92,7 +92,7 @@ function resolveAction(action: string): "buy" | "sell" {
   throw new Error(`Unknown action: ${action}`);
 }
 
-function resolveSymbol(body: WebhookBody): string {
+export function resolveSymbol(body: WebhookBody): string {
   const s = body.symbol ?? body.tv_instrument;
   if (!s) throw new Error("symbol or tv_instrument required");
   return normalizeSymbol(s);

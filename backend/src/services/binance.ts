@@ -75,7 +75,7 @@ export async function marketBuyQuote(
   };
 }
 
-function floorToStep(qty: number, step: number): number {
+export function floorToStep(qty: number, step: number): number {
   if (step <= 0) return qty;
   const decimals = Math.max(0, Math.ceil(-Math.log10(step)));
   const floored = Math.floor(qty / step) * step;
