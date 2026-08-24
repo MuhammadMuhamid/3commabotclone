@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { config } from "../config.js";
+import { config, isUsableScryptSalt } from "../config.js";
 
 const ALGO = "aes-256-gcm";
 
@@ -12,19 +12,47 @@ const ALGO = "aes-256-gcm";
  */
 let _cachedKey: Buffer | null = null;
 
+/**
+ * There is deliberately no fallback.
+ *
+ * A `dev-insecure-key` / `dev-insecure-salt-…` pair used to be substituted
+ * whenever either variable was unset, and because the hard configuration check
+ * was gated on `!DRY_RUN` — which defaults to true — the documented first-run
+ * path reached it. Any Binance API key added through Settings in that state was
+ * encrypted under a key derived from two string literals in this repository, so
+ * a copy of `bot.db` was decryptable by anyone holding the source.
+ *
+ * `assertConfig()` refuses to start without real key material, and this throws
+ * if it is ever reached anyway — a decryption failure is recoverable, silently
+ * encrypting a live credential under a published key is not.
+ */
 function deriveKey(): Buffer {
-  const pw = config.encryptionKey || "dev-insecure-key";
-  const saltHex = config.scryptSalt || "dev-insecure-salt-00000000000000";
-
   if (!config.encryptionKey || !config.scryptSalt) {
-    // Only safe in local dev (assertConfig() already printed a warning)
-    return crypto.createHash("sha256").update(pw + saltHex).digest();
+    throw new Error(
+      "ENCRYPTION_KEY and SCRYPT_SALT are required before any secret can be " +
+      "stored or read. See backend/.env.example."
+    );
+  }
+  if (!isUsableScryptSalt(config.scryptSalt)) {
+    throw new Error(
+      "SCRYPT_SALT must be hexadecimal (16-64 characters). Node's " +
+      "Buffer.from(str, \"hex\") truncates silently at the first invalid " +
+      "character, which would leave scrypt unsalted."
+    );
   }
 
-  // Pad or truncate salt hex to exactly 32 hex chars (16 bytes)
-  const saltStr = saltHex.padEnd(32, "0").slice(0, 32);
-  const salt = Buffer.from(saltStr, "hex");
-  return crypto.scryptSync(pw, salt, 32, { N: 16384, r: 8, p: 1 });
+  // The derivation itself is UNCHANGED, padEnd/slice included: altering it
+  // would make every stored API key undecryptable. The validation above
+  // rejects input that would silently lose the salt, rather than normalising
+  // it into a different key.
+  const saltHex = config.scryptSalt.padEnd(32, "0").slice(0, 32);
+  const salt = Buffer.from(saltHex, "hex");
+  return crypto.scryptSync(config.encryptionKey, salt, 32, { N: 16384, r: 8, p: 1 });
+}
+
+/** True when key material is present and valid, so a caller can refuse early. */
+export function canStoreSecrets(): boolean {
+  return config.encryptionKey.length >= 32 && isUsableScryptSalt(config.scryptSalt);
 }
 
 function key(): Buffer {

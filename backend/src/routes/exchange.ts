@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { encrypt } from "../lib/crypto.js";
+import { canStoreSecrets, encrypt } from "../lib/crypto.js";
 import { clientFromAccount, getUsdtBalance, getTotalBalanceUsdt } from "../services/binance.js";
 
 export const exchangeRouter = Router();
@@ -29,6 +29,19 @@ exchangeRouter.post("/", async (req, res) => {
       apiSecret: z.string().min(1),
       testnet: z.boolean().optional(),
     });
+    // Refuse to persist a live exchange credential when key material is
+    // missing or unusable. `assertConfig()` already prevents the server from
+    // starting in that state, but this is the write that would be
+    // unrecoverable: a blob encrypted under the wrong key cannot be read back,
+    // and one encrypted under a *published* key is readable by anyone with the
+    // source (finding X-07).
+    if (!canStoreSecrets()) {
+      return res.status(503).json({
+        error:
+          "Cannot store exchange credentials: ENCRYPTION_KEY and SCRYPT_SALT " +
+          "are not configured. See backend/.env.example.",
+      });
+    }
     const body = schema.parse(req.body);
     const account = await prisma.exchangeAccount.create({
       data: {
