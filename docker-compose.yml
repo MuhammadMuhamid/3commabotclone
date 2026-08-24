@@ -9,6 +9,15 @@ services:
       - bot-data:/app/data
     ports:
       - "127.0.0.1:4000:4000"
+    # `docker compose down -v` destroys bot-data, which holds the ENCRYPTED
+    # Binance API keys and the whole trade history. Back it up first —
+    # `scripts/backup-db.sh` (finding BOT-029).
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:4000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
 
   frontend:
     build:
@@ -16,10 +25,14 @@ services:
       args:
         VITE_API_URL: ""
     restart: unless-stopped
+    # Published on 8080, not 80: the host nginx terminates TLS and proxies to
+    # it. `deploy/nginx-host-ssl.conf` used to proxy to 127.0.0.1:80 — the port
+    # it listens on itself (finding BOT-028).
     ports:
-      - "80:80"
+      - "127.0.0.1:8080:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   bot-data:
