@@ -187,20 +187,27 @@ export function BotFormFields({
         </label>
 
         {/* Direction */}
+        {/*
+          BOT-012: "short" and "reversal" were offered here with no caveat,
+          accepted by the API and stored — while `binance.ts` hardcodes BUY and
+          SELL and the value's only backend consumer was a cosmetic label. A
+          user could configure a short bot, watch it accept signals, and get
+          long positions. Only the implemented direction is offered now, and it
+          says why, in the same way `entryOrderType`'s unimplemented "limit"
+          state is already warned about below.
+        */}
         <label className="block mb-4">
           <span className="text-xs font-medium text-[var(--color-muted)] block mb-1.5 uppercase tracking-wide">
             Direction
           </span>
           <div className="flex gap-1 bg-[var(--color-panel-2)] border border-[var(--color-border)] rounded-xl p-1 w-fit">
-            {(["long", "reversal", "short"] as const).map((d) => (
-              <DirPill
-                key={d}
-                value={d}
-                active={form.direction === d}
-                onClick={() => setForm((f) => ({ ...f, direction: d }))}
-              />
-            ))}
+            <DirPill value="long" active onClick={() => setForm((f) => ({ ...f, direction: "long" }))} />
           </div>
+          <p className="text-[11px] text-[var(--color-muted)] mt-1.5 leading-relaxed">
+            Spot long only. Short and reversal are not implemented — the order
+            side is fixed in the exchange client — so they are no longer offered
+            rather than accepted and ignored.
+          </p>
         </label>
 
         {/* Pairs */}

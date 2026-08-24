@@ -17,6 +17,10 @@ report() { echo "::error file=$1,line=$2::$3"; fail=1; }
 is_allowed() {
   case "$1" in
     */package-lock.json|package-lock.json) return 0 ;;   # npm integrity hashes
+    # CONTRACT_FINGERPRINT is a sha256 digest of this file's own source, used to
+    # detect drift between the two repositories' vendored copies. The module is
+    # import-free and holds no configuration.
+    */contract/webhookContract.ts) return 0 ;;
     *.png|*.jpg|*.jpeg|*.pdf|*.zip|*.gz) return 0 ;;
   esac
   return 1

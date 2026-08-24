@@ -27,8 +27,12 @@ function bot(over: Partial<SignalBot> = {}): SignalBot {
 
 // ── Order sizing ───────────────────────────────────────────────────────────
 
-test("KNOWN DEFECT BOT-003: the shipped defaults spend the entire free USDT balance", () => {
-  assert.equal(calcOrderQuoteUsdt(bot(), 5000), 5000);
+test("BOT-003: a bot configured for 100 % of the balance still spends it — the DEFAULT changed, not the maths", () => {
+  // `calcOrderQuoteUsdt` is faithful to whatever the bot is configured with.
+  // What changed is the default a NEW bot starts with (5 %, with a stop loss
+  // on) and the API's refusal to accept a large size with no stop.
+  assert.equal(calcOrderQuoteUsdt(bot({ maxInvestmentPct: 100 }), 5000), 5000);
+  assert.equal(calcOrderQuoteUsdt(bot({ maxInvestmentPct: 5 }), 5000), 250);
 });
 
 test("a percentage unit takes that share of the balance, then the entry-volume share", () => {
@@ -54,11 +58,14 @@ test("the result is never negative", () => {
   assert.equal(calcOrderQuoteUsdt(bot(), 5000, -1), 0);
 });
 
-test("KNOWN DEFECT BOT-013: '*_bot' and '*_trade' units size identically", () => {
+test("BOT-013 FIXED: '*_bot' units aggregate across open positions, '*_trade' units do not", () => {
   const perBot = bot({ maxInvestmentUnit: "usdt_bot", maxInvestmentPct: 100 });
   const perTrade = bot({ maxInvestmentUnit: "usdt_trade", maxInvestmentPct: 100 });
-  assert.equal(calcOrderQuoteUsdt(perBot, 5000), calcOrderQuoteUsdt(perTrade, 5000));
-  // Three concurrent positions therefore deploy 300 USDT under a "100 per Bot" setting.
+  // With nothing open the two agree, which is why the defect was invisible.
+  assert.equal(calcOrderQuoteUsdt(perBot, 5000, null, 0), calcOrderQuoteUsdt(perTrade, 5000, null, 0));
+  // With 60 already committed they diverge, which is the point.
+  assert.equal(calcOrderQuoteUsdt(perBot, 5000, null, 60), 40);
+  assert.equal(calcOrderQuoteUsdt(perTrade, 5000, null, 60), 100);
 });
 
 test("legacy investment-unit labels still resolve, and unknown ones fall back to pct_bot", () => {
@@ -76,6 +83,10 @@ test("floorToStep rounds DOWN to the exchange lot step", () => {
   near(floorToStep(1.9999, 1), 1);
   near(floorToStep(100, 0.1), 100);
   assert.equal(floorToStep(5.5, 0), 5.5, "a zero step means no lot filter");
+  // BOT-032: a value a hair under a step boundary is that boundary, not one
+  // whole step below it. Fuller coverage is in tests/moneyPath.test.ts.
+  near(floorToStep(0.29, 0.01), 0.29);
+  near(floorToStep(2.9999999999999996, 0.1), 3);
 });
 
 test("floorToStep never returns more than it was given", () => {

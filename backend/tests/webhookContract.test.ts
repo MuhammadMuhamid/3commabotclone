@@ -42,14 +42,19 @@ test("every partial exit leg below 100 % parses", () => {
   }
 });
 
-test("KNOWN MISMATCH X-01: sell_percent exactly 100 is rejected, and a 4xx is never retried", () => {
-  const r = webhookSchema.safeParse(sell({ sell_percent: 100, exit_leg: "tp2" }));
-  assert.equal(r.success, false);
+test("X-01 FIXED: sell_percent exactly 100 is accepted as a full close", () => {
   // The sender can produce exactly 100 whenever rrTp1Size + rrTp2Size >= 100.
   const rrTp1Size = 50, rrTp2Size = 50;
   const already = rrTp1Size;
   const currentPct = Math.min(100, (rrTp2Size / Math.max(0.000001, 100 - already)) * 100);
   assert.equal(currentPct, 100, "a 50/50 TP split makes the TP2 leg exactly 100");
+
+  // It used to be a terminal 400, so the take-profit never reached the exchange
+  // while the sender marked the tier done. Both the schema and the service now
+  // treat it as the full close it is.
+  assert.equal(webhookSchema.safeParse(sell({ sell_percent: currentPct, exit_leg: "tp2" })).success, true);
+  // Above 100 is still refused.
+  assert.equal(webhookSchema.safeParse(sell({ sell_percent: 100.01 })).success, false);
 });
 
 test("sell_percent must be positive and is refused on a buy action", () => {

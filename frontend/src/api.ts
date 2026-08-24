@@ -228,6 +228,47 @@ export const api = {
 
   // ── App data ──────────────────────────────────────────────────────────────
   config: () => request<{ publicUrl: string; dryRun: boolean }>("/api/config"),
+
+  /**
+   * Operator status and controls (BOT-011, BOT-034).
+   *
+   * `mode` is the honest three-state answer — DRY_RUN, HALTED or LIVE — which
+   * was previously only inferable from `dryRun` on /api/config, and not at all
+   * for a halt because halting did not exist.
+   */
+  ops: {
+    status: () =>
+      request<{
+        mode: "DRY_RUN" | "HALTED" | "LIVE";
+        dryRun: boolean;
+        risk: {
+          tradingHalted: boolean;
+          haltedReason: string | null;
+          haltedBy: string | null;
+          maxTotalExposureQuote: number | null;
+          maxConcurrentTrades: number | null;
+          maxDailyLossQuote: number | null;
+          dailyLossWindowHours: number;
+          snapshot: { openExposureQuote: number; openTrades: number; realisedPnlInWindow: number };
+          summary: string;
+        };
+        bots: { active: number; paused: number };
+        protectiveOrders: { enabled: boolean; status: string; note: string };
+        time: string;
+      }>("/api/ops/status"),
+
+    halt: (reason: string) =>
+      request<{ halted: true; reason: string }>("/api/ops/halt", {
+        method: "POST",
+        body: JSON.stringify({ confirmation: "HALT_TRADING", reason }),
+      }),
+
+    resume: () =>
+      request<{ halted: false; previousReason?: string | null; note?: string }>("/api/ops/resume", {
+        method: "POST",
+        body: JSON.stringify({ confirmation: "RESUME_TRADING" }),
+      }),
+  },
   stats: () => request<Stats>("/api/bots/stats"),
 
   bots: {

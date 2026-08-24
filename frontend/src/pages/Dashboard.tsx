@@ -418,6 +418,28 @@ function BotRow({
   const isActive = b.status === "active";
 
   const toggle = async () => {
+    /*
+     * BOT-034: starting a bot arms real order flow, and it was the one
+     * money-touching action with no confirmation — delete, close and partial
+     * close all had one. Stopping needs no confirmation: it is the safe
+     * direction.
+     */
+    if (!isActive) {
+      const size = `${b.maxInvestmentLabel} per entry`;
+      const guards = [
+        b.stopLossEnabled ? `stop loss ${b.stopLossPct ?? "?"}%` : "NO STOP LOSS",
+        b.takeProfitEnabled ? `take profit ${b.takeProfitPct ?? "?"}%` : "no take profit",
+        b.exitEnabled ? "exits enabled" : "EXITS DISABLED",
+      ].join(", ");
+      const warning =
+        `Start "${b.name}"?\n\n` +
+        `Pairs: ${b.pairs.join(", ")}\n` +
+        `Size: ${size}\n` +
+        `Guards: ${guards}\n\n` +
+        "Once started, an incoming webhook places a real Binance Spot order " +
+        "unless the server is in DRY RUN.";
+      if (!confirm(warning)) return;
+    }
     setBusy(true);
     try {
       await api.bots.toggle(b.id);
@@ -744,6 +766,45 @@ function FilterChip({ active, onClick, label }: { active: boolean; onClick: () =
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
+/**
+ * The trading-mode badge (BOT-034).
+ *
+ * Four states, and `UNKNOWN` is deliberately one of them: if the status call
+ * fails, saying so is correct, whereas defaulting to LIVE would alarm and
+ * defaulting to DRY RUN would reassure — both without evidence.
+ */
+function OpsBadge({ mode, reason }: {
+  mode: "DRY_RUN" | "HALTED" | "LIVE" | "UNKNOWN";
+  reason: string | null;
+}) {
+  const styles: Record<typeof mode, string> = {
+    DRY_RUN: "bg-amber-500/15 text-amber-400 border-amber-500/30",
+    HALTED: "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border-[var(--color-danger)]/40",
+    LIVE: "bg-[var(--color-success-dim)] text-[var(--color-success)] border-[var(--color-success)]/40",
+    UNKNOWN: "bg-[var(--color-panel-2)] text-[var(--color-muted)] border-[var(--color-border)]",
+  };
+  const label: Record<typeof mode, string> = {
+    DRY_RUN: "DRY RUN",
+    HALTED: "HALTED",
+    LIVE: "LIVE",
+    UNKNOWN: "MODE UNKNOWN",
+  };
+  const title =
+    mode === "HALTED" ? `Trading is halted${reason ? `: ${reason}` : ""}`
+    : mode === "DRY_RUN" ? "Orders are simulated — nothing reaches the exchange"
+    : mode === "LIVE" ? "A webhook will place a REAL Binance Spot order"
+    : "Could not read the trading mode from the server";
+  return (
+    <span
+      title={title}
+      aria-label={title}
+      className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border font-medium ${styles[mode]}`}
+    >
+      <Zap size={11} aria-hidden="true" />{label[mode]}
+    </span>
+  );
+}
+
 export default function Dashboard() {
   const [botFilter, setBotFilter]   = useState<BotFilter>("all");
   const [bots, setBots]             = useState<BotListItem[]>([]);
@@ -751,26 +812,71 @@ export default function Dashboard() {
   const [stats, setStats]           = useState<Stats | null>(null);
   const [trades, setTrades]         = useState<SmartTrade[]>([]);
   const [accounts, setAccounts]     = useState<ExchangeAccount[]>([]);
-  const [dryRun, setDryRun]         = useState(false);
+  const [opsMode, setOpsMode]       = useState<"DRY_RUN" | "HALTED" | "LIVE" | "UNKNOWN">("UNKNOWN");
+  const [haltReason, setHaltReason] = useState<string | null>(null);
+  const [haltBusy, setHaltBusy]     = useState(false);
   const [loadError, setLoadError]   = useState<string | null>(null);
   const [loading, setLoading]       = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
+  /** BOT-011: halt or resume all trading, with the confirmation the API requires. */
+  const toggleHalt = async () => {
+    if (opsMode === "HALTED") {
+      if (!confirm(
+        "Resume trading?\n\nThis re-arms real order flow. If the halt was " +
+        "latched by a risk limit, the API will refuse until that limit is clear."
+      )) return;
+      setHaltBusy(true);
+      try {
+        await api.ops.resume();
+        toast("Trading resumed", "success");
+        await load(true);
+      } catch (e) {
+        toast(e instanceof Error ? e.message : "Could not resume", "error");
+      } finally {
+        setHaltBusy(false);
+      }
+      return;
+    }
+    const reason = prompt(
+      "Halt ALL trading.\n\nEvery entry and exit will be refused until you " +
+      "resume. Give a reason so the halt is explicable later:"
+    );
+    if (reason === null) return;
+    if (reason.trim().length < 3) {
+      toast("A reason of at least 3 characters is required", "error");
+      return;
+    }
+    setHaltBusy(true);
+    try {
+      await api.ops.halt(reason.trim());
+      toast("Trading halted", "success");
+      await load(true);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Could not halt", "error");
+    } finally {
+      setHaltBusy(false);
+    }
+  };
+
   const load = async (silent = false) => {
     if (!silent) setRefreshing(true);
     try {
-      const [botList, s, t, c, accs] = await Promise.all([
+      const [botList, s, t, accs, ops] = await Promise.all([
         api.bots.list(),
         api.stats(),
         api.trades.list(tradeTab),
-        api.config(),
         api.exchange.list(),
+        // A failure here must not blank the dashboard — the badge falls back to
+        // UNKNOWN, which is an honest answer, rather than to LIVE or DRY RUN.
+        api.ops.status().catch(() => null),
       ]);
       setBots(botList);
       setStats(s);
       setTrades(t);
-      setDryRun(c.dryRun);
       setAccounts(accs);
+      setOpsMode(ops ? ops.mode : "UNKNOWN");
+      setHaltReason(ops?.risk.haltedReason ?? null);
       setLoadError(null);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : "Failed to load data");
@@ -806,10 +912,26 @@ export default function Dashboard() {
           <p className="text-xs text-[var(--color-muted)] mt-0.5">Live trading overview</p>
         </div>
         <div className="flex items-center gap-3">
-          {dryRun && (
-            <span className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30 font-medium">
-              <Zap size={11} />DRY RUN
-            </span>
+          {/*
+            BOT-034: three states, and none of them is a guess. DRY RUN means
+            nothing reaches the exchange; HALTED means orders are refused;
+            LIVE means a webhook places a real order. Previously only DRY RUN
+            was shown, and a halt did not exist to be shown.
+          */}
+          <OpsBadge mode={opsMode} reason={haltReason} />
+          {opsMode !== "DRY_RUN" && (
+            <Btn
+              small
+              onClick={toggleHalt}
+              disabled={haltBusy}
+              className={
+                opsMode === "HALTED"
+                  ? "text-[var(--color-success)] border-[var(--color-success)]/30 bg-[var(--color-success-dim)]"
+                  : "text-[var(--color-danger)] border-[var(--color-danger)]/30 bg-[var(--color-danger-dim)]"
+              }
+            >
+              {opsMode === "HALTED" ? "Resume trading" : "Halt all trading"}
+            </Btn>
           )}
           <button
             type="button"

@@ -5,16 +5,58 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildBotPayload, defaultBotForm, PAIRS } from "../src/lib/botForm.js";
+import {
+  buildBotPayload, defaultBotForm, PAIRS, UNPROTECTED_SIZE_LIMIT_PCT, unsafeConfigReason,
+} from "../src/lib/botForm.js";
 
-test("KNOWN DEFECT BOT-003/BOT-015: the shipped defaults are the maximum-risk ones", () => {
-  assert.equal(defaultBotForm.maxInvestmentPct, 100, "100 % of the balance");
-  assert.equal(defaultBotForm.entryVolumePct, 100);
+test("BOT-003/BOT-015 FIXED: the defaults are survivable", () => {
+  // They were maxInvestmentPct 100 with entryVolumePct 100 and every exit
+  // control off — the entire free USDT balance in one position with no
+  // automated exit path, and exit webhooks refused outright.
+  assert.equal(defaultBotForm.maxInvestmentPct, 5);
   assert.equal(defaultBotForm.maxInvestmentUnit, "pct_bot");
-  assert.equal(defaultBotForm.stopLossEnabled, false, "no stop loss");
-  assert.equal(defaultBotForm.takeProfitEnabled, false, "no take profit");
-  assert.equal(defaultBotForm.exitEnabled, false, "and exits are refused outright");
+  assert.equal(defaultBotForm.stopLossEnabled, true);
+  assert.equal(defaultBotForm.stopLossPct, 3);
+  assert.equal(defaultBotForm.exitEnabled, true);
+  // Take profit stays opt-in: it is a preference, not a safety control.
+  assert.equal(defaultBotForm.takeProfitEnabled, false);
   assert.equal(defaultBotForm.maxActiveSmartTradesEnabled, false);
+});
+
+test("the defaults themselves pass the safety guard", () => {
+  assert.equal(unsafeConfigReason(defaultBotForm), null);
+});
+
+test("BOT-003: rebuilding the old configuration by hand is refused", () => {
+  const reason = unsafeConfigReason({
+    ...defaultBotForm,
+    maxInvestmentPct: 100,
+    entryVolumePct: 100,
+    stopLossEnabled: false,
+  });
+  assert.ok(reason, "a full-balance position with no stop must be refused");
+  assert.match(reason, new RegExp(`${UNPROTECTED_SIZE_LIMIT_PCT}%`));
+});
+
+test("the guard reads the EFFECTIVE size, so entry volume counts", () => {
+  const base = { ...defaultBotForm, maxInvestmentPct: 100, stopLossEnabled: false };
+  assert.equal(unsafeConfigReason({ ...base, entryVolumePct: 40 }), null);
+  assert.ok(unsafeConfigReason({ ...base, entryVolumePct: 60 }));
+});
+
+test("an enabled stop or target with no distance is refused before submitting", () => {
+  assert.match(unsafeConfigReason({ ...defaultBotForm, stopLossPct: 0 }) ?? "", /Stop loss/);
+  assert.match(
+    unsafeConfigReason({ ...defaultBotForm, takeProfitEnabled: true, takeProfitPct: 0 }) ?? "",
+    /Take profit/
+  );
+});
+
+test("BOT-012: only the implemented direction is representable", () => {
+  assert.equal(defaultBotForm.direction, "long");
+  // The type is now the literal "long", so a short bot cannot be constructed.
+  const asString: string = defaultBotForm.direction;
+  assert.equal(asString, "long");
 });
 
 test("disabled optional limits are sent as null, not as their stale form value", () => {
