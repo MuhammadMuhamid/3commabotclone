@@ -1,0 +1,48 @@
+// =============================================================================
+// REPLACE the bottom "Alerts" section of SR+Trend v5 (from line ~Alerts: Custom...)
+// through end of file WITH this block.
+// =============================================================================
+//
+// TradingView alert (each chart: NEAR, TIA, ZEC):
+//   Condition: SR+Trend v5 → alert() function calls ONLY (NOT "Order fills and...")
+//   Webhook:   https://bot.alphawebstudioz.com/api/webhooks/signal_bots
+//   Message:   {{alert_message}}
+//
+// Pine inputs (1 General):
+//   Signal delivery = Custom webhook bot
+//   secret  = 5fbfb001deec412990e030e8b7d9fea6e95814e7cb5841b0  (full line)
+//   symbol  = NEARUSDT / TIAUSDT / ZECUSDT per chart
+//   BUY quote USDT = 100.01  (or null in TV message — bot uses ~100 from settings)
+
+//------------------------------------------------------------------------------
+// Alerts — Custom FastAPI bot (https://bot.alphawebstudioz.com)
+// IMPORTANT: Set [Custom bot] secret in Inputs — NOT "REPLACE_ME"
+//------------------------------------------------------------------------------
+if use_custom_webhook and (ALERT_SECRET == "REPLACE_ME" or str.length(ALERT_SECRET) < 32)
+    runtime.error("Set [Custom bot] secret to your full bot webhook secret (Settings on dashboard)")
+
+f_bot_json_buy() =>
+    "{\"secret\":\"" + ALERT_SECRET + "\",\"action\":\"buy\",\"symbol\":\"" + alert_symbol +
+     "\",\"quote_order_qty\":" + str.tostring(alert_buy_usdt) +
+     ",\"dedupe_key\":\"L-" + str.tostring(bar_index) + "-" + str.tostring(time) + "\"}"
+
+f_bot_json_sell_exit() =>
+    "{\"secret\":\"" + ALERT_SECRET + "\",\"action\":\"sell\",\"symbol\":\"" + alert_symbol +
+     "\",\"dedupe_key\":\"X-" + str.tostring(bar_index) + "-" + str.tostring(time) + "\"}"
+
+// Entry long
+if use_custom_webhook and longSignal
+    alert(f_bot_json_buy(), alert.freq_once_per_bar_close)
+
+// Entry short (only if short_en = true)
+if use_custom_webhook and shortSignal
+    alert(
+         "{\"secret\":\"" + ALERT_SECRET + "\",\"action\":\"sell\",\"symbol\":\"" + alert_symbol +
+          "\",\"quantity\":" + str.tostring(alert_sell_base) +
+          ",\"dedupe_key\":\"S-" + str.tostring(bar_index) + "-" + str.tostring(time) + "\"}",
+         alert.freq_once_per_bar_close)
+
+// EXIT long — required: strategy.exit("Long X") often does NOT fire "Order fills only"
+bool longJustClosed = strategy.position_size == 0 and strategy.position_size[1] > 0
+if use_custom_webhook and longJustClosed
+    alert(f_bot_json_sell_exit(), alert.freq_once_per_bar_close)

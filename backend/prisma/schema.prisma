@@ -1,0 +1,144 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model ExchangeAccount {
+  id            String      @id @default(uuid())
+  name          String
+  exchange      String      @default("binance")
+  marketType    String      @default("spot")
+  apiKeyEnc     String
+  apiSecretEnc  String
+  testnet       Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  bots          SignalBot[]
+}
+
+model SignalBot {
+  id                          String       @id @default(uuid())
+  name                        String
+  alertType                   String       @default("custom")
+  direction                   String       @default("long")
+  pairs                       String
+  maxInvestmentPct            Float        @default(100)
+  maxInvestmentUnit           String       @default("pct_bot")
+  status                      String       @default("active")
+  webhookSecret               String       @unique
+
+  entryEnabled                Boolean      @default(true)
+  entryVolumePct              Float        @default(100)
+  entryOrderType              String       @default("market")
+  exitEnabled                 Boolean      @default(false)
+  takeProfitEnabled           Boolean      @default(false)
+  takeProfitPct               Float?
+  stopLossEnabled             Boolean      @default(false)
+  stopLossPct                 Float?
+  maxEntryOrders              Int?
+  maxActiveSmartTradesEnabled Boolean      @default(false)
+  maxActiveSmartTrades        Int?
+
+  exchangeAccountId           String?
+  exchangeAccount             ExchangeAccount? @relation(fields: [exchangeAccountId], references: [id])
+  smartTrades                 SmartTrade[]
+  webhookLogs                 WebhookLog[]
+  createdAt                   DateTime     @default(now())
+  updatedAt                   DateTime     @updatedAt
+}
+
+// F5: botId is nullable + SetNull so deleting a bot preserves all historical trades.
+// botName is denormalised so trade history still shows the original bot name after deletion.
+model SmartTrade {
+  id              String         @id @default(uuid())
+  botId           String?
+  bot             SignalBot?     @relation(fields: [botId], references: [id], onDelete: SetNull)
+  botName         String         @default("")
+  pair            String
+  direction       String         @default("long")
+  status          String         @default("active")
+  entryPrice      Float?
+  currentPrice    Float?
+  quantity        Float          @default(0)
+  quoteSpent      Float          @default(0)
+  pnlUsdt         Float          @default(0)
+  pnlPct          Float          @default(0)
+  buyPrice        Float?
+  exchangeOrderId String?
+  closedReason    String?
+  createdAt       DateTime       @default(now())
+  closedAt        DateTime?
+  updatedAt       DateTime       @updatedAt
+  partialCloses   PartialClose[]
+}
+
+// F4: Each row records one partial sell on an active trade.
+model PartialClose {
+  id              String     @id @default(uuid())
+  tradeId         String
+  trade           SmartTrade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  pct             Float
+  quantity        Float
+  revenue         Float
+  pnlUsdt         Float
+  avgPrice        Float
+  exchangeOrderId String?
+  createdAt       DateTime   @default(now())
+}
+
+model WebhookLog {
+  id        String     @id @default(uuid())
+  botId     String?
+  bot       SignalBot? @relation(fields: [botId], references: [id], onDelete: SetNull)
+  payload   String
+  status    String
+  message   String?
+  createdAt DateTime   @default(now())
+}
+
+// ─── Auth ──────────────────────────────────────────────────────────────────
+
+model User {
+  id            String         @id @default(uuid())
+  username      String         @unique
+  passwordHash  String
+  totpSecret    String?
+  totpEnabled   Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+  refreshTokens RefreshToken[]
+  pushSubscriptions PushSubscription[]
+}
+
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Persists webhook idempotency across restarts and multiple server workers.
+model WebhookReceipt {
+  id        String   @id @default(uuid())
+  keyHash   String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
