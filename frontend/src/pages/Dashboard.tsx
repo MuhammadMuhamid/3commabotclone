@@ -763,6 +763,45 @@ function FilterChip({ active, onClick, label }: { active: boolean; onClick: () =
  * fails, saying so is correct, whereas defaulting to LIVE would alarm and
  * defaulting to DRY RUN would reassure — both without evidence.
  */
+/**
+ * Which Binance an order would actually reach.
+ *
+ * Two answers, not one: `BINANCE_TESTNET` is the process-wide default, and each
+ * stored exchange account carries its OWN flag which overrides it for that
+ * account's bots. An operator reading only the first could believe every order
+ * is on testnet while an account sends some to mainnet — so a disagreement is
+ * shown as its own state rather than folded into either.
+ */
+function ExchangeBadge({ exchange }: {
+  exchange: {
+    envTestnet: boolean;
+    accounts: { id: string; name: string; testnet: boolean }[];
+    mixed: boolean;
+    note: string;
+  } | null;
+}) {
+  if (!exchange) return null;
+  const label = exchange.mixed ? "MIXED NET" : exchange.envTestnet ? "TESTNET" : "MAINNET";
+  const style = exchange.mixed
+    ? "bg-amber-500/15 text-amber-400 border-amber-500/30"
+    : exchange.envTestnet
+      ? "bg-[var(--color-panel-2)] text-[var(--color-muted)] border-[var(--color-border)]"
+      : "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border-[var(--color-danger)]/40";
+  const detail = exchange.accounts.length === 0
+    ? exchange.note
+    : `${exchange.note} Accounts: ${
+        exchange.accounts.map((a) => `${a.name} (${a.testnet ? "testnet" : "mainnet"})`).join(", ")}`;
+  return (
+    <span
+      title={detail}
+      aria-label={detail}
+      className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border font-medium ${style}`}
+    >
+      {label}
+    </span>
+  );
+}
+
 function OpsBadge({ mode, reason }: {
   mode: "DRY_RUN" | "HALTED" | "LIVE" | "UNKNOWN";
   reason: string | null;
@@ -804,6 +843,12 @@ export default function Dashboard() {
   const [accounts, setAccounts]     = useState<ExchangeAccount[]>([]);
   const [opsMode, setOpsMode]       = useState<"DRY_RUN" | "HALTED" | "LIVE" | "UNKNOWN">("UNKNOWN");
   const [haltReason, setHaltReason] = useState<string | null>(null);
+  const [exchange, setExchange] = useState<{
+    envTestnet: boolean;
+    accounts: { id: string; name: string; testnet: boolean }[];
+    mixed: boolean;
+    note: string;
+  } | null>(null);
   const [haltBusy, setHaltBusy]     = useState(false);
   const [loadError, setLoadError]   = useState<string | null>(null);
   const [loading, setLoading]       = useState(true);
@@ -867,6 +912,7 @@ export default function Dashboard() {
       setAccounts(accs);
       setOpsMode(ops ? ops.mode : "UNKNOWN");
       setHaltReason(ops?.risk.haltedReason ?? null);
+      setExchange(ops?.exchange ?? null);
       setLoadError(null);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : "Failed to load data");
@@ -909,6 +955,7 @@ export default function Dashboard() {
             was shown, and a halt did not exist to be shown.
           */}
           <OpsBadge mode={opsMode} reason={haltReason} />
+          <ExchangeBadge exchange={exchange} />
           {opsMode !== "DRY_RUN" && (
             <Btn
               small

@@ -1030,6 +1030,22 @@ not added to `MONEY_FIELDS` in `lib/money.ts` silently stops being quantized;
 `tests/moneyPrecision.test.ts` names the models as a reminder, but it cannot
 know about a column it has never seen.
 
+### Which Binance an order reaches
+
+`GET /api/ops/status` reports it, and the dashboard shows it beside the trading
+mode. There are **two** answers and they are not the same one:
+
+- `BINANCE_TESTNET` in the bot's environment is the process-wide default, used
+  when a bot has no exchange account of its own;
+- each stored exchange account carries **its own** `testnet` flag, which
+  overrides the default for that account's bots.
+
+An operator reading only the first could believe every order is on testnet while
+an account sends some to mainnet, so a disagreement is its own state — `MIXED
+NET` — rather than being folded into either. The status response carries account
+names and flags only; no key material leaves the process, and nothing here
+contacts Binance.
+
 ### The TP/SL monitor's schedule (`BOT-033`)
 
 The monitor ran under `setInterval(…, 30_000)` and walked every open position

@@ -254,6 +254,17 @@ export const api = {
         };
         bots: { active: number; paused: number };
         protectiveOrders: { enabled: boolean; status: string; note: string };
+        /**
+         * Which Binance an order would actually reach. Two answers, not one:
+         * `envTestnet` is the process-wide default, and each stored account
+         * carries its own flag which overrides it for that account's bots.
+         */
+        exchange: {
+          envTestnet: boolean;
+          accounts: { id: string; name: string; testnet: boolean }[];
+          mixed: boolean;
+          note: string;
+        };
         time: string;
       }>("/api/ops/status"),
 

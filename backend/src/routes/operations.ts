@@ -42,9 +42,14 @@ operationsRouter.get(
   asyncHandler(async (_req, res) => {
     const limits = await getBotRiskLimits();
     const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours);
-    const [activeBots, pausedBots] = await Promise.all([
+    const [activeBots, pausedBots, accounts] = await Promise.all([
       prisma.signalBot.count({ where: { status: "active" } }),
       prisma.signalBot.count({ where: { status: { not: "active" } } }),
+      // Names and the testnet flag only. No key material leaves this process.
+      prisma.exchangeAccount.findMany({
+        select: { id: true, name: true, testnet: true },
+        orderBy: { createdAt: "asc" },
+      }),
     ]);
 
     res.json({
@@ -65,6 +70,30 @@ operationsRouter.get(
           exchangeStopsEnabled()
             ? "Exchange-side protective orders are ENABLED. Verify the testnet checks in services/exchangeStops.ts were completed."
             : "Protection is a 30-second in-process poll only. Open positions are unprotected while this process is down.",
+      },
+      /*
+       * WHICH BINANCE will an order actually reach?
+       *
+       * There are two answers and they are not the same one: `BINANCE_TESTNET`
+       * is the process-wide default used when a bot has no exchange account of
+       * its own, and each stored account carries its OWN flag. An operator
+       * reading only the first could believe every order is on testnet while an
+       * account overrides it to mainnet.
+       *
+       * Nothing here contacts Binance. This is configuration, reported.
+       */
+      exchange: {
+        envTestnet: config.binanceTestnet,
+        accounts: accounts.map((a) => ({ id: a.id, name: a.name, testnet: a.testnet })),
+        mixed: accounts.some((a) => a.testnet !== config.binanceTestnet),
+        note: accounts.length === 0
+          ? `No exchange account is stored. Orders would use the process default: ${
+              config.binanceTestnet ? "TESTNET" : "MAINNET"}.`
+          : accounts.some((a) => a.testnet !== config.binanceTestnet)
+            ? "An account's testnet setting DISAGREES with the process default. A bot uses "
+              + "its own account's setting, so some orders go to a different Binance from others."
+            : `Every account matches the process default: ${
+                config.binanceTestnet ? "TESTNET" : "MAINNET"}.`,
       },
       time: new Date().toISOString(),
     });
