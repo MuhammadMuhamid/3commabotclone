@@ -17,6 +17,7 @@ import { detectManualCloses } from "./services/manualCloseSync.js";
 import { prisma } from "./lib/prisma.js";
 import { pruneCloseMarks } from "./lib/tradeCloseTracker.js";
 import { errorHandler, notFoundHandler } from "./middleware/errors.js";
+import { startInterval } from "./lib/scheduler.js";
 
 // Hard-fail in production if any critical secret is missing
 assertConfig();
@@ -170,15 +171,17 @@ app.use("/api", notFoundHandler);
 app.use(errorHandler);
 
 // ─── Background jobs ──────────────────────────────────────────────────────────
-// TP/SL monitor + PnL refresh — runs every 30s
-setInterval(() => {
-  checkTakeProfitStopLoss().catch(console.error);
-}, 30_000);
+//
+// BOT-033: these ran under `setInterval`, which fires on the clock whether or
+// not the previous run has finished. The TP/SL monitor walks every open
+// position and makes Binance calls, so once a cycle exceeded 30 seconds a
+// second cycle started on top of the first — two concurrent passes over the
+// same positions. `startInterval` schedules the next run only after the
+// previous one settles, and logs when a cycle overruns its interval.
+startInterval("tpsl", 30_000, checkTakeProfitStopLoss);
 
-// F2: Detect positions closed directly on Binance — runs every 60s
-setInterval(() => {
-  detectManualCloses().catch(console.error);
-}, 60_000);
+// F2: Detect positions closed directly on Binance
+startInterval("manual-close-sync", 60_000, detectManualCloses);
 
 // Webhook log retention — prune entries older than 30 days, and the durable
 // stale-sell markers past their TTL (BOT-019).
@@ -192,7 +195,7 @@ async function pruneWebhookLogs(): Promise<void> {
   if (count > 0) console.log(`[cleanup] Pruned ${count} webhook log(s) older than 30 days`);
 }
 pruneWebhookLogs().catch(console.error);
-setInterval(() => pruneWebhookLogs().catch(console.error), 24 * 60 * 60 * 1000);
+startInterval("webhook-log-prune", 24 * 60 * 60 * 1000, pruneWebhookLogs);
 
 // ─── Crash guard ──────────────────────────────────────────────────────────────
 // Node exits the process on an unhandled rejection. For a live trading daemon

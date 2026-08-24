@@ -1030,6 +1030,26 @@ not added to `MONEY_FIELDS` in `lib/money.ts` silently stops being quantized;
 `tests/moneyPrecision.test.ts` names the models as a reminder, but it cannot
 know about a column it has never seen.
 
+### The TP/SL monitor's schedule (`BOT-033`)
+
+The monitor ran under `setInterval(…, 30_000)` and walked every open position
+sequentially, making at least one Binance call each. `setInterval` fires on the
+clock whether or not the previous run has finished, so a cycle that took longer
+than 30 seconds had the next one start on top of it — two concurrent passes over
+the same open positions, each able to decide to close one.
+
+- `src/lib/scheduler.ts` `startInterval` schedules the next cycle only after the
+  previous one settles, keeps running when a cycle throws, and logs when a cycle
+  overruns its interval — the signal that the interval is too short for the
+  work. All three background jobs use it.
+- `checkTakeProfitStopLoss` is now two phases. **Reads** — resolving one client
+  per exchange account, one ticker call per distinct (account, pair) rather than
+  one per trade, and the P&L refresh — run with a concurrency of 4. **Orders**
+  stay strictly sequential: placing sells concurrently is not a latency problem
+  worth solving, it is how two closes on one account interleave.
+- A trade whose price or P&L refresh failed is skipped for this cycle rather
+  than evaluated on a stale figure; the next cycle is 30 seconds away.
+
 ### The library that signs every order (`BOT-039`)
 
 `binance-api-node@0.12.9` was last published in 2022 and is effectively

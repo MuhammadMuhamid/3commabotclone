@@ -8,6 +8,14 @@ import {
   releaseTradeClose,
 } from "../lib/tradeCloseLock.js";
 import { sendExecutionNotification } from "./push.js";
+import { mapWithConcurrency } from "../lib/scheduler.js";
+
+/**
+ * BOT-033 tuning. Deliberately small: Binance rate-limits by weight, and this
+ * runs beside webhook-driven order placement that must not be crowded out.
+ */
+const PRICE_CONCURRENCY = 4;
+const PNL_CONCURRENCY = 4;
 import { sumMoney } from "../lib/money.js";
 
 // F3: Binance charges 0.1% on each side. Factor both into every P&L calculation.
@@ -84,7 +92,14 @@ export function calcFinalClosePnl(
 
 export async function updateSmartTradePnl(
   tradeId: string,
-  client?: BinanceClient
+  client?: BinanceClient,
+  /**
+   * Price already fetched for this pair in this cycle. BOT-033: several trades
+   * commonly share a pair, and the monitor used to make one ticker call per
+   * TRADE. Passing the price in also means every trade in a cycle is valued at
+   * the same tick, which is what an operator reading the dashboard expects.
+   */
+  knownPrice?: number
 ): Promise<void> {
   const trade = await prisma.smartTrade.findUnique({
     where: { id: tradeId },
@@ -104,7 +119,7 @@ export async function updateSmartTradePnl(
   }
   if (!c) return;
 
-  const price = await getTickerPrice(c, trade.pair);
+  const price = knownPrice ?? await getTickerPrice(c, trade.pair);
   const { pnlUsdt, pnlPct } = calcUnrealizedPnl(trade.quantity, price, trade.quoteSpent);
 
   await prisma.smartTrade.update({
@@ -127,36 +142,86 @@ export async function refreshAllActivePnL(): Promise<void> {
   }
 }
 
+/** Trades that share an exchange account share a client and a price lookup. */
+const CLIENT_CACHE_KEY = (accountId: string | null | undefined) => accountId ?? "__env__";
+
+/**
+ * One monitor cycle, in two phases (`BOT-033`).
+ *
+ * Phase 1 — READS — runs with bounded concurrency and one ticker call per
+ * distinct (account, pair) instead of one per trade, so the cycle's duration
+ * stops scaling linearly with the number of open positions.
+ *
+ * Phase 2 — ORDERS — stays strictly sequential. Placing sells concurrently is
+ * not a latency problem worth solving: it is how two closes on one account
+ * interleave.
+ */
 export async function checkTakeProfitStopLoss(): Promise<void> {
   const trades = await prisma.smartTrade.findMany({
     where: { status: "active" },
     include: { bot: true },
   });
 
-  for (const trade of trades) {
-    const bot = trade.bot;
-    // F5: bot is null when the parent bot was deleted — skip TP/SL but still refresh PnL if possible
-    if (!bot) continue;
-
-    // Cheap pre-check so a trade another path is already closing is skipped
-    // before any Binance call. The authoritative acquire happens below.
-    if (isTradeClosingNow(trade.id)) continue;
-
+  // ── Phase 0: resolve one client per exchange account ──────────────────────
+  const clients = new Map<string, BinanceClient | undefined>();
+  const clientFor = async (accountId: string | null | undefined): Promise<BinanceClient | undefined> => {
+    const key = CLIENT_CACHE_KEY(accountId);
+    if (clients.has(key)) return clients.get(key);
     let client: BinanceClient | undefined;
-    if (bot.exchangeAccountId) {
-      const acc = await prisma.exchangeAccount.findUnique({
-        where: { id: bot.exchangeAccountId },
-      });
+    if (accountId) {
+      const acc = await prisma.exchangeAccount.findUnique({ where: { id: accountId } });
       if (acc) client = clientFromAccount(acc);
     }
     if (!client) client = clientFromEnv() ?? undefined;
-    if (!client) continue;
+    clients.set(key, client);
+    return client;
+  };
 
+  const candidates: { trade: (typeof trades)[number]; client: BinanceClient }[] = [];
+  for (const trade of trades) {
+    // F5: bot is null when the parent bot was deleted — skip TP/SL but still refresh PnL if possible
+    if (!trade.bot) continue;
+    // Cheap pre-check so a trade another path is already closing is skipped
+    // before any Binance call. The authoritative acquire happens below.
+    if (isTradeClosingNow(trade.id)) continue;
+    const client = await clientFor(trade.bot.exchangeAccountId);
+    if (!client) continue;
+    candidates.push({ trade, client });
+  }
+
+  // ── Phase 1: one price per (account, pair), then refresh P&L concurrently ──
+  const priceKeys = [...new Set(candidates.map(
+    (c) => `${CLIENT_CACHE_KEY(c.trade.bot!.exchangeAccountId)}\u0000${c.trade.pair}`
+  ))];
+  const prices = new Map<string, number>();
+  await mapWithConcurrency(priceKeys, PRICE_CONCURRENCY, async (key) => {
+    const [accountKey, pair] = key.split("\u0000") as [string, string];
+    const client = clients.get(accountKey);
+    if (!client) return;
     try {
-      await updateSmartTradePnl(trade.id, client);
+      prices.set(key, await getTickerPrice(client, pair));
     } catch {
-      continue;
+      // A pair whose price could not be read is simply not refreshed this
+      // cycle; it must not stop the other positions being monitored.
     }
+  });
+
+  const refreshed = new Set<string>();
+  await mapWithConcurrency(candidates, PNL_CONCURRENCY, async ({ trade, client }) => {
+    const key = `${CLIENT_CACHE_KEY(trade.bot!.exchangeAccountId)}\u0000${trade.pair}`;
+    try {
+      await updateSmartTradePnl(trade.id, client, prices.get(key));
+      refreshed.add(trade.id);
+    } catch {
+      // Leave it out of phase 2: a TP/SL decision on a stale P&L is worse than
+      // no decision, and the next cycle is 30 seconds away.
+    }
+  });
+
+  // ── Phase 2: evaluate and close, one at a time ────────────────────────────
+  for (const { trade, client } of candidates) {
+    const bot = trade.bot!;
+    if (!refreshed.has(trade.id)) continue;
 
     if (!bot.takeProfitEnabled && !bot.stopLossEnabled) continue;
 
