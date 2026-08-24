@@ -1,7 +1,62 @@
+# ── secrets ──
+# Runtime credentials live here: ENCRYPTION_KEY, SCRYPT_SALT, JWT_SECRET,
+# BINANCE_API_* and the VAPID pair. Never commit them.
+.env
+.env.*
+!.env.example
+!*.env.example
+!backend/tests/test.env
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# ── dependencies / build output ──
 node_modules/
 dist/
-.env
+build/
+*.tsbuildinfo
+.vite/
+
+# ── local database ──
+# bot.db holds the ENCRYPTED exchange API keys and the full trade history.
 backend/data/
+backend/prisma/*.db
+backend/prisma/*.db-journal
 *.db
-.DS_Store
+*.db-journal
+*.sqlite
+*.sqlite3
+backend/tests/.tmp-*
+
+# ── local backups produced by scripts/backup-db.sh ──
+backups/
+
+# ── browser / session state ──
+# A saved browser profile or cookie jar is a live credential.
+.playwright/
+playwright-report/
+test-results/
+.auth/
+cookies.json
+storageState.json
+*.har
+
+# ── caches ──
+.cache/
+.npm/
+.eslintcache
+coverage/
+__pycache__/
+*.pyc
 .venv/
+
+# ── logs and scratch ──
+*.log
+npm-debug.log*
+*.tmp
+*.tmp.json
+
+# ── macOS ──
+.DS_Store
