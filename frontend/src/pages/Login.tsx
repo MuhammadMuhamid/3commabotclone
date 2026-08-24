@@ -1,4 +1,7 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import {
+  Children, cloneElement, isValidElement, useEffect, useId, useRef, useState,
+  type FormEvent,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import { Activity, KeyRound, Shield, ShieldCheck, Eye, EyeOff, Copy } from "lucide-react";
 import { api } from "../api";
@@ -396,6 +399,19 @@ export default function Login() {
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
+/**
+ * A labelled field on the sign-in form.
+ *
+ * The label used to be a bare `<label>` with no `htmlFor`, sitting beside the
+ * input rather than wrapping it — so it labelled nothing. Every field on the
+ * sign-in form, including the password, was announced as "edit text, blank",
+ * with only a placeholder that some screen readers skip and that disappears the
+ * moment you type.
+ *
+ * The association is made by cloning the child with `aria-labelledby` rather
+ * than by a render prop, so it holds for every call site including ones added
+ * later without anyone remembering to thread an id through.
+ */
 function Field({
   label,
   icon,
@@ -407,29 +423,48 @@ function Field({
   right?: React.ReactNode;
   children: React.ReactNode;
 }) {
+  const labelId = useId();
+  const child = Children.only(children);
+  const labelled = isValidElement(child)
+    ? cloneElement(child as React.ReactElement<{ "aria-labelledby"?: string }>,
+        { "aria-labelledby": labelId })
+    : child;
+
   return (
     <div>
       <div className="flex items-center justify-between mb-1.5">
-        <label className="flex items-center gap-1.5 text-xs font-medium text-[var(--color-muted)]">
+        <span
+          id={labelId}
+          className="flex items-center gap-1.5 text-xs font-medium text-[var(--color-muted)]"
+        >
           {icon}
           {label}
-        </label>
+        </span>
         {right}
       </div>
-      {children}
+      {labelled}
     </div>
   );
 }
 
+/**
+ * Show or hide the password.
+ *
+ * It measured 13x13 with no accessible name and `tabIndex={-1}`, which took the
+ * feature away from exactly the people who need it most: revealing what you
+ * typed is the standard mitigation for a long password on a phone or with a
+ * motor impairment, and a keyboard-only user could not reach it at all.
+ */
 function EyeToggle({ show, toggle }: { show: boolean; toggle: () => void }) {
   return (
     <button
       type="button"
       onClick={toggle}
-      className="text-[var(--color-muted)] hover:text-white transition-colors"
-      tabIndex={-1}
+      aria-label={show ? "Hide password" : "Show password"}
+      aria-pressed={show}
+      className="-my-1 flex h-7 w-7 items-center justify-center rounded text-[var(--color-muted)] transition-colors hover:text-white"
     >
-      {show ? <EyeOff size={13} /> : <Eye size={13} />}
+      {show ? <EyeOff size={13} aria-hidden="true" /> : <Eye size={13} aria-hidden="true" />}
     </button>
   );
 }
