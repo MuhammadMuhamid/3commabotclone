@@ -14,6 +14,7 @@ import { requireAuth } from "./middleware/requireAuth.js";
 import { checkTakeProfitStopLoss } from "./services/smartTrade.js";
 import { detectManualCloses } from "./services/manualCloseSync.js";
 import { prisma } from "./lib/prisma.js";
+import { errorHandler, notFoundHandler } from "./middleware/errors.js";
 
 // Hard-fail in production if any critical secret is missing
 assertConfig();
@@ -78,6 +79,17 @@ const refreshLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many refresh attempts — please try again shortly." },
+  /*
+   * An anonymous visit to /login runs GET /api/auth/me, which 401s, which makes
+   * the frontend's transparent-refresh path POST here with no refresh cookie at
+   * all. Those requests used to spend from the same 120-per-15-minutes budget
+   * as real sessions, so repeatedly loading the login page could lock out a
+   * legitimate user mid-session (finding BOT-040).
+   *
+   * A cookieless refresh is rejected by the route before it touches the
+   * database, so it costs nothing and does not need a budget.
+   */
+  skip: (req) => !(req.cookies as Record<string, string> | undefined)?.refresh_token,
 });
 
 const apiLimiter = rateLimit({
@@ -96,6 +108,17 @@ const webhookLimiter = rateLimit({
   message: { error: "Too many webhook requests." },
 });
 
+// The platform polls /signal_bots/status every 30 seconds for every deployment
+// group. Sharing the 30/min order-signal budget meant routine polling could
+// exhaust it and start rejecting real BUY/SELL signals, so it gets its own.
+const webhookStatusLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many status requests." },
+});
+
 // ─── Open routes (no auth) ────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   // Do NOT expose dryRun or any internal state publicly
@@ -111,7 +134,9 @@ app.use("/api/auth/totp",     authLimiter); // covers /totp/qr, /totp/enable, /t
 app.use("/api/auth/refresh",  refreshLimiter);
 app.use("/api/auth/logout",   authLimiter);
 app.use("/api/auth", authRouter);
-// Webhook route: auth-exempt so TradingView can POST without a session
+// Webhook routes: auth-exempt so TradingView can POST without a session.
+// Order signals and the position-status poll get separate budgets — see above.
+app.use("/api/webhooks/signal_bots/status", webhookStatusLimiter);
 app.use("/api/webhooks", webhookLimiter, webhooksRouter);
 
 // ─── Protected routes (requireAuth applied globally below) ───────────────────
@@ -127,6 +152,14 @@ app.use("/api/exchange-accounts", requireAuth, apiLimiter, exchangeRouter);
 app.use("/api/bots",              requireAuth, apiLimiter, botsRouter);
 app.use("/api/trades",            requireAuth, apiLimiter, tradesRouter);
 app.use("/api/notifications",     requireAuth, apiLimiter, notificationsRouter);
+
+// ─── Terminal error handling ──────────────────────────────────────────────────
+// Express 4 does not catch a rejected promise from an async handler, so a
+// rejection used to escape to the process-level guard below: the daemon stayed
+// up, correctly, but the request never received a response and the browser hung
+// forever. These two must be registered AFTER every route.
+app.use("/api", notFoundHandler);
+app.use(errorHandler);
 
 // ─── Background jobs ──────────────────────────────────────────────────────────
 // TP/SL monitor + PnL refresh — runs every 30s
