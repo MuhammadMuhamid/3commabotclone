@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from "uuid";
 import { prisma } from "../lib/prisma.js";
 import { config } from "../config.js";
 import { formatInvestmentLabel, INVESTMENT_UNITS } from "../lib/investment.js";
+import { sumMoney } from "../lib/money.js";
 
 export const botsRouter = Router();
 
@@ -204,7 +205,7 @@ botsRouter.get("/", async (_req, res) => {
         }),
       ]);
 
-      const totalProfit = closedTrades.reduce((s, t) => s + t.pnlUsdt, 0);
+      const totalProfit = sumMoney(closedTrades.map((t) => t.pnlUsdt));
       const activeSmartTrades = activeTrades;
 
       return mapBot(b, {
@@ -221,8 +222,8 @@ botsRouter.get("/", async (_req, res) => {
 
 botsRouter.get("/stats", async (_req, res) => {
   const active = await prisma.smartTrade.findMany({ where: { status: "active" } });
-  const upnl = active.reduce((s, t) => s + t.pnlUsdt, 0);
-  const locked = active.reduce((s, t) => s + t.quoteSpent, 0);
+  const upnl = sumMoney(active.map((t) => t.pnlUsdt));
+  const locked = sumMoney(active.map((t) => t.quoteSpent));
   const activeCount = active.length;
   const closedCount = await prisma.smartTrade.count({ where: { status: "closed" } });
   const botCount = await prisma.signalBot.count();
@@ -232,7 +233,7 @@ botsRouter.get("/stats", async (_req, res) => {
   const todayClosed = await prisma.smartTrade.findMany({
     where: { status: "closed", closedAt: { gte: todayStart } },
   });
-  const todayPnl = todayClosed.reduce((s, t) => s + t.pnlUsdt, 0);
+  const todayPnl = sumMoney(todayClosed.map((t) => t.pnlUsdt));
   res.json({
     upnl,
     locked,

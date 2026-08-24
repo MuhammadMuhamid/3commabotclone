@@ -40,7 +40,12 @@ app.use(
         frameAncestors: ["'none'"],         // clickjacking protection
       },
     },
-    // Disable COEP — binance-api-node uses cross-origin resources
+    // COEP is off. The reason recorded here was "binance-api-node uses
+    // cross-origin resources", which is not a reason: COEP is a response header
+    // governing what a BROWSER DOCUMENT may embed, and the exchange SDK runs
+    // server-side in this process. The header is left off because this origin
+    // serves the dashboard, and turning it on would require every embedded
+    // resource to opt in — a separate change with its own browser testing.
     crossOriginEmbedderPolicy: false,
   })
 );

@@ -8,6 +8,7 @@ import {
   releaseTradeClose,
 } from "../lib/tradeCloseLock.js";
 import { sendExecutionNotification } from "./push.js";
+import { sumMoney } from "../lib/money.js";
 
 // F3: Binance charges 0.1% on each side. Factor both into every P&L calculation.
 const BUY_FEE  = 1.001; // effective buy cost multiplier
@@ -66,15 +67,14 @@ export function calcFinalClosePnl(
   const { pnlUsdt: finalLegPnl } = calcRealizedPnl(finalRevenue, remainingQuoteSpent);
 
   // Sum in all prior partial close P&Ls
-  const partialsPnl = partials.reduce((s, p) => s + p.pnlUsdt, 0);
+  const partialsPnl = sumMoney(partials.map((p) => p.pnlUsdt));
   const totalPnlUsdt = finalLegPnl + partialsPnl;
 
   // Reconstruct the original total effective cost for an accurate percentage.
   // From calcRealizedPnl: pnlUsdt = revenue * SELL_FEE - proportionalCost * BUY_FEE
   // => proportionalCost * BUY_FEE = revenue * SELL_FEE - pnlUsdt
-  const partialEffectiveCost = partials.reduce(
-    (s, p) => s + (p.revenue * SELL_FEE - p.pnlUsdt),
-    0
+  const partialEffectiveCost = sumMoney(
+    partials.map((p) => p.revenue * SELL_FEE - p.pnlUsdt)
   );
   const totalEffectiveCost = remainingQuoteSpent * BUY_FEE + partialEffectiveCost;
   const pnlPct = totalEffectiveCost > 0 ? (totalPnlUsdt / totalEffectiveCost) * 100 : 0;

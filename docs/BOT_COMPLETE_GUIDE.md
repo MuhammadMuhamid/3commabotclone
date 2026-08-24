@@ -2,7 +2,7 @@
 
 > **Audience:** AI agents and engineers onboarding to this codebase.  
 > **Repository:** https://github.com/MuhammadMuhamid/3commabotclone (private)  
-> **Local checkout:** `~/Projects/tradingbot`  
+> **Local checkout:** wherever this repository is cloned.  
 > **Last audited:** 2026-08-24
 
 ---
@@ -42,7 +42,7 @@
 | **Health check** | `GET /health` → `{ status: "ok", dryRun: boolean }` |
 | **Backend** | Node 22, Express 4, TypeScript, Prisma 6, SQLite |
 | **Frontend** | React 19, Vite 6, Tailwind 4, React Router 7 |
-| **Exchange** | Binance Spot via `binance-api-node` (testnet supported) |
+| **Exchange** | Binance Spot via `binance-api-node` 0.12.9, pinned (testnet supported) |
 | **Deploy** | Docker Compose on AWS EC2 (ap-southeast-2), host nginx + Let's Encrypt |
 
 **Risk:** Live trading can lose money. Default local dev uses `DRY_RUN=true` (simulated fills at ticker price, no real orders).
@@ -161,7 +161,7 @@ Local dev: frontend `5173` proxies `/api` and `/health` to backend `4000`.
 | Runtime | Node.js 22 (Alpine in Docker) |
 | API | Express 4, `cors`, `zod` validation |
 | ORM | Prisma 6 → SQLite |
-| Exchange SDK | `binance-api-node` 0.12 |
+| Exchange SDK | `binance-api-node` **0.12.9, pinned exactly** — see *Money and the exchange SDK* below |
 | Crypto | Node `crypto` AES-256-GCM for API secrets |
 | Frontend | React 19, Vite 6, Tailwind CSS 4 |
 | Routing | `react-router-dom` 7 |
@@ -997,6 +997,62 @@ Dashboard → SmartTrades → **Close** on active row → `POST /api/trades/:id/
 | **PUBLIC_URL** | Base URL embedded in webhook links for TV. |
 
 ---
+
+## 12b. Money and the exchange SDK
+
+### Money is stored as SQLite `REAL` (`BOT-023`)
+
+Every monetary column in `schema.prisma` — `quoteSpent`, `pnlUsdt`, `revenue`,
+`quantity`, `entryPrice` and the rest — is a `Float`, which SQLite stores as an
+IEEE 754 double. That is not exact decimal arithmetic. The remediation roadmap's
+answer is integer minor units or `Decimal`; neither is available without
+migrating the live database, and Prisma's `Decimal` on SQLite is not exact
+either.
+
+What is in place instead **bounds** the error rather than eliminating it:
+
+- `src/lib/money.ts` quantizes every monetary value to 8 decimal places —
+  Binance's own maximum precision for price and quantity — rounding half away
+  from zero so a loss is never rounded towards zero.
+- `src/lib/prisma.ts` applies that through a Prisma client extension on
+  `create` / `update` / `updateMany` / `upsert` / `createMany`, so it happens at
+  one place rather than at ~60 call sites, and Prisma's `{ increment }` /
+  `{ set }` operators are covered too.
+- Every sum over rows — a trade's partial closes, a bot's realized P&L, the risk
+  controller's exposure and daily-loss windows — uses `sumMoney`, a Neumaier
+  compensated sum, so adding a thousand rows does not accumulate a thousand
+  rounding errors in one direction.
+
+**What remains open:** the columns are still `REAL`. Moving them to integer
+minor units is a schema migration plus a data migration of a live database, and
+this workspace does not touch production data. A new monetary column that is
+not added to `MONEY_FIELDS` in `lib/money.ts` silently stops being quantized;
+`tests/moneyPrecision.test.ts` names the models as a reminder, but it cannot
+know about a column it has never seen.
+
+### The library that signs every order (`BOT-039`)
+
+`binance-api-node@0.12.9` was last published in 2022 and is effectively
+unmaintained. It computes the HMAC-SHA256 signature on every real order this bot
+places.
+
+Locally enforced now, by `tests/exchangeDependency.test.ts`:
+
+- the version is **pinned exactly** (it was `^0.12.9`), so a fresh install
+  cannot resolve a different 0.12.x into the order-signing path, and the
+  lockfile entry must carry an integrity hash;
+- the bot uses exactly four calls from it — `accountInfo`, `exchangeInfo`,
+  `order`, `prices` — so a replacement stays a bounded piece of work;
+- nothing outside `src/services/binance.ts` imports it, so that file is the
+  single seam a replacement swaps;
+- the signing scheme is asserted against the installed dependency and against
+  Binance's own documented example vector, so a dependency that silently changes
+  how it signs fails in CI rather than at the exchange.
+
+**Replacing it is gated on Binance testnet credentials**, which this workspace
+does not hold. Swapping the signer under a live trading bot without validating a
+single round trip is not a safe local change, and the four-call surface plus the
+signature fixture above are what a replacement would have to satisfy.
 
 ## 13. Known gaps and TODOs
 

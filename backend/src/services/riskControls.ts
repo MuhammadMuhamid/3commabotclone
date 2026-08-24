@@ -18,6 +18,7 @@
  * this order be placed" from either side.
  */
 import { prisma } from "../lib/prisma.js";
+import { sumMoney } from "../lib/money.js";
 
 export type HaltSource = "operator" | "daily_loss" | "exposure" | "concurrency";
 
@@ -196,9 +197,9 @@ export async function readBotRiskSnapshot(windowHours: number): Promise<BotRiskS
     }),
   ]);
   return {
-    openExposureQuote: open.reduce((s, t) => s + t.quoteSpent, 0),
+    openExposureQuote: sumMoney(open.map((t) => t.quoteSpent)),
     openTrades: open.length,
-    realisedPnlInWindow: closed.reduce((s, t) => s + t.pnlUsdt, 0),
+    realisedPnlInWindow: sumMoney(closed.map((t) => t.pnlUsdt)),
   };
 }
 

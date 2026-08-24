@@ -19,6 +19,7 @@ import {
 import { parsePair, toBinanceSymbol } from "../lib/symbols.js";
 import { calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
 import { recordPairClose } from "../lib/tradeCloseTracker.js";
+import { sumMoney } from "../lib/money.js";
 
 const TOLERANCE = 0.90; // flag if actual balance < 90% of expected
 
@@ -79,7 +80,7 @@ export async function detectManualCloses(): Promise<void> {
       const actualTotal =
         parseFloat(bal?.free ?? "0") + parseFloat(bal?.locked ?? "0");
 
-      const expectedTotal = groupTrades.reduce((s, t) => s + t.quantity, 0);
+      const expectedTotal = sumMoney(groupTrades.map((t) => t.quantity));
 
       // Within tolerance — everything still open
       if (actualTotal >= expectedTotal * TOLERANCE) continue;
