@@ -8,72 +8,121 @@ datasource db {
 }
 
 model ExchangeAccount {
-  id            String      @id @default(uuid())
-  name          String
-  exchange      String      @default("binance")
-  marketType    String      @default("spot")
-  apiKeyEnc     String
-  apiSecretEnc  String
-  testnet       Boolean     @default(false)
-  createdAt     DateTime    @default(now())
-  updatedAt     DateTime    @updatedAt
-  bots          SignalBot[]
+  id           String      @id @default(uuid())
+  name         String
+  exchange     String      @default("binance")
+  marketType   String      @default("spot")
+  apiKeyEnc    String
+  apiSecretEnc String
+  testnet      Boolean     @default(false)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  bots         SignalBot[]
 }
 
 model SignalBot {
-  id                          String       @id @default(uuid())
-  name                        String
-  alertType                   String       @default("custom")
-  direction                   String       @default("long")
-  pairs                       String
-  maxInvestmentPct            Float        @default(100)
-  maxInvestmentUnit           String       @default("pct_bot")
-  status                      String       @default("active")
-  webhookSecret               String       @unique
+  id                String @id @default(uuid())
+  name              String
+  alertType         String @default("custom")
+  // BOT-012: only "long" is implemented. `binance.ts` hardcodes BUY/SELL and
+  // the value's only backend consumer is a cosmetic label, so "short" and
+  // "reversal" were accepted, stored, offered in the UI, and silently ignored.
+  // The API now refuses anything else; the column keeps existing rows readable.
+  direction         String @default("long")
+  pairs             String
+  /**
+   * BOT-003: this defaulted to 100 with entryVolumePct 100, which makes
+   * `configuredMaximum === usdtBalance` — one order for the entire free USDT
+   * balance. Combined with stopLossEnabled false, takeProfitEnabled false and
+   * exitEnabled false, a bot created by filling in only a name and a pair
+   * converted the whole balance into one spot position with NO automated exit
+   * path at all.
+   * The default is now 5 %. Existing rows keep their stored values — this
+   * changes what a NEW bot starts as, not what a running one does.
+   */
+  maxInvestmentPct  Float  @default(5)
+  maxInvestmentUnit String @default("pct_bot")
+  status            String @default("active")
+  webhookSecret     String @unique
 
-  entryEnabled                Boolean      @default(true)
-  entryVolumePct              Float        @default(100)
-  entryOrderType              String       @default("market")
-  exitEnabled                 Boolean      @default(false)
-  takeProfitEnabled           Boolean      @default(false)
+  entryEnabled                Boolean @default(true)
+  entryVolumePct              Float   @default(100)
+  entryOrderType              String  @default("market")
+  // BOT-015: this defaulted to false, so a default bot REJECTED every exit
+  // webhook — `webhook.ts` enforces it — while BOT_COMPLETE_GUIDE.md asserted
+  // the opposite twice. A bot that can enter and cannot exit is the worst of
+  // the available states.
+  exitEnabled                 Boolean @default(true)
+  takeProfitEnabled           Boolean @default(false)
   takeProfitPct               Float?
-  stopLossEnabled             Boolean      @default(false)
-  stopLossPct                 Float?
+  // BOT-003: a position with no stop is unbounded. On by default, with a 3 %
+  // distance, and the API refuses a large position size with it turned off.
+  stopLossEnabled             Boolean @default(true)
+  stopLossPct                 Float?  @default(3)
   maxEntryOrders              Int?
-  maxActiveSmartTradesEnabled Boolean      @default(false)
+  maxActiveSmartTradesEnabled Boolean @default(false)
   maxActiveSmartTrades        Int?
 
-  exchangeAccountId           String?
-  exchangeAccount             ExchangeAccount? @relation(fields: [exchangeAccountId], references: [id])
-  smartTrades                 SmartTrade[]
-  webhookLogs                 WebhookLog[]
-  createdAt                   DateTime     @default(now())
-  updatedAt                   DateTime     @updatedAt
+  exchangeAccountId String?
+  exchangeAccount   ExchangeAccount? @relation(fields: [exchangeAccountId], references: [id])
+  smartTrades       SmartTrade[]
+  webhookLogs       WebhookLog[]
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
 }
 
 // F5: botId is nullable + SetNull so deleting a bot preserves all historical trades.
 // botName is denormalised so trade history still shows the original bot name after deletion.
 model SmartTrade {
-  id              String         @id @default(uuid())
-  botId           String?
-  bot             SignalBot?     @relation(fields: [botId], references: [id], onDelete: SetNull)
-  botName         String         @default("")
-  pair            String
-  direction       String         @default("long")
-  status          String         @default("active")
-  entryPrice      Float?
-  currentPrice    Float?
-  quantity        Float          @default(0)
-  quoteSpent      Float          @default(0)
-  pnlUsdt         Float          @default(0)
-  pnlPct          Float          @default(0)
-  buyPrice        Float?
-  exchangeOrderId String?
-  closedReason    String?
-  createdAt       DateTime       @default(now())
-  closedAt        DateTime?
-  updatedAt       DateTime       @updatedAt
-  partialCloses   PartialClose[]
+  id                String         @id @default(uuid())
+  botId             String?
+  bot               SignalBot?     @relation(fields: [botId], references: [id], onDelete: SetNull)
+  botName           String         @default("")
+  pair              String
+  direction         String         @default("long")
+  status            String         @default("active")
+  entryPrice        Float?
+  currentPrice      Float?
+  quantity          Float          @default(0)
+  quoteSpent        Float          @default(0)
+  pnlUsdt           Float          @default(0)
+  pnlPct            Float          @default(0)
+  buyPrice          Float?
+  /**
+   * BOT-025: this was nullable and non-unique, so the same exchange order could
+   * be recorded against two trades and there was no way to look a trade up by
+   * the order that created it.
+   * It gains an INDEX rather than a UNIQUE constraint, deliberately. A unique
+   * index would fail to build if a live database already contains a duplicate,
+   * and a migration that refuses to apply blocks startup — a worse outcome than
+   * the defect. The uniqueness guarantee lives on `clientOrderId` below, which
+   * is new and therefore cannot conflict with existing rows.
+   */
+  exchangeOrderId   String?
+  /**
+   * Deterministic client order id, so an order that succeeded at Binance but
+   * threw locally afterwards can be found again (BOT-007).
+   */
+  clientOrderId     String?        @unique
+  /**
+   * Client order id of the resting exchange-side protective order, when one
+   * was placed. Disabled by default — see services/exchangeStops.ts.
+   */
+  protectiveOrderId String?
+  closedReason      String?
+  createdAt         DateTime       @default(now())
+  closedAt          DateTime?
+  updatedAt         DateTime       @updatedAt
+  partialCloses     PartialClose[]
+
+  // BOT-024: every hot query filters on status, and most also on bot or pair.
+  // Without these, the 30-second TP/SL loop and the 60-second manual-close sync
+  // both table-scan on every tick.
+  @@index([status])
+  @@index([botId, status])
+  @@index([pair, status])
+  @@index([closedAt])
+  @@index([exchangeOrderId])
 }
 
 // F4: Each row records one partial sell on an active trade.
@@ -88,6 +137,11 @@ model PartialClose {
   avgPrice        Float
   exchangeOrderId String?
   createdAt       DateTime   @default(now())
+
+  // BOT-024: this index existed and was DROPPED by
+  // 20260712224627_web_push_security/migration.sql, never recreated. Every
+  // final close reads a trade's partial closes to accumulate their P&L.
+  @@index([tradeId])
 }
 
 model WebhookLog {
@@ -103,13 +157,13 @@ model WebhookLog {
 // ─── Auth ──────────────────────────────────────────────────────────────────
 
 model User {
-  id            String         @id @default(uuid())
-  username      String         @unique
-  passwordHash  String
-  totpSecret    String?
-  totpEnabled   Boolean        @default(false)
-  createdAt     DateTime       @default(now())
-  refreshTokens RefreshToken[]
+  id                String             @id @default(uuid())
+  username          String             @unique
+  passwordHash      String
+  totpSecret        String?
+  totpEnabled       Boolean            @default(false)
+  createdAt         DateTime           @default(now())
+  refreshTokens     RefreshToken[]
   pushSubscriptions PushSubscription[]
 }
 
@@ -141,4 +195,40 @@ model RefreshToken {
   tokenHash String   @unique
   expiresAt DateTime
   createdAt DateTime @default(now())
+}
+
+/**
+ * BOT-019: the stale-sell guard was an in-memory Map that evaporated on
+ * restart, while the idempotency guard beside it (`WebhookReceipt`) was
+ * deliberately durable. After a restart the guard was blind, so a delayed SELL
+ * meant for a closed trade could close the trade that replaced it.
+ * One row per (bot, pair), updated on every close.
+ */
+model PairCloseMark {
+  id        String   @id @default(uuid())
+  botId     String
+  pair      String
+  closedAt  DateTime
+  createdAt DateTime @default(now())
+
+  @@unique([botId, pair])
+  @@index([closedAt])
+}
+
+/**
+ * BOT-011: account-level risk controls. A single row, `id = "global"`.
+ * Every limit is null (disabled) and `tradingHalted` false on creation, so
+ * adding this table changes no behaviour until an operator sets a number.
+ */
+model RiskControl {
+  id                    String    @id @default("global")
+  tradingHalted         Boolean   @default(false)
+  haltedReason          String?
+  haltedBy              String?
+  haltedAt              DateTime?
+  maxTotalExposureQuote Float?
+  maxConcurrentTrades   Int?
+  maxDailyLossQuote     Float?
+  dailyLossWindowHours  Int       @default(24)
+  updatedAt             DateTime  @updatedAt
 }

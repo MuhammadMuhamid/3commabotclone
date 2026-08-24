@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { processWebhook } from "../services/webhook.js";
 import { positionStatusSchema, webhookSchema } from "./webhookSchema.js";
+import { httpStatusFor, isReceiverOutcome } from "../contract/webhookContract.js";
 
 export const webhooksRouter = Router();
 
@@ -40,7 +41,17 @@ webhooksRouter.post("/signal_bots", async (req, res) => {
       return res.status(400).json({ error: parsed.error.errors[0]?.message ?? "Invalid webhook payload" });
     }
     const result = await processWebhook(parsed.data);
-    res.json(result);
+    /*
+     * X-12: three different meanings used to share HTTP 200, and the sender's
+     * success test was `res.ok`. `ignored_stale_sell` in particular means NO
+     * order was placed and the receiver is STILL LONG — so a sender that
+     * ignores the body must fail safe, which means a non-2xx.
+     *
+     * `ok` and `ignored_duplicate` stay 200: a duplicate implies the original
+     * order landed, so it is genuinely a success from the sender's view.
+     */
+    const status = isReceiverOutcome(result.status) ? httpStatusFor(result.status) : 200;
+    res.status(status).json(result);
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Webhook error";
     const code =

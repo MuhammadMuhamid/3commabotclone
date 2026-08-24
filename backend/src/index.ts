@@ -10,10 +10,12 @@ import { tradesRouter } from "./routes/trades.js";
 import { webhooksRouter } from "./routes/webhooks.js";
 import { authRouter } from "./routes/auth.js";
 import { notificationsRouter } from "./routes/notifications.js";
+import { operationsRouter } from "./routes/operations.js";
 import { requireAuth } from "./middleware/requireAuth.js";
 import { checkTakeProfitStopLoss } from "./services/smartTrade.js";
 import { detectManualCloses } from "./services/manualCloseSync.js";
 import { prisma } from "./lib/prisma.js";
+import { pruneCloseMarks } from "./lib/tradeCloseTracker.js";
 import { errorHandler, notFoundHandler } from "./middleware/errors.js";
 
 // Hard-fail in production if any critical secret is missing
@@ -152,6 +154,7 @@ app.use("/api/exchange-accounts", requireAuth, apiLimiter, exchangeRouter);
 app.use("/api/bots",              requireAuth, apiLimiter, botsRouter);
 app.use("/api/trades",            requireAuth, apiLimiter, tradesRouter);
 app.use("/api/notifications",     requireAuth, apiLimiter, notificationsRouter);
+app.use("/api/ops",               requireAuth, apiLimiter, operationsRouter);
 
 // ─── Terminal error handling ──────────────────────────────────────────────────
 // Express 4 does not catch a rejected promise from an async handler, so a
@@ -172,8 +175,11 @@ setInterval(() => {
   detectManualCloses().catch(console.error);
 }, 60_000);
 
-// Webhook log retention — prune entries older than 30 days
+// Webhook log retention — prune entries older than 30 days, and the durable
+// stale-sell markers past their TTL (BOT-019).
 async function pruneWebhookLogs(): Promise<void> {
+  const pruned = await pruneCloseMarks();
+  if (pruned > 0) console.log(`[cleanup] Pruned ${pruned} expired pair-close marker(s)`);
   const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   const { count } = await prisma.webhookLog.deleteMany({
     where: { createdAt: { lt: cutoff } },

@@ -14,10 +14,32 @@ const investmentUnitSchema = z.enum([
   "usdt_trade",
 ]);
 
-const botSchema = z.object({
+/**
+ * The position-size fraction above which a stop loss stops being optional.
+ *
+ * BOT-003: the shipped defaults were `maxInvestmentPct: 100` with
+ * `entryVolumePct: 100` and every exit control off, which turns the entire free
+ * USDT balance into one spot position with no automated exit path. Defaults are
+ * fixed below; this constant is the API-level refusal that stops the same
+ * configuration being rebuilt by hand.
+ */
+export const UNPROTECTED_SIZE_LIMIT_PCT = 50;
+
+const botBaseSchema = z.object({
   name: z.string().min(1),
   alertType: z.enum(["custom", "tradingview"]).default("custom"),
-  direction: z.enum(["long", "short", "reversal"]).default("long"),
+  /*
+   * BOT-012: "short" and "reversal" were accepted, stored, and offered in the
+   * UI with no caveat, while `binance.ts` hardcodes BUY and SELL and the
+   * value's only backend consumer is a cosmetic label. A user could configure
+   * a short bot, watch it accept signals, and get long positions. Contrast
+   * `entryOrderType`, whose unimplemented "limit" state IS warned about in the
+   * form.
+   *
+   * Only "long" is accepted until shorts actually exist. The database column
+   * keeps any existing value readable.
+   */
+  direction: z.literal("long").default("long"),
   pairs: z.array(z.string()).min(1),
   maxInvestmentPct: z.number().min(0.01).max(10000),
   maxInvestmentUnit: investmentUnitSchema.default("pct_bot"),
@@ -25,15 +47,59 @@ const botSchema = z.object({
   entryEnabled: z.boolean().default(true),
   entryVolumePct: z.number().min(1).max(100).default(100),
   entryOrderType: z.enum(["market", "limit"]).default("market"),
-  exitEnabled: z.boolean().default(false),
+  // BOT-015: defaulted false, so a default bot rejected every exit webhook.
+  exitEnabled: z.boolean().default(true),
   takeProfitEnabled: z.boolean().default(false),
-  takeProfitPct: z.number().optional().nullable(),
-  stopLossEnabled: z.boolean().default(false),
-  stopLossPct: z.number().optional().nullable(),
-  maxEntryOrders: z.number().optional().nullable(),
+  takeProfitPct: z.number().positive().max(1000).optional().nullable(),
+  // BOT-003: defaulted false, leaving the position unbounded.
+  stopLossEnabled: z.boolean().default(true),
+  stopLossPct: z.number().positive().max(100).optional().nullable(),
+  maxEntryOrders: z.number().int().min(1).optional().nullable(),
   maxActiveSmartTradesEnabled: z.boolean().default(false),
   maxActiveSmartTrades: z.number().int().min(1).optional().nullable(),
 });
+
+/**
+ * The cross-field safety rules, applied to a COMPLETE configuration.
+ *
+ * Split out from the object schema so a PATCH can be checked against the merged
+ * result rather than against the patch alone — otherwise a request that only
+ * turns `stopLossEnabled` off would pass, and BOT-003's configuration could be
+ * rebuilt one field at a time.
+ */
+export function assertSafeBotConfig(b: {
+  maxInvestmentPct: number;
+  maxInvestmentUnit: string;
+  entryVolumePct: number;
+  stopLossEnabled: boolean;
+  stopLossPct?: number | null;
+  takeProfitEnabled: boolean;
+  takeProfitPct?: number | null;
+}): string | null {
+  const isPct = b.maxInvestmentUnit === "pct_bot" || b.maxInvestmentUnit === "pct_trade";
+  if (isPct) {
+    const effective = (b.maxInvestmentPct * b.entryVolumePct) / 100;
+    if (effective >= UNPROTECTED_SIZE_LIMIT_PCT && !b.stopLossEnabled) {
+      return (
+        `A position of ${UNPROTECTED_SIZE_LIMIT_PCT}% of the balance or more requires a ` +
+        "stop loss. Either enable stopLossEnabled or reduce maxInvestmentPct / entryVolumePct."
+      );
+    }
+  }
+  if (b.stopLossEnabled && (b.stopLossPct ?? 0) <= 0) {
+    return "stopLossPct must be greater than 0 when a stop loss is enabled";
+  }
+  if (b.takeProfitEnabled && (b.takeProfitPct ?? 0) <= 0) {
+    return "takeProfitPct must be greater than 0 when a take profit is enabled";
+  }
+  return null;
+}
+
+const botSchema = botBaseSchema
+  .refine((b) => assertSafeBotConfig(b) === null, (b) => ({
+    message: assertSafeBotConfig(b) ?? "invalid configuration",
+    path: ["stopLossEnabled"],
+  }));
 
 function webhookUrl(): string {
   return `${config.publicUrl}/api/webhooks/signal_bots`;
@@ -257,15 +323,33 @@ botsRouter.patch("/:id", async (req, res) => {
   if (!existing) return res.status(404).json({ error: "Not found" });
 
   // BUG-10: Catch ZodError with a structured 400 response
-  let body: Partial<z.infer<typeof botSchema>>;
+  let body: Partial<z.infer<typeof botBaseSchema>>;
   try {
-    body = botSchema.partial().parse(req.body);
+    body = botBaseSchema.partial().parse(req.body);
   } catch (e) {
     if (e instanceof z.ZodError) {
       return res.status(400).json({ error: e.errors[0]?.message ?? "Invalid input" });
     }
     return res.status(400).json({ error: "Invalid request body" });
   }
+  /*
+   * The cross-field rules are checked against the MERGED configuration, not the
+   * patch. A request that only turns `stopLossEnabled` off would otherwise
+   * pass, and BOT-003's unprotected-full-balance configuration could be rebuilt
+   * one field at a time.
+   */
+  const merged = {
+    maxInvestmentPct: body.maxInvestmentPct ?? existing.maxInvestmentPct,
+    maxInvestmentUnit: body.maxInvestmentUnit ?? existing.maxInvestmentUnit,
+    entryVolumePct: body.entryVolumePct ?? existing.entryVolumePct,
+    stopLossEnabled: body.stopLossEnabled ?? existing.stopLossEnabled,
+    stopLossPct: body.stopLossPct ?? existing.stopLossPct,
+    takeProfitEnabled: body.takeProfitEnabled ?? existing.takeProfitEnabled,
+    takeProfitPct: body.takeProfitPct ?? existing.takeProfitPct,
+  };
+  const unsafe = assertSafeBotConfig(merged);
+  if (unsafe) return res.status(400).json({ error: unsafe });
+
   const { pairs, maxActiveSmartTradesEnabled, maxActiveSmartTrades, ...rest } = body;
   const data: Record<string, unknown> = { ...rest };
 
