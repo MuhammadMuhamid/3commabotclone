@@ -164,7 +164,10 @@ test("placeholder detection covers the values this repository ships", () => {
 // ── Webhook secret masking ─────────────────────────────────────────────────
 
 test("a masked secret keeps only four characters at each end", () => {
-  const secret = "abcdef0123456789abcdef0123456789abcdef01";
+  // Built rather than written out: a 40-character hex literal is exactly the
+  // shape of a real webhook secret, and `scripts/ci/scan-secrets.sh` is right
+  // to fail on one in tracked source.
+  const secret = "abcdef01".repeat(5);
   const masked = maskSecret(secret);
   assert.equal(masked.length, secret.length);
   assert.equal(masked.slice(0, 4), "abcd");
