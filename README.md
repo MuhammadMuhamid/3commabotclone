@@ -6,9 +6,9 @@ Full-stack signal trading bot: connect **Binance Spot**, receive **TradingView w
 
 ## What this repository is, and what it is not
 
-This is the **execution** half of a two-repository system.
+This is the **execution** half of the system.
 
-| | This repository | Platform (`MuhammadMuhamid/pythoncryptobacktesingsystems`) |
+| | This repository | Platform (`MuhammadMuhamid/my-tradingview-clone`) |
 |---|---|---|
 | Decides when to trade | no | **yes** |
 | Places exchange orders | **yes** | no |
@@ -22,6 +22,13 @@ idea.
 **Keeping exchange credentials in this process alone is the point of the split.**
 Do not move credential handling into the platform, and do not merge the two
 repositories.
+
+There is a third repository,
+[`MuhammadMuhamid/pythoncryptobacktesingsystems`](https://github.com/MuhammadMuhamid/pythoncryptobacktesingsystems),
+which holds the optimizer trees and research. It is offline analysis: it never
+sends an instruction here and this repository never reads from it. It is named
+only so the name is not mistaken for the platform — it held both until the
+repositories were separated on 2026-08-22.
 
 The cross-repository payload contract is documented in the platform repository
 at `docs/WEBHOOK-CONTRACT.md`. Change it on both sides, and in that document, in
