@@ -12,6 +12,11 @@ export const positionStatusSchema = z.object({
   symbols: z.array(z.string().min(3).max(40)).min(1).max(100),
 }).strict();
 
+/** Account-level read-only status, authenticated by an existing bot secret. */
+export const operationalStatusSchema = z.object({
+  secret: z.string().min(32).max(256),
+}).strict();
+
 export const webhookSchema = z.object({
   secret: z.string().min(32).max(256),
   action: z.string().min(1).max(40),

@@ -1,9 +1,25 @@
 import { Router } from "express";
 import { processWebhook } from "../services/webhook.js";
-import { positionStatusSchema, webhookSchema } from "./webhookSchema.js";
+import { operationalStatusSchema, positionStatusSchema, webhookSchema } from "./webhookSchema.js";
 import { httpStatusFor, isReceiverOutcome } from "../contract/webhookContract.js";
+import { readBotOperationalStatusForSecret } from "../services/operationalStatus.js";
+import { asyncHandler } from "../middleware/errors.js";
 
 export const webhooksRouter = Router();
+
+/**
+ * Small account-level operational contract for the platform. The existing
+ * webhook secret is sufficient trust: its holder can already place real
+ * orders, while this endpoint is read-only and returns no account identifiers,
+ * key material, stored secret, token, or exchange response.
+ */
+export const operationalStatusHandler = asyncHandler(async (req, res) => {
+  const parsed = operationalStatusSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid operations status request" });
+  const status = await readBotOperationalStatusForSecret(parsed.data.secret);
+  if (!status) return res.status(401).json({ error: "Invalid secret" });
+  return res.json(status);
+});
 
 /**
  * Authenticated position-state endpoint for the local strategy runner.

@@ -7,7 +7,7 @@ import { config, assertConfig } from "./config.js";
 import { exchangeRouter } from "./routes/exchange.js";
 import { botsRouter } from "./routes/bots.js";
 import { tradesRouter } from "./routes/trades.js";
-import { webhooksRouter } from "./routes/webhooks.js";
+import { operationalStatusHandler, webhooksRouter } from "./routes/webhooks.js";
 import { authRouter } from "./routes/auth.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { operationsRouter } from "./routes/operations.js";
@@ -145,6 +145,13 @@ app.use("/api/auth", authRouter);
 // Webhook routes: auth-exempt so TradingView can POST without a session.
 // Order signals and the position-status poll get separate budgets — see above.
 app.use("/api/webhooks/signal_bots/status", webhookStatusLimiter);
+// This read-only platform poll must not spend from the real-order signal
+// budget. Register the complete handler before the generic webhook limiter.
+app.post(
+  "/api/webhooks/signal_bots/operations",
+  webhookStatusLimiter,
+  operationalStatusHandler
+);
 app.use("/api/webhooks", webhookLimiter, webhooksRouter);
 
 // ─── Protected routes (requireAuth applied globally below) ───────────────────

@@ -53,6 +53,28 @@ export interface BotRiskSnapshot {
   realisedPnlInWindow: number;
 }
 
+export interface ClosedTradePnl {
+  pnlUsdt: number;
+  partialCloses: Array<{ pnlUsdt: number }>;
+}
+
+/**
+ * Realised P&L is event-based. A closed trade's `pnlUsdt` already includes all
+ * of its partial closes, possibly from earlier days, so its final-close event
+ * is the total minus those partials. Partials inside the requested window are
+ * then added at their own timestamps. This avoids both omission and double
+ * counting around a UTC-day or rolling-window boundary.
+ */
+export function realisedPnlFromTradeEvents(
+  closedInWindow: ClosedTradePnl[],
+  partialsInWindow: Array<{ pnlUsdt: number }>
+): number {
+  const finalLegs = closedInWindow.map((trade) =>
+    trade.pnlUsdt - sumMoney(trade.partialCloses.map((partial) => partial.pnlUsdt))
+  );
+  return sumMoney([...finalLegs, ...partialsInWindow.map((partial) => partial.pnlUsdt)]);
+}
+
 export type BotRiskBlockCode =
   | "trading_halted"
   | "max_exposure"
@@ -182,8 +204,8 @@ export async function updateBotRiskLimits(patch: {
  * `quoteSpent` on an open trade is what was actually committed, so exposure
  * here is an observation rather than the platform's intent-based estimate.
  */
-export async function readBotRiskSnapshot(windowHours: number): Promise<BotRiskSnapshot> {
-  const [open, closed] = await Promise.all([
+export async function readBotRiskSnapshotSince(since: Date): Promise<BotRiskSnapshot> {
+  const [open, closed, partials] = await Promise.all([
     prisma.smartTrade.findMany({
       where: { status: "active" },
       select: { quoteSpent: true },
@@ -191,16 +213,27 @@ export async function readBotRiskSnapshot(windowHours: number): Promise<BotRiskS
     prisma.smartTrade.findMany({
       where: {
         status: "closed",
-        closedAt: { gte: new Date(Date.now() - windowHours * 3_600_000) },
+        closedAt: { gte: since },
       },
+      select: {
+        pnlUsdt: true,
+        partialCloses: { select: { pnlUsdt: true } },
+      },
+    }),
+    prisma.partialClose.findMany({
+      where: { createdAt: { gte: since } },
       select: { pnlUsdt: true },
     }),
   ]);
   return {
     openExposureQuote: sumMoney(open.map((t) => t.quoteSpent)),
     openTrades: open.length,
-    realisedPnlInWindow: sumMoney(closed.map((t) => t.pnlUsdt)),
+    realisedPnlInWindow: realisedPnlFromTradeEvents(closed, partials),
   };
+}
+
+export async function readBotRiskSnapshot(windowHours: number): Promise<BotRiskSnapshot> {
+  return readBotRiskSnapshotSince(new Date(Date.now() - windowHours * 3_600_000));
 }
 
 /** One-line operator summary. */
