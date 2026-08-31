@@ -164,7 +164,7 @@ export async function marketBuyQuote(
   client: BinanceClient,
   symbol: string,
   quoteUsdt: number,
-  opts: { idempotencyScope?: string } = {}
+  opts: { idempotencyScope?: string; explicitClientOrderId?: string; dryRun?: boolean } = {}
 ): Promise<OrderResult> {
   const sym = toBinanceSymbol(symbol);
   const quote = floorQuote(quoteUsdt);
@@ -177,11 +177,11 @@ export async function marketBuyQuote(
    * exercised at all — the mode recommended for pre-live validation could not
    * validate an exit.
    */
-  if (config.dryRun) {
+  if (opts.dryRun ?? config.dryRun) {
     const price = await getTickerPrice(client, sym);
     const qty = price > 0 ? quote / price : 0;
     return {
-      orderId: `dry-${clientOrderId(opts.idempotencyScope ?? `${sym}:${quote}`)}`,
+      orderId: `dry-${opts.explicitClientOrderId ?? clientOrderId(opts.idempotencyScope ?? `${sym}:${quote}`)}`,
       executedQty: qty,
       cummulativeQuoteQty: quote,
       avgPrice: price,
@@ -204,7 +204,9 @@ export async function marketBuyQuote(
       type: "MARKET",
       quoteOrderQty: quote.toFixed(2),
       // BOT-007: makes the order findable if the local write throws next.
-      ...(opts.idempotencyScope ? { newClientOrderId: clientOrderId(opts.idempotencyScope) } : {}),
+      ...(opts.explicitClientOrderId
+        ? { newClientOrderId: opts.explicitClientOrderId }
+        : opts.idempotencyScope ? { newClientOrderId: clientOrderId(opts.idempotencyScope) } : {}),
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
     wrapExchangeError(err, sym);
@@ -296,7 +298,7 @@ export async function marketSellBase(
   client: BinanceClient,
   symbol: string,
   quantity: number,
-  opts: { idempotencyScope?: string } = {}
+  opts: { idempotencyScope?: string; explicitClientOrderId?: string; dryRun?: boolean } = {}
 ): Promise<OrderResult> {
   const sym = toBinanceSymbol(symbol);
 
@@ -312,11 +314,11 @@ export async function marketSellBase(
    * Dry run now simulates the exchange completely: the only real call is a
    * price lookup, and the quantity is whatever the simulated position holds.
    */
-  if (config.dryRun) {
+  if (opts.dryRun ?? config.dryRun) {
     const price = await getTickerPrice(client, sym);
     const qty = Math.max(0, quantity);
     return {
-      orderId: `dry-${clientOrderId(opts.idempotencyScope ?? `${sym}:sell:${qty}`)}`,
+      orderId: `dry-${opts.explicitClientOrderId ?? clientOrderId(opts.idempotencyScope ?? `${sym}:sell:${qty}`)}`,
       executedQty: qty,
       cummulativeQuoteQty: qty * price,
       avgPrice: price,
@@ -333,7 +335,9 @@ export async function marketSellBase(
       side: "SELL",
       type: "MARKET",
       quantity: qty.toFixed(8).replace(/\.?0+$/, "") || "0",
-      ...(opts.idempotencyScope ? { newClientOrderId: clientOrderId(opts.idempotencyScope) } : {}),
+      ...(opts.explicitClientOrderId
+        ? { newClientOrderId: opts.explicitClientOrderId }
+        : opts.idempotencyScope ? { newClientOrderId: clientOrderId(opts.idempotencyScope) } : {}),
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
     wrapExchangeError(err, sym);

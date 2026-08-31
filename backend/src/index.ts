@@ -11,6 +11,7 @@ import { operationalStatusHandler, webhooksRouter } from "./routes/webhooks.js";
 import { authRouter } from "./routes/auth.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { operationsRouter } from "./routes/operations.js";
+import { manualTradingRouter } from "./routes/manualTrading.js";
 import { requireAuth } from "./middleware/requireAuth.js";
 import { checkTakeProfitStopLoss } from "./services/smartTrade.js";
 import { detectManualCloses } from "./services/manualCloseSync.js";
@@ -18,6 +19,7 @@ import { prisma } from "./lib/prisma.js";
 import { pruneCloseMarks } from "./lib/tradeCloseTracker.js";
 import { errorHandler, notFoundHandler } from "./middleware/errors.js";
 import { startInterval } from "./lib/scheduler.js";
+import { checkManualProtection, reconcileManualTrading } from "./services/manualProtection.js";
 
 // Hard-fail in production if any critical secret is missing
 assertConfig();
@@ -153,6 +155,9 @@ app.post(
   operationalStatusHandler
 );
 app.use("/api/webhooks", webhookLimiter, webhooksRouter);
+// Separate service-to-service HMAC contract; never accepts strategy body secrets
+// or browser cookies as authentication.
+app.use("/api/manual-trading", apiLimiter, manualTradingRouter);
 
 // ─── Protected routes (requireAuth applied globally below) ───────────────────
 app.get("/api/config", requireAuth, apiLimiter, (_req, res) => {
@@ -189,6 +194,9 @@ startInterval("tpsl", 30_000, checkTakeProfitStopLoss);
 
 // F2: Detect positions closed directly on Binance
 startInterval("manual-close-sync", 60_000, detectManualCloses);
+void reconcileManualTrading().catch((e) => console.error("manual reconciliation failed", e));
+startInterval("manual-order-reconcile", 30_000, reconcileManualTrading);
+startInterval("manual-tpsl", 30_000, checkManualProtection);
 
 // Webhook log retention — prune entries older than 30 days, and the durable
 // stale-sell markers past their TTL (BOT-019).

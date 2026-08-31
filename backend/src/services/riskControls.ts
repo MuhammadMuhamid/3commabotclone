@@ -205,7 +205,7 @@ export async function updateBotRiskLimits(patch: {
  * here is an observation rather than the platform's intent-based estimate.
  */
 export async function readBotRiskSnapshotSince(since: Date): Promise<BotRiskSnapshot> {
-  const [open, closed, partials] = await Promise.all([
+  const [open, closed, partials, pendingManualBuys] = await Promise.all([
     prisma.smartTrade.findMany({
       where: { status: "active" },
       select: { quoteSpent: true },
@@ -224,10 +224,19 @@ export async function readBotRiskSnapshotSince(since: Date): Promise<BotRiskSnap
       where: { createdAt: { gte: since } },
       select: { pnlUsdt: true },
     }),
+    // A resting manual BUY LIMIT has reserved risk even before it becomes a
+    // SmartTrade. Count only its unfilled quote remainder, so a partial fill is
+    // represented once here and once by the canonical open trade.
+    prisma.manualOrder.findMany({
+      where: { side: "BUY", status: { in: ["requested", "submitted", "open", "partially_filled"] } },
+      select: { requestedQuoteQty: true, filledQuoteQty: true, filledBaseQty: true },
+    }),
   ]);
+  const pendingExposure = sumMoney(pendingManualBuys.map((order) =>
+    Math.max(0, (order.requestedQuoteQty ?? 0) - order.filledQuoteQty)));
   return {
-    openExposureQuote: sumMoney(open.map((t) => t.quoteSpent)),
-    openTrades: open.length,
+    openExposureQuote: sumMoney([...open.map((t) => t.quoteSpent), pendingExposure]),
+    openTrades: open.length + pendingManualBuys.filter((order) => order.filledBaseQty <= 0).length,
     realisedPnlInWindow: realisedPnlFromTradeEvents(closed, partials),
   };
 }

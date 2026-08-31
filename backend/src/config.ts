@@ -94,6 +94,11 @@ export const config = {
   binanceApiSecret: process.env.BINANCE_API_SECRET ?? "",
   binanceTestnet: (process.env.BINANCE_TESTNET ?? "false").toLowerCase() === "true",
 
+  // Distinct platform -> bot manual-order channel. Disabled unless explicitly armed.
+  manualTradingEnabled: process.env.MANUAL_TRADING_ENABLED === "true",
+  mainnetManualTradingEnabled: process.env.MAINNET_MANUAL_TRADING_ENABLED === "true",
+  manualTradingHmacSecret: process.env.MANUAL_TRADING_HMAC_SECRET ?? "",
+
   vapidPublicKey: process.env.VAPID_PUBLIC_KEY ?? "",
   vapidPrivateKey: process.env.VAPID_PRIVATE_KEY ?? "",
   vapidSubject: process.env.VAPID_SUBJECT ?? "mailto:alerts@localhost",
@@ -133,6 +138,12 @@ export function collectConfigErrors(): string[] {
   }
   if (config.setupToken && isPublishedPlaceholder(config.setupToken)) {
     errors.push("SETUP_TOKEN is a value published in this repository — generate a real one");
+  }
+
+  if (config.manualTradingEnabled && config.manualTradingHmacSecret.length < 32) {
+    errors.push("MANUAL_TRADING_HMAC_SECRET must be at least 32 characters when manual trading is enabled");
+  } else if (config.manualTradingEnabled && isPublishedPlaceholder(config.manualTradingHmacSecret)) {
+    errors.push("MANUAL_TRADING_HMAC_SECRET is a published placeholder value — generate a real one");
   }
 
   const vapidCount = [config.vapidPublicKey, config.vapidPrivateKey].filter(Boolean).length;

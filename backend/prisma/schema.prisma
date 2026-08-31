@@ -18,6 +18,8 @@ model ExchangeAccount {
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
   bots         SignalBot[]
+  manualOrders ManualOrder[]
+  smartTrades  SmartTrade[]
 }
 
 model SignalBot {
@@ -115,6 +117,17 @@ model SmartTrade {
   updatedAt         DateTime       @updatedAt
   partialCloses     PartialClose[]
 
+  /** Manual Spot positions reuse the canonical trade ledger. */
+  source             String           @default("strategy")
+  exchangeAccountId  String?
+  exchangeAccount    ExchangeAccount? @relation(fields: [exchangeAccountId], references: [id])
+  manualOrderId      String?          @unique
+  manualOrder        ManualOrder?     @relation("ManualEntryTrade", fields: [manualOrderId], references: [id], onDelete: SetNull)
+  manualTpPrice      Float?
+  manualSlPrice      Float?
+  protectionType     String?
+  protectionState    String?
+
   // BOT-024: every hot query filters on status, and most also on bot or pair.
   // Without these, the 30-second TP/SL loop and the 60-second manual-close sync
   // both table-scan on every tick.
@@ -123,6 +136,66 @@ model SmartTrade {
   @@index([pair, status])
   @@index([closedAt])
   @@index([exchangeOrderId])
+  @@index([exchangeAccountId, status])
+}
+
+/**
+ * Durable lifecycle for manual Spot orders. This is an order ledger, not a
+ * second position/trade ledger: filled BUY entries point at SmartTrade.
+ */
+model ManualOrder {
+  id                   String           @id @default(uuid())
+  requestId            String           @unique
+  exchangeAccountId    String
+  exchangeAccount      ExchangeAccount  @relation(fields: [exchangeAccountId], references: [id])
+  entryTrade            SmartTrade?      @relation("ManualEntryTrade")
+  linkedPositionId      String?
+  symbol                String
+  side                  String
+  orderType             String
+  quantityType          String
+  requestedBaseQty      Float?
+  requestedQuoteQty     Float?
+  limitPrice            Float?
+  takeProfitPrice       Float?
+  stopLossPrice         Float?
+  protectionType        String?
+  protectionState       String?
+  status                String           @default("requested")
+  exchangeOrderId       String?
+  clientOrderId         String            @unique
+  filledBaseQty         Float             @default(0)
+  filledQuoteQty        Float             @default(0)
+  averageFillPrice      Float?
+  error                 String?
+  submittedAt           DateTime?
+  completedAt           DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  @@index([status, createdAt])
+  @@index([exchangeAccountId, symbol, createdAt])
+}
+
+/** Every platform command has one durable, replayable result. */
+model ManualCommand {
+  id        String   @id @default(uuid())
+  requestId String   @unique
+  kind      String
+  status    String   @default("processing")
+  result    String?
+  error     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/** HMAC nonces are persisted so replay protection survives restarts/workers. */
+model ManualNonce {
+  nonce     String   @id
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
 }
 
 // F4: Each row records one partial sell on an active trade.
