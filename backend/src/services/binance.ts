@@ -143,6 +143,42 @@ function wrapExchangeError(err: unknown, symbol: string): never {
   throw new ExchangeError(message, code, symbol);
 }
 
+/**
+ * Resolve an ambiguous MARKET submission by its deterministic client order id.
+ * Only FILLED is usable by the current SmartTrade lifecycle; NEW or partial
+ * results remain uncertain rather than being recorded as a completed entry or
+ * exit. BUY recovery also requires fills so base-asset commission stays net.
+ */
+async function recoverFilledMarketOrder(
+  client: BinanceClient,
+  symbol: string,
+  side: "BUY" | "SELL",
+  stableClientOrderId: string
+): Promise<OrderResult | null> {
+  try {
+    const order = await client.getOrder({
+      symbol, origClientOrderId: stableClientOrderId,
+    } as Parameters<BinanceClient["getOrder"]>[0]);
+    if (String(order.status) !== "FILLED" || String(order.side) !== side) return null;
+    const grossQty = Number(order.executedQty ?? 0);
+    const quote = Number(order.cummulativeQuoteQty ?? 0);
+    if (!(grossQty > 0) || !(quote >= 0)) return null;
+    let executedQty = grossQty;
+    if (side === "BUY") {
+      const trades = await client.myTrades({
+        symbol, orderId: Number(order.orderId),
+      } as Parameters<BinanceClient["myTrades"]>[0]);
+      executedQty = netBaseQty(grossQty, trades, parsePair(symbol).base);
+    }
+    return {
+      orderId: String(order.orderId), executedQty, cummulativeQuoteQty: quote,
+      avgPrice: quote / grossQty, simulated: false,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** The symbol's minimum order notional, or 0 when the filter is absent. */
 export async function getMinNotional(client: BinanceClient, symbol: string): Promise<number> {
   const sym = toBinanceSymbol(symbol);
@@ -196,6 +232,8 @@ export async function marketBuyQuote(
     throw new MinNotionalError(minNotional, quote, sym);
   }
 
+  const stableClientOrderId = opts.explicitClientOrderId ??
+    (opts.idempotencyScope ? clientOrderId(opts.idempotencyScope) : undefined);
   let order;
   try {
     order = await client.order({
@@ -204,11 +242,13 @@ export async function marketBuyQuote(
       type: "MARKET",
       quoteOrderQty: quote.toFixed(2),
       // BOT-007: makes the order findable if the local write throws next.
-      ...(opts.explicitClientOrderId
-        ? { newClientOrderId: opts.explicitClientOrderId }
-        : opts.idempotencyScope ? { newClientOrderId: clientOrderId(opts.idempotencyScope) } : {}),
+      ...(stableClientOrderId ? { newClientOrderId: stableClientOrderId } : {}),
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
+    if ((err as { code?: unknown }).code === undefined && stableClientOrderId) {
+      const recovered = await recoverFilledMarketOrder(client, sym, "BUY", stableClientOrderId);
+      if (recovered) return recovered;
+    }
     wrapExchangeError(err, sym);
   }
 
@@ -328,6 +368,8 @@ export async function marketSellBase(
 
   const qty = await resolveSellQuantity(client, sym, quantity);
 
+  const stableClientOrderId = opts.explicitClientOrderId ??
+    (opts.idempotencyScope ? clientOrderId(opts.idempotencyScope) : undefined);
   let order;
   try {
     order = await client.order({
@@ -335,11 +377,13 @@ export async function marketSellBase(
       side: "SELL",
       type: "MARKET",
       quantity: qty.toFixed(8).replace(/\.?0+$/, "") || "0",
-      ...(opts.explicitClientOrderId
-        ? { newClientOrderId: opts.explicitClientOrderId }
-        : opts.idempotencyScope ? { newClientOrderId: clientOrderId(opts.idempotencyScope) } : {}),
+      ...(stableClientOrderId ? { newClientOrderId: stableClientOrderId } : {}),
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
+    if ((err as { code?: unknown }).code === undefined && stableClientOrderId) {
+      const recovered = await recoverFilledMarketOrder(client, sym, "SELL", stableClientOrderId);
+      if (recovered) return recovered;
+    }
     wrapExchangeError(err, sym);
   }
 

@@ -9,6 +9,8 @@ import {
   marketBuyQuote,
   marketSellBase,
   clientOrderId,
+  ExchangeError,
+  MinNotionalError,
   type BinanceClient,
 } from "./binance.js";
 import { updateSmartTradePnl, calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
@@ -24,7 +26,6 @@ import crypto from "crypto";
 import { Prisma } from "@prisma/client";
 import { sendExecutionNotification } from "./push.js";
 
-const dedupe = new Map<string, number>();
 const DEDUPE_TTL = 120_000;
 /** Blocks a second buy/sell for same bot+pair within this window (TV order-fill duplicate guard) */
 const TRADE_DEDUPE_TTL = 45_000;
@@ -32,23 +33,12 @@ const TRADE_DEDUPE_TTL = 45_000;
 // BUG-04: Per-bot lock prevents concurrent buys from racing past assertCanOpenTrade
 const botBuyLocks = new Set<string>();
 
-function pruneDedupe(now: number): void {
-  for (const [k, ts] of dedupe) {
-    if (now - ts > DEDUPE_TTL) dedupe.delete(k);
-  }
-}
-
-function isDuplicate(key: string, ttlMs: number = DEDUPE_TTL): boolean {
-  const now = Date.now();
-  pruneDedupe(now);
-  const ts = dedupe.get(key);
-  if (ts != null && now - ts < ttlMs) return true;
-  dedupe.set(key, now);
-  return false;
+function dedupeHash(key: string): string {
+  return crypto.createHash("sha256").update(key).digest("hex");
 }
 
 async function reservePersistentDedupe(key: string, ttlMs: number): Promise<boolean> {
-  const keyHash = crypto.createHash("sha256").update(key).digest("hex");
+  const keyHash = dedupeHash(key);
   const now = new Date();
   await prisma.webhookReceipt.deleteMany({ where: { expiresAt: { lt: now } } });
   try {
@@ -60,6 +50,13 @@ async function reservePersistentDedupe(key: string, ttlMs: number): Promise<bool
     if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") return false;
     throw e;
   }
+}
+
+async function releasePersistentDedupe(keys: string[]): Promise<void> {
+  if (keys.length === 0) return;
+  await prisma.webhookReceipt.deleteMany({
+    where: { keyHash: { in: keys.map(dedupeHash) } },
+  });
 }
 
 /** TradingView "Order fills" alert with Message {{alert_message}} sends literal placeholder → 401 */
@@ -145,7 +142,10 @@ async function assertCanOpenTrade(bot: SignalBot, symbol: string): Promise<void>
 
 export async function processWebhook(
   body: WebhookBody,
-  { skipExitCheck = false }: { skipExitCheck?: boolean } = {}
+  { skipExitCheck = false, clientFactory = getClient }: {
+    skipExitCheck?: boolean;
+    clientFactory?: (bot: SignalBot) => Promise<BinanceClient>;
+  } = {}
 ): Promise<{ status: string; detail?: unknown }> {
   if (isPlaceholderPayload(body)) {
     throw new Error(
@@ -169,14 +169,16 @@ export async function processWebhook(
   if (!body.action) throw new Error("action required");
   const actionRaw = body.action;
   const side = resolveAction(actionRaw);
+  const reservedDedupeKeys: string[] = [];
 
   // Namespace caller keys: TradingView's {{timenow}} can be identical for
   // different coins and bots closing on the same bar.
   if (body.dedupe_key) {
     const callerKey = `caller:${bot.id}:${symbol}:${side}:${body.dedupe_key}`;
-    if (isDuplicate(callerKey) || !(await reservePersistentDedupe(callerKey, DEDUPE_TTL))) {
+    if (!(await reservePersistentDedupe(callerKey, DEDUPE_TTL))) {
       return { status: "ignored_duplicate" };
     }
+    reservedDedupeKeys.push(callerKey);
   }
 
   /*
@@ -201,10 +203,11 @@ export async function processWebhook(
    */
   if (side === "sell") {
     const tradeKey = tradeEventKey(bot.id, symbol, side, body.exit_leg);
-    if (isDuplicate(tradeKey, TRADE_DEDUPE_TTL) ||
-        !(await reservePersistentDedupe(tradeKey, TRADE_DEDUPE_TTL))) {
+    if (!(await reservePersistentDedupe(tradeKey, TRADE_DEDUPE_TTL))) {
+      await releasePersistentDedupe(reservedDedupeKeys);
       return { status: "ignored_duplicate" };
     }
+    reservedDedupeKeys.push(tradeKey);
   }
 
   // CRIT-03: Redact the webhook secret before storing the log payload.
@@ -221,9 +224,24 @@ export async function processWebhook(
   // BOT-005: the trade whose close lock this call holds, released in the
   // `finally` below however this function ends.
   let closeLockHeld: string | null = null;
+  let submissionAttempted = false;
 
   try {
     let result: { status: string; detail?: unknown };
+
+    /*
+     * The operator halt applies to every exchange submission. Numeric exposure,
+     * concurrency and loss limits still exempt SELL exits in evaluateBotRisk;
+     * this early pass is what prevents the sell branch from bypassing the halt.
+     * It also stops an already-blocked BUY before credentials/balances are read.
+     */
+    const preflight = await guardOrder(side, 0);
+    if (!preflight.ok) {
+      await prisma.webhookLog.update({ where: { id: log.id },
+        data: { status: "blocked", message: preflight.reason } });
+      await releasePersistentDedupe(reservedDedupeKeys);
+      return { status: preflight.outcome, detail: preflight.reason };
+    }
 
     if (side === "buy") {
       if (!bot.entryEnabled) throw new Error("Entry orders disabled on this bot");
@@ -236,7 +254,7 @@ export async function processWebhook(
 
       try {
         await assertCanOpenTrade(bot, symbol);
-        const client = await getClient(bot);
+        const client = await clientFactory(bot);
         const usdt = await getUsdtBalance(client);
         /*
          * BOT-013: "per Bot" units are a ceiling on the bot's TOTAL
@@ -274,12 +292,13 @@ export async function processWebhook(
          * `assertCanOpenTrade` above is per-bot and defaults to disabled; this
          * is across every bot on the account.
          */
-        const riskDecision = await guardEntry(quote);
+        const riskDecision = await guardOrder("buy", quote);
         if (!riskDecision.ok) {
           await prisma.webhookLog.update({
             where: { id: log.id },
             data: { status: "blocked", message: riskDecision.reason },
           });
+          await releasePersistentDedupe(reservedDedupeKeys);
           return { status: riskDecision.outcome, detail: riskDecision.reason };
         }
 
@@ -287,6 +306,7 @@ export async function processWebhook(
         // at Binance but threw before `smartTrade.create` can be found again
         // rather than becoming an untracked live position.
         const scope = idempotencyScope(bot.id, symbol, "buy", body.dedupe_key);
+        submissionAttempted = true;
         const orderResult = await marketBuyQuote(client, symbol, quote, {
           idempotencyScope: scope,
         });
@@ -329,7 +349,7 @@ export async function processWebhook(
         throw new Error("Exit orders disabled on this bot");
       }
 
-      const client = await getClient(bot);
+      const client = await clientFactory(bot);
       let qty = body.quantity;
       const active = await prisma.smartTrade.findFirst({
         where: { botId: bot.id, pair: symbol, status: "active" },
@@ -390,6 +410,7 @@ export async function processWebhook(
       if (active && !skipExitCheck) {
         const lastCloseTs = await getLastCloseTs(bot.id, symbol);
         if (lastCloseTs !== undefined && active.createdAt.getTime() > lastCloseTs) {
+          await releasePersistentDedupe(reservedDedupeKeys);
           return {
             status: "ignored_stale_sell",
             detail: `${symbol} position was re-opened after a recent close. Sell signal skipped to protect the new trade (opened ${new Date(active.createdAt).toISOString()}).`,
@@ -398,6 +419,7 @@ export async function processWebhook(
       }
 
       // BUG-09: Removed redundant getBaseFreeBalance cap — resolveSellQuantity inside marketSellBase handles it
+      submissionAttempted = true;
       const orderResult = await marketSellBase(client, symbol, qty, {
         idempotencyScope: idempotencyScope(bot.id, symbol, "sell", body.dedupe_key),
       });
@@ -506,6 +528,14 @@ export async function processWebhook(
     return result;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    // A known exchange rejection (or any failure before submission) created no
+    // order, so a retry must be allowed. Ambiguous transport failures and local
+    // post-submit failures retain the receipt to fail safe against duplication.
+    if (!submissionAttempted ||
+        (e instanceof ExchangeError && e.code !== undefined) ||
+        e instanceof MinNotionalError) {
+      await releasePersistentDedupe(reservedDedupeKeys);
+    }
     // BUG-01: Update the existing log entry instead of creating a second one
     await prisma.webhookLog.update({
       where: { id: log.id },
@@ -542,7 +572,7 @@ export function idempotencyScope(
   return `${botId}:${symbol}:${side}:t${minuteBucket}`;
 }
 
-type EntryGuard =
+type OrderGuard =
   | { ok: true }
   | { ok: false; outcome: ReceiverOutcome; reason: string };
 
@@ -553,10 +583,10 @@ type EntryGuard =
  * sender that ignores the response body must still fail safe, which is the
  * lesson of X-12.
  */
-async function guardEntry(quoteQty: number): Promise<EntryGuard> {
+async function guardOrder(side: "buy" | "sell", quoteQty: number): Promise<OrderGuard> {
   const limits = await getBotRiskLimits();
   const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours);
-  const decision = evaluateBotRisk(limits, snapshot, { side: "buy", quoteQty });
+  const decision = evaluateBotRisk(limits, snapshot, { side, quoteQty });
   if (decision.allowed) return { ok: true };
 
   const latch = shouldLatchHalt(decision);

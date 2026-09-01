@@ -123,10 +123,10 @@ test("lifecycle maps partial fills and reconciliation queries before resubmittin
     limitPrice: 100 } as ManualOrder;
   assert.equal(await reconcileOneManualOrder(order, adapter), snapshot);
   assert.equal(submits, 1);
-  assert.equal(await reconcileOneManualOrder({ ...order, status: "submitted" }, adapter), snapshot);
-  assert.equal(submits, 2);
+  assert.equal(await reconcileOneManualOrder({ ...order, status: "submitted" }, adapter), null);
+  assert.equal(submits, 1);
   assert.equal(await reconcileOneManualOrder({ ...order, status: "open" }, adapter), null);
-  assert.equal(submits, 2);
+  assert.equal(submits, 1);
 });
 
 test("attached TP/SL stays pending until a fill, then edit/remove is authoritative", () => {

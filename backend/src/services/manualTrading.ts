@@ -94,6 +94,14 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
   return prisma.$transaction(async (tx) => {
     const before = await tx.manualOrder.findUnique({ where: { id: orderId } });
     if (!before) throw new ManualTradingError("manual order not found", 404);
+    // Cancel/reconcile requests can overlap after obtaining their exchange
+    // snapshots. Do not let the slower, older response regress terminal truth
+    // or cumulative fills. Equal quote fill is intentionally accepted because
+    // a later trades lookup can correct BUY net base commission downward.
+    if (isComplete(before.status) ||
+        snapshot.executedQuoteQuantity + 1e-9 < before.filledQuoteQty) {
+      return before;
+    }
     const status = manualLifecycleStatus(snapshot.status);
     const protectionState = manualProtectionState(
       before.takeProfitPrice, before.stopLossPrice, snapshot.executedBaseQuantity);
@@ -305,8 +313,15 @@ export async function reconcileOneManualOrder(
   order: ManualOrder, adapter: ManualExchangeAdapter
 ): Promise<ManualOrderSnapshot | null> {
   const found = await adapter.query(order.symbol, order.clientOrderId);
-  return found ?? (["requested", "submitted"].includes(order.status)
-    ? adapter.submit(intentFromOrder(order)) : null);
+  /*
+   * `submitted` means an exchange request was already attempted. A lookup can
+   * temporarily miss an accepted order (or the process can have died between
+   * the durable state change and the request), so absence is not evidence that
+   * placing a replacement is safe. Keep reconciling the stable client order id
+   * instead. Only `requested` proves this process has not crossed the shared
+   * submission boundary yet.
+   */
+  return found ?? (order.status === "requested" ? adapter.submit(intentFromOrder(order)) : null);
 }
 
 export async function listManualState(symbol?: string): Promise<unknown> {
