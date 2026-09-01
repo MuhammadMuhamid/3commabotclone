@@ -50,8 +50,12 @@ interface SymbolRules {
   minNotional: number;
 }
 
-function decimal(value: number): string {
-  return value.toFixed(16).replace(/\.?0+$/, "") || "0";
+function decimal(value: number, step: number): string {
+  const [coefficient, exponentText] = step.toString().toLowerCase().split("e");
+  const exponent = Number(exponentText ?? 0);
+  const fractionDigits = coefficient?.split(".")[1]?.length ?? 0;
+  const decimals = Math.max(0, Math.min(20, fractionDigits - exponent));
+  return value.toFixed(decimals).replace(/\.?0+$/, "") || "0";
 }
 
 /** SELL limits round up so precision handling never lowers the user's ask. */
@@ -201,8 +205,8 @@ export class BinanceManualExchange implements ManualExchangeAdapter {
         side: intent.side,
         type: "LIMIT",
         timeInForce: "GTC",
-        quantity: decimal(qty),
-        price: decimal(price),
+        quantity: decimal(qty, rules.lotStep),
+        price: decimal(price, rules.priceTick),
         newClientOrderId: intent.clientOrderId,
         newOrderRespType: "FULL",
       } as Parameters<BinanceClient["order"]>[0]);

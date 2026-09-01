@@ -33,8 +33,8 @@ export interface SubmitManualOrderInput {
   quoteQuantity?: number;
   baseQuantity?: number;
   limitPrice?: number;
-  takeProfitPrice?: number;
-  stopLossPrice?: number;
+  takeProfitPrice?: number | null;
+  stopLossPrice?: number | null;
   positionId?: string;
   mainnetConfirmation?: string;
 }

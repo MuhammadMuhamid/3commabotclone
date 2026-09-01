@@ -32,6 +32,11 @@ function requestId(res: Response): string {
   return String(res.locals.manualRequestId ?? "");
 }
 
+function pathId(req: Request): string {
+  const value = req.params.id;
+  return Array.isArray(value) ? (value[0] ?? "") : value;
+}
+
 manualTradingRouter.get("/state", asyncHandler(async (req, res) => {
   const parsed = z.object({ symbol: z.string().optional() }).safeParse(req.query);
   if (!parsed.success) { res.status(400).json({ error: "invalid symbol" }); return; }
@@ -53,7 +58,7 @@ manualTradingRouter.post("/orders/:id/cancel", asyncHandler(async (req, res) => 
   const parsed = z.object({ mainnetConfirmation: confirmation }).strict().safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ error: "invalid cancel request" }); return; }
   const result = await runIdempotentManualCommand(requestId(res), "cancel_order",
-    () => cancelManualOrder(req.params.id, parsed.data.mainnetConfirmation));
+    () => cancelManualOrder(pathId(req), parsed.data.mainnetConfirmation));
   res.json(result);
 }));
 
@@ -64,7 +69,7 @@ manualTradingRouter.patch("/positions/:id/protection", asyncHandler(async (req, 
     res.status(400).json({ error: "provide takeProfitPrice and/or stopLossPrice; null removes a level" }); return;
   }
   const result = await runIdempotentManualCommand(requestId(res), "update_protection",
-    () => updateManualProtection({ positionId: req.params.id, ...parsed.data }));
+    () => updateManualProtection({ positionId: pathId(req), ...parsed.data }));
   res.json(result);
 }));
 
