@@ -149,15 +149,16 @@ function wrapExchangeError(err: unknown, symbol: string): never {
  * results remain uncertain rather than being recorded as a completed entry or
  * exit. BUY recovery also requires fills so base-asset commission stays net.
  */
-async function recoverFilledMarketOrder(
+export async function queryFilledMarketOrder(
   client: BinanceClient,
   symbol: string,
   side: "BUY" | "SELL",
   stableClientOrderId: string
 ): Promise<OrderResult | null> {
+  const sym = toBinanceSymbol(symbol);
   try {
     const order = await client.getOrder({
-      symbol, origClientOrderId: stableClientOrderId,
+      symbol: sym, origClientOrderId: stableClientOrderId,
     } as Parameters<BinanceClient["getOrder"]>[0]);
     if (String(order.status) !== "FILLED" || String(order.side) !== side) return null;
     const grossQty = Number(order.executedQty ?? 0);
@@ -166,9 +167,9 @@ async function recoverFilledMarketOrder(
     let executedQty = grossQty;
     if (side === "BUY") {
       const trades = await client.myTrades({
-        symbol, orderId: Number(order.orderId),
+        symbol: sym, orderId: Number(order.orderId),
       } as Parameters<BinanceClient["myTrades"]>[0]);
-      executedQty = netBaseQty(grossQty, trades, parsePair(symbol).base);
+      executedQty = netBaseQty(grossQty, trades, parsePair(sym).base);
     }
     return {
       orderId: String(order.orderId), executedQty, cummulativeQuoteQty: quote,
@@ -246,7 +247,7 @@ export async function marketBuyQuote(
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
     if ((err as { code?: unknown }).code === undefined && stableClientOrderId) {
-      const recovered = await recoverFilledMarketOrder(client, sym, "BUY", stableClientOrderId);
+      const recovered = await queryFilledMarketOrder(client, sym, "BUY", stableClientOrderId);
       if (recovered) return recovered;
     }
     wrapExchangeError(err, sym);
@@ -381,7 +382,7 @@ export async function marketSellBase(
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
     if ((err as { code?: unknown }).code === undefined && stableClientOrderId) {
-      const recovered = await recoverFilledMarketOrder(client, sym, "SELL", stableClientOrderId);
+      const recovered = await queryFilledMarketOrder(client, sym, "SELL", stableClientOrderId);
       if (recovered) return recovered;
     }
     wrapExchangeError(err, sym);

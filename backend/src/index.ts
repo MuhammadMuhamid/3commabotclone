@@ -20,6 +20,7 @@ import { pruneCloseMarks } from "./lib/tradeCloseTracker.js";
 import { errorHandler, notFoundHandler } from "./middleware/errors.js";
 import { startInterval } from "./lib/scheduler.js";
 import { checkManualProtection, reconcileManualTrading } from "./services/manualProtection.js";
+import { reconcilePendingStrategyIntents } from "./services/strategyOrderIntent.js";
 
 // Hard-fail in production if any critical secret is missing
 assertConfig();
@@ -197,6 +198,9 @@ startInterval("manual-close-sync", 60_000, detectManualCloses);
 void reconcileManualTrading().catch((e) => console.error("manual reconciliation failed", e));
 startInterval("manual-order-reconcile", 30_000, reconcileManualTrading);
 startInterval("manual-tpsl", 30_000, checkManualProtection);
+void reconcilePendingStrategyIntents().catch(
+  (e) => console.error("strategy intent reconciliation failed", e));
+startInterval("strategy-intent-reconcile", 30_000, reconcilePendingStrategyIntents);
 
 // Webhook log retention — prune entries older than 30 days, and the durable
 // stale-sell markers past their TTL (BOT-019).

@@ -12,8 +12,12 @@ import { reserveManualNonce } from "../src/services/manualAuth.js";
 import { applyManualSnapshot, cancelManualOrder, reconcileOneManualOrder,
   reconcilePendingManualOrders, runIdempotentManualCommand,
   submitManualOrder } from "../src/services/manualTrading.js";
+import { clientOrderId, marketBuyQuote, marketSellBase } from "../src/services/binance.js";
 import { processWebhook } from "../src/services/webhook.js";
-import { marketBuyQuote, marketSellBase } from "../src/services/binance.js";
+import {
+  reconcilePendingStrategyIntents, reconcileStrategyIntent, reserveStrategyIntent,
+  strategyMarketAdapter, type StrategyMarketAdapter,
+} from "../src/services/strategyOrderIntent.js";
 
 const backendRoot = path.join(import.meta.dirname, "..");
 const testDb = path.join(backendRoot, "prisma", "tests", ".tmp-test.db");
@@ -39,6 +43,7 @@ async function createAccount(overrides: Partial<ExchangeAccount> = {}): Promise<
 
 async function clearDatabase(): Promise<void> {
   await prisma.partialClose.deleteMany();
+  await prisma.strategyOrderIntent.deleteMany();
   await prisma.smartTrade.deleteMany();
   await prisma.manualOrder.deleteMany();
   await prisma.manualCommand.deleteMany();
@@ -201,7 +206,284 @@ test("durable webhook identity suppresses a successful replay after reconnect", 
   assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id } }), 1);
 });
 
-test("a known webhook exchange rejection releases dedupe identity for a safe retry", async () => {
+test("strategy crash A/G: a never-attempted intent survives and submits once only after halt clears", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Never attempted strategy", webhookSecret: "never-attempted-strategy-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true,
+  } });
+  let wireOrders = 0;
+  const client = {
+    accountInfo: async () => ({ balances: [{ asset: "USDT", free: "1000", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "MIN_NOTIONAL", minNotional: "10" },
+    ] }] }),
+    order: async (payload: Record<string, unknown>) => {
+      wireOrders++;
+      return { orderId: "never-attempted-1", clientOrderId: payload.newClientOrderId,
+        side: "BUY", status: "FILLED", executedQty: "0.5",
+        cummulativeQuoteQty: "50", fills: [] };
+    },
+    prices: async ({ symbol }: { symbol: string }) => ({ [symbol]: "100" }),
+  };
+  const body = { secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50, dedupe_key: "crash-before-submit" };
+  await assert.rejects(processWebhook(body, {
+    clientFactory: async () => client as never,
+    strategyCrashHooks: { afterIntentPersisted: () => { throw new Error("crash before submit"); } },
+  }), /crash before submit/);
+  const intent = await prisma.strategyOrderIntent.findFirstOrThrow();
+  assert.equal(intent.status, "requested");
+  assert.equal(wireOrders, 0);
+  assert.equal(await prisma.webhookReceipt.count(), 0);
+
+  await prisma.riskControl.create({ data: { id: "global", tradingHalted: true,
+    haltedReason: "operator", haltedBy: "operator" } });
+  await prisma.$disconnect();
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  assert.equal(wireOrders, 0);
+  assert.equal((await prisma.strategyOrderIntent.findUniqueOrThrow({ where: { id: intent.id } })).status,
+    "requested");
+
+  await prisma.riskControl.deleteMany();
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  assert.equal(wireOrders, 1);
+  assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id } }), 1);
+  assert.equal((await prisma.strategyOrderIntent.findUniqueOrThrow({ where: { id: intent.id } })).status,
+    "reconciled");
+});
+
+test("the durable submission marker is written before the wire call and a crash there never resubmits", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Submission marker strategy", webhookSecret: "submission-marker-strategy-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true,
+  } });
+  let wireOrders = 0;
+  let queries = 0;
+  const client = {
+    accountInfo: async () => ({ balances: [{ asset: "USDT", free: "1000", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "MIN_NOTIONAL", minNotional: "10" },
+    ] }] }),
+    order: async () => { wireOrders++; throw new Error("must not reach wire"); },
+    getOrder: async () => { queries++; throw new Error("not found"); },
+  };
+  await assert.rejects(processWebhook({
+    secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50, dedupe_key: "crash-after-marker",
+  }, {
+    clientFactory: async () => client as never,
+    strategyCrashHooks: {
+      afterSubmissionMarked: () => { throw new Error("crash after durable submission marker"); },
+    },
+  }), /crash after durable submission marker/);
+  const intent = await prisma.strategyOrderIntent.findFirstOrThrow();
+  assert.equal(intent.status, "submitted");
+  assert.equal(wireOrders, 0);
+
+  await prisma.$disconnect();
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  assert.equal(wireOrders, 0);
+  assert.equal(queries, 2);
+  assert.equal((await prisma.strategyOrderIntent.findUniqueOrThrow({ where: { id: intent.id } })).status,
+    "submitted");
+});
+
+test("strategy crash B/H: accepted-then-thrown BUY is recovered while halted without resubmission", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Accepted crash strategy", webhookSecret: "accepted-crash-strategy-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true,
+  } });
+  const accepted = new Map<string, Record<string, unknown>>();
+  let wireOrders = 0;
+  let queries = 0;
+  let visible = false;
+  const client = {
+    accountInfo: async () => ({ balances: [{ asset: "USDT", free: "1000", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "MIN_NOTIONAL", minNotional: "10" },
+    ] }] }),
+    order: async (payload: Record<string, unknown>) => {
+      wireOrders++;
+      const id = String(payload.newClientOrderId);
+      accepted.set(id, { orderId: "accepted-buy-1", clientOrderId: id, side: "BUY",
+        status: "FILLED", executedQty: "0.5", cummulativeQuoteQty: "50" });
+      throw new Error("socket closed after acceptance");
+    },
+    getOrder: async ({ origClientOrderId }: { origClientOrderId: string }) => {
+      queries++;
+      if (!visible) throw new Error("not visible before process death");
+      return accepted.get(origClientOrderId);
+    },
+    myTrades: async () => [{ commission: "0.001", commissionAsset: "BTC" }],
+    prices: async ({ symbol }: { symbol: string }) => ({ [symbol]: "100" }),
+  };
+  const body = { secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50, dedupe_key: "accepted-before-crash" };
+  await assert.rejects(processWebhook(body, { clientFactory: async () => client as never }),
+    /socket closed after acceptance/);
+  const intent = await prisma.strategyOrderIntent.findFirstOrThrow();
+  assert.equal(intent.status, "submitted");
+  assert.equal(wireOrders, 1);
+  assert.equal(await prisma.smartTrade.count(), 0);
+  assert.equal(await prisma.webhookReceipt.count(), 1);
+
+  await prisma.riskControl.create({ data: { id: "global", tradingHalted: true,
+    haltedReason: "operator", haltedBy: "operator" } });
+  visible = true;
+  await prisma.$disconnect();
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  const recovered = await prisma.smartTrade.findUniqueOrThrow({
+    where: { clientOrderId: intent.clientOrderId },
+  });
+  assert.equal(recovered.quantity, 0.499);
+  assert.equal(wireOrders, 1);
+  assert.equal(queries, 2);
+
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  assert.equal(wireOrders, 1);
+  assert.equal(queries, 2);
+  assert.equal(await prisma.smartTrade.count({ where: { clientOrderId: intent.clientOrderId } }), 1);
+  assert.equal((await processWebhook(body, { clientFactory: async () => client as never })).status,
+    "ignored_duplicate");
+});
+
+test("strategy crash C/E: a normal SELL response is recovered and close accounting is applied once", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "SELL crash strategy", webhookSecret: "sell-crash-strategy-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), exitEnabled: true,
+  } });
+  const trade = await prisma.smartTrade.create({ data: {
+    botId: bot.id, botName: bot.name, pair: "BTCUSDT", status: "active",
+    direction: "long", quantity: 0.5, quoteSpent: 50,
+  } });
+  let wireOrders = 0;
+  let queries = 0;
+  let acceptedId = "";
+  const client = {
+    accountInfo: async () => ({ balances: [{ asset: "BTC", free: "0.5", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "LOT_SIZE", stepSize: "0.001", minQty: "0.001" },
+    ] }] }),
+    order: async (payload: Record<string, unknown>) => {
+      wireOrders++;
+      acceptedId = String(payload.newClientOrderId);
+      return { orderId: "accepted-sell-1", clientOrderId: acceptedId, side: "SELL",
+        status: "FILLED", executedQty: "0.5", cummulativeQuoteQty: "60" };
+    },
+    getOrder: async () => {
+      queries++;
+      return { orderId: "accepted-sell-1", clientOrderId: acceptedId, side: "SELL",
+        status: "FILLED", executedQty: "0.5", cummulativeQuoteQty: "60" };
+    },
+  };
+  const body = { secret: bot.webhookSecret, action: "sell", symbol: "BTCUSDT",
+    dedupe_key: "sell-response-before-crash" };
+  await assert.rejects(processWebhook(body, {
+    clientFactory: async () => client as never,
+    strategyCrashHooks: { afterExchangeResult: () => { throw new Error("crash after response"); } },
+  }), /crash after response/);
+  const intent = await prisma.strategyOrderIntent.findFirstOrThrow();
+  assert.equal(intent.status, "submitted");
+  assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id: trade.id } })).status,
+    "active");
+
+  await prisma.$disconnect();
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  const closed = await prisma.smartTrade.findUniqueOrThrow({ where: { id: trade.id } });
+  assert.equal(closed.status, "closed");
+  assert.equal(closed.pnlUsdt, 9.89);
+  assert.equal(await prisma.pairCloseMark.count({ where: { botId: bot.id, pair: "BTCUSDT" } }), 1);
+  assert.equal(wireOrders, 1);
+  assert.equal(queries, 1);
+
+  await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+  assert.equal(wireOrders, 1);
+  assert.equal(queries, 1);
+  assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id: trade.id } })).pnlUsdt,
+    closed.pnlUsdt);
+});
+
+test("strategy crash D: a persisted SmartTrade is linked without a lookup or duplicate", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Link recovery strategy", webhookSecret: "link-recovery-strategy-secret",
+    pairs: JSON.stringify(["BTCUSDT"]),
+  } });
+  const sourceKey = `${bot.id}:BTCUSDT:buy:persisted-before-link`;
+  const intent = await reserveStrategyIntent({ sourceKey, bot, symbol: "BTCUSDT", side: "BUY",
+    clientOrderId: clientOrderId(sourceKey), requestedQuoteQty: 50 });
+  await prisma.strategyOrderIntent.update({ where: { id: intent.id }, data: {
+    status: "submitted", submittedAt: new Date(),
+  }});
+  const trade = await prisma.smartTrade.create({ data: {
+    botId: bot.id, botName: bot.name, pair: "BTCUSDT", status: "active", direction: "long",
+    quantity: 0.499, quoteSpent: 50, entryPrice: 100, currentPrice: 100,
+    exchangeOrderId: "already-persisted", clientOrderId: intent.clientOrderId,
+  }});
+  let exchangeCalls = 0;
+  const adapter: StrategyMarketAdapter = {
+    submit: async () => { exchangeCalls++; throw new Error("must not submit"); },
+    query: async () => { exchangeCalls++; throw new Error("must not query"); },
+  };
+  const linked = await reconcileStrategyIntent(intent.id, adapter);
+  assert.equal(linked.intent.smartTradeId, trade.id);
+  assert.equal(linked.intent.status, "reconciled");
+  assert.equal(exchangeCalls, 0);
+  assert.equal(await prisma.smartTrade.count({ where: { clientOrderId: intent.clientOrderId } }), 1);
+});
+
+test("strategy crash E/F: repeated partial recovery is exactly once and query misses never resubmit", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Partial recovery strategy", webhookSecret: "partial-recovery-strategy-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), exitEnabled: true,
+  } });
+  const trade = await prisma.smartTrade.create({ data: {
+    botId: bot.id, botName: bot.name, pair: "BTCUSDT", status: "active", direction: "long",
+    quantity: 1, quoteSpent: 100,
+  }});
+  const sourceKey = `${bot.id}:BTCUSDT:sell:partial-recovery`;
+  const reserved = await reserveStrategyIntent({ sourceKey, bot, symbol: "BTCUSDT", side: "SELL",
+    clientOrderId: clientOrderId(sourceKey), requestedBaseQty: 0.4, sellPercent: 40,
+    smartTradeId: trade.id });
+  const intent = await prisma.strategyOrderIntent.update({ where: { id: reserved.id }, data: {
+    status: "submitted", submittedAt: new Date(),
+  }});
+  let submits = 0;
+  let queries = 0;
+  const found: StrategyMarketAdapter = {
+    submit: async () => { submits++; throw new Error("must not submit"); },
+    query: async () => {
+      queries++;
+      return { orderId: "partial-sell-1", executedQty: 0.4,
+        cummulativeQuoteQty: 44, avgPrice: 110, simulated: false };
+    },
+  };
+  await reconcileStrategyIntent(intent.id, found);
+  await reconcileStrategyIntent(intent.id, found);
+  assert.equal(submits, 0);
+  assert.equal(queries, 1);
+  assert.equal(await prisma.partialClose.count({ where: { strategyIntentId: intent.id } }), 1);
+  assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id: trade.id } })).quantity, 0.6);
+
+  const missingKey = `${bot.id}:ETHUSDT:buy:missing-after-attempt`;
+  const missing = await prisma.strategyOrderIntent.create({ data: {
+    sourceKey: missingKey, botId: bot.id, botName: bot.name,
+    clientOrderId: clientOrderId(missingKey), symbol: "ETHUSDT", side: "BUY",
+    requestedQuoteQty: 25, status: "submitted", submittedAt: new Date(),
+  }});
+  const absent: StrategyMarketAdapter = {
+    submit: async () => { submits++; throw new Error("must not submit"); },
+    query: async () => { queries++; return null; },
+  };
+  assert.equal((await reconcileStrategyIntent(missing.id, absent)).pending, true);
+  assert.equal((await reconcileStrategyIntent(missing.id, absent)).pending, true);
+  assert.equal(submits, 0);
+  assert.equal((await prisma.strategyOrderIntent.findUniqueOrThrow({ where: { id: missing.id } })).status,
+    "submitted");
+});
+
+test("a known webhook exchange rejection releases its receipt but the durable intent prevents resubmission", async () => {
   const bot = await prisma.signalBot.create({ data: {
     name: "Rejected strategy", webhookSecret: "strategy-rejection-secret",
     pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true,
@@ -221,8 +503,9 @@ test("a known webhook exchange rejection releases dedupe identity for a safe ret
     quote_order_qty: 50, dedupe_key: "L-1700000060000" };
   await assert.rejects(processWebhook(body, { clientFactory: async () => client as never }), /rejected/);
   await assert.rejects(processWebhook(body, { clientFactory: async () => client as never }), /rejected/);
-  assert.equal(wireOrders, 2);
+  assert.equal(wireOrders, 1);
   assert.equal(await prisma.webhookReceipt.count(), 0);
+  assert.equal((await prisma.strategyOrderIntent.findFirstOrThrow()).status, "rejected");
 });
 
 test("a query miss never resubmits an already-attempted intent, while an unattempted request can submit", async () => {

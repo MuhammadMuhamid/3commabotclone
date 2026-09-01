@@ -75,25 +75,34 @@ SQLite database. Never point them at a real database or a real key.
   another submission: absence cannot distinguish lookup delay from a crash just
   before the wire call. It remains pending for later reconciliation/operator
   review. A never-attempted `requested` intent may submit once.
-- Strategy MARKET orders also use deterministic client IDs and, after an
-  ambiguous transport exception, immediately query that ID. Only an
-  authoritative `FILLED` result is accepted (including BUY commission trades);
-  other results remain uncertain.
-- Webhook dedupe receipts are durable. Known pre-submission failures and known
-  exchange rejections release their receipts for a safe retry; ambiguous or
-  post-submission failures retain them to fail safe against a duplicate.
+- Every strategy MARKET BUY/SELL has a durable `StrategyOrderIntent` before the
+  exchange boundary. `requested` proves no submission has been attempted;
+  `submitted` is persisted before the wire call and can only query the
+  deterministic client ID. A query miss stays unresolved and never authorizes
+  a replacement order.
+- Startup and a bounded poller reconstruct an authoritative `FILLED` order into
+  the normal SmartTrade/partial-close ledger transactionally. BUY recovery
+  requires commission trades; repeated recovery links or reuses the same local
+  records and accounting markers.
+- Webhook receipts are delivery/replay protection, strategy intents are monetary
+  submission/recovery truth, and SmartTrade is the lifecycle/accounting ledger.
+  Pre-submission failures and authoritative rejections may release a receipt;
+  ambiguous/post-submission failures retain it. A released receipt never resets
+  an existing intent's attempted state.
 - The operator halt gates both BUY and SELL submission paths. Numeric exposure,
   concurrency and daily-loss limits continue to permit exits according to the
-  existing policy. Dry run never sends an order, and manual live execution is
-  restricted to Binance Spot with the existing testnet/mainnet confirmations.
+  existing policy. A never-attempted strategy intent rechecks those gates, while
+  an already-attempted intent still reconciles exchange truth during a later
+  halt. Dry run never sends an order, and manual live execution is restricted
+  to Binance Spot with the existing testnet/mainnet confirmations.
 
 These are local code guarantees, not Binance acceptance. Real Binance/testnet
 must still confirm client-order-ID uniqueness and lookup timing, order status
 and cumulative-fill fields, commission-trade availability, and cancel/fill race
-responses. A hard process crash after a strategy order reaches Binance but
-before its immediate lookup/local SmartTrade write has no durable strategy
-order-intent reconciler; the retained webhook receipt prevents an automatic
-duplicate, but operator exchange-to-ledger recovery is still required.
+responses. Local fake-exchange/SQLite tests prove durable ordering, conservative
+query-miss handling and idempotent local reconstruction; they do not prove real
+Binance eventual visibility, MARKET partial-fill behavior, user-data timing or
+commission-trade timing.
 
 `scripts/ci/scan-secrets.sh` runs in CI and fails the build on
 credential-shaped literals in tracked source. It reports file and line only,

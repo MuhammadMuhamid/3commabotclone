@@ -130,8 +130,11 @@ sequenceDiagram
   PW->>PW: reject placeholders / dedupe
   PW->>DB: find SignalBot by webhookSecret
   PW->>PW: validate pair, bot active, limits
-  PW->>BN: getUsdtBalance, marketBuyQuote
-  PW->>DB: create SmartTrade active
+  PW->>BN: getUsdtBalance
+  PW->>DB: create StrategyOrderIntent requested
+  PW->>DB: mark intent submitted
+  PW->>BN: marketBuyQuote with deterministic client ID
+  PW->>DB: transactionally create/link SmartTrade and reconcile intent
   PW->>DB: WebhookLog processing
   PW-->>TV: 200 ok
 ```
@@ -335,6 +338,18 @@ Exports `config` from environment:
 | `closedReason` | String? | `signal_exit`, `take_profit`, `stop_loss` |
 | `closedAt` | DateTime? | When closed |
 
+#### `StrategyOrderIntent`
+
+This is the durable monetary submission/recovery record for strategy MARKET
+orders, not a second position ledger. `sourceKey` and `clientOrderId` are unique;
+the row stores bot/account identity, symbol, side, requested base/quote amount,
+SELL linkage/percentage, submission status, authoritative exchange result and
+the resulting SmartTrade link. `requested` may submit once after current gates
+pass. Before that call it is compare-and-set to `submitted`; from then on every
+process queries the deterministic client ID and a miss remains unresolved.
+`reconciled` means the exchange result and local accounting were committed
+idempotently.
+
 #### `WebhookLog`
 
 | Field | Type | Purpose |
@@ -457,12 +472,15 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
    - `assertCanOpenTrade` (max active SmartTrades, max per-pair entry orders)
    - `getClient(bot)` → account or env
    - `calcOrderQuoteUsdt(bot, usdtBalance, quote_order_qty)`
-   - `marketBuyQuote` → create `SmartTrade` active → `updateSmartTradePnl`
-   - an ambiguous submission exception queries the deterministic client order ID and accepts only authoritative `FILLED` exchange truth
+   - persist `StrategyOrderIntent(requested)` with the deterministic client ID
+   - durably mark it `submitted` before `marketBuyQuote`
+   - transactionally create/link one `SmartTrade`, reconcile the intent, then update PnL
 9. **Sell branch**:
    - Resolve quantity from body, else latest active SmartTrade, else wallet free base
    - Cap qty to `getBaseFreeBalance`
-   - `marketSellBase` → update SmartTrade closed with PnL
+   - refuse a second SELL while the linked trade has an unresolved strategy intent
+   - persist and mark the SELL intent before `marketSellBase`
+   - transactionally apply one partial-close marker or final-close accounting and reconcile the intent
 
 **`resolveAction(action)` aliases:**
 
@@ -470,11 +488,19 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 |-------------------|-------------------|
 | buy, enterlong, long, entrylong, openlong | sell, exitlong, closelong, close, exit, closeposition, market |
 
-**Durable dedupe:** `WebhookReceipt` hashes identities in SQLite, so replay
-protection survives restarts and workers. This does not replace exchange
-reconciliation: ambiguous submissions retain their receipt, and a hard crash
-before a strategy `SmartTrade` write still needs operator exchange-to-ledger
-recovery.
+**Three separate responsibilities:** `WebhookReceipt` is delivery/replay
+protection; `StrategyOrderIntent` is monetary submission/recovery truth; and
+`SmartTrade`/`PartialClose` is lifecycle/accounting truth. Receipt release never
+resets a durable attempted intent. Startup and the 30-second reconciler submit a
+never-attempted row only after current halt/risk/bot gates pass. An already
+attempted row is queried even if trading is later halted; a query miss remains
+`submitted`, and an authoritative `FILLED` result reconstructs local state
+exactly once. BUY lookup requires commission trades so recovered base quantity
+stays net of base-asset fees.
+
+These are local SQLite/fake-exchange guarantees. Binance testnet still needs to
+confirm client-ID lookup timing/eventual visibility, MARKET partial-fill and
+user-data timing, and commission-trade availability/timing.
 
 #### `services/binance.ts`
 
@@ -1127,6 +1153,7 @@ below was re-checked against this checkout.
 | `remote-deploy.sh` hardcoded a Mac path | Derived from the script's own location, and `DRY_RUN` is no longer forced to `false` (`BOT-030`) |
 | No automated test suite | 122 tests across nine files, run by `npm test` with no network and no database |
 | Dashboard showed a hardcoded exchange name | The account's own name is shown |
+| A crash after strategy exchange acceptance required operator ledger repair | Durable strategy intents query the deterministic client ID on restart and transactionally reconstruct BUY/SELL SmartTrade accounting exactly once; unfindable attempts remain unresolved without resubmission |
 
 
 ---

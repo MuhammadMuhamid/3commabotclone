@@ -76,6 +76,10 @@ export function sumMoney(values: readonly number[]): number {
 export const MONEY_FIELDS: Record<string, readonly string[]> = {
   SmartTrade: ["entryPrice", "currentPrice", "quantity", "quoteSpent", "pnlUsdt", "pnlPct", "buyPrice"],
   PartialClose: ["pct", "quantity", "revenue", "pnlUsdt", "avgPrice"],
+  StrategyOrderIntent: [
+    "requestedBaseQty", "requestedQuoteQty", "sellPercent", "filledBaseQty",
+    "filledQuoteQty", "averageFillPrice",
+  ],
   SignalBot: ["maxInvestmentPct", "entryVolumePct", "takeProfitPct", "stopLossPct"],
   RiskControl: ["maxTotalExposureQuote", "maxDailyLossQuote"],
 };

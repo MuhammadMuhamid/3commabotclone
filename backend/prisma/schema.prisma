@@ -209,12 +209,58 @@ model PartialClose {
   pnlUsdt         Float
   avgPrice        Float
   exchangeOrderId String?
+  /** Exactly-once key for a recovered strategy SELL partial. Existing rows stay null. */
+  strategyIntentId String?    @unique
   createdAt       DateTime   @default(now())
 
   // BOT-024: this index existed and was DROPPED by
   // 20260712224627_web_push_security/migration.sql, never recreated. Every
   // final close reads a trade's partial closes to accumulate their P&L.
   @@index([tradeId])
+}
+
+/**
+ * Durable monetary truth for webhook-driven strategy MARKET orders.
+ *
+ * A row is created as `requested` before the process may cross the exchange
+ * boundary. It is changed to `submitted` durably before the wire call, so any
+ * later process must query `clientOrderId` rather than place another order.
+ * SmartTrade remains the position/accounting ledger; this row only carries the
+ * minimum submission and reconstruction state across a crash.
+ */
+model StrategyOrderIntent {
+  id                String   @id @default(uuid())
+  sourceKey         String   @unique
+  webhookLogId      String?
+  botId             String
+  botName           String
+  exchangeAccountId String?
+  clientOrderId     String   @unique
+  symbol            String
+  side              String
+  orderType         String   @default("MARKET")
+  requestedBaseQty  Float?
+  requestedQuoteQty Float?
+  sellPercent       Float?
+  exitLeg           String?
+  skipExitCheck     Boolean  @default(false)
+  smartTradeId      String?
+  status            String   @default("requested")
+  exchangeOrderId   String?
+  exchangeStatus    String?
+  filledBaseQty     Float    @default(0)
+  filledQuoteQty    Float    @default(0)
+  averageFillPrice  Float?
+  simulated         Boolean  @default(false)
+  error             String?
+  submittedAt       DateTime?
+  reconciledAt      DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([smartTradeId, status])
+  @@index([botId, symbol, status])
 }
 
 model WebhookLog {

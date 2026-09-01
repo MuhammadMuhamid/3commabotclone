@@ -6,14 +6,12 @@ import {
   clientFromEnv,
   getBaseFreeBalance,
   getUsdtBalance,
-  marketBuyQuote,
-  marketSellBase,
   clientOrderId,
   ExchangeError,
   MinNotionalError,
   type BinanceClient,
 } from "./binance.js";
-import { updateSmartTradePnl, calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
+import { updateSmartTradePnl } from "./smartTrade.js";
 import { acquireTradeClose, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import {
   evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
@@ -21,10 +19,14 @@ import {
 } from "./riskControls.js";
 import type { ReceiverOutcome } from "../contract/webhookContract.js";
 import { calcOrderQuoteUsdt, isPerBotUnit } from "../lib/investment.js";
-import { recordPairClose, getLastCloseTs } from "../lib/tradeCloseTracker.js";
+import { getLastCloseTs } from "../lib/tradeCloseTracker.js";
 import crypto from "crypto";
 import { Prisma } from "@prisma/client";
 import { sendExecutionNotification } from "./push.js";
+import {
+  hasUnresolvedStrategySell, reconcileStrategyIntent, reserveStrategyIntent,
+  strategyMarketAdapter, type StrategyCrashHooks,
+} from "./strategyOrderIntent.js";
 
 const DEDUPE_TTL = 120_000;
 /** Blocks a second buy/sell for same bot+pair within this window (TV order-fill duplicate guard) */
@@ -142,9 +144,10 @@ async function assertCanOpenTrade(bot: SignalBot, symbol: string): Promise<void>
 
 export async function processWebhook(
   body: WebhookBody,
-  { skipExitCheck = false, clientFactory = getClient }: {
+  { skipExitCheck = false, clientFactory = getClient, strategyCrashHooks }: {
     skipExitCheck?: boolean;
     clientFactory?: (bot: SignalBot) => Promise<BinanceClient>;
+    strategyCrashHooks?: StrategyCrashHooks;
   } = {}
 ): Promise<{ status: string; detail?: unknown }> {
   if (isPlaceholderPayload(body)) {
@@ -225,6 +228,7 @@ export async function processWebhook(
   // `finally` below however this function ends.
   let closeLockHeld: string | null = null;
   let submissionAttempted = false;
+  let strategyIntentId: string | null = null;
 
   try {
     let result: { status: string; detail?: unknown };
@@ -302,43 +306,42 @@ export async function processWebhook(
           return { status: riskDecision.outcome, detail: riskDecision.reason };
         }
 
-        // BOT-007: a deterministic client order id, so an order that succeeded
-        // at Binance but threw before `smartTrade.create` can be found again
-        // rather than becoming an untracked live position.
+        // Persist the complete monetary identity before crossing the exchange
+        // boundary. The durable requested->submitted transition below is the
+        // sole authority that may perform the initial submission.
         const scope = idempotencyScope(bot.id, symbol, "buy", body.dedupe_key);
-        submissionAttempted = true;
-        const orderResult = await marketBuyQuote(client, symbol, quote, {
-          idempotencyScope: scope,
-        });
-        const trade = await prisma.smartTrade.create({
-          data: {
-            botId: bot.id,
-            botName: bot.name,  // F5: persisted so history survives bot deletion
-            pair: symbol,
-            // BOT-012: only long is implemented. `binance.ts` hardcodes BUY and
-            // SELL, so recording anything else described a position that does
-            // not exist.
-            direction: "long",
-            status: "active",
-            entryPrice: orderResult.avgPrice,
-            buyPrice: orderResult.avgPrice,
-            currentPrice: orderResult.avgPrice,
-            // BOT-006: NET of base-asset commission — what the wallet actually
-            // received. Storing the gross figure made a later "full close" ask
-            // for more than the position held, which `resolveSellQuantity` then
-            // silently capped while the trade was marked closed anyway.
-            quantity: orderResult.executedQty,
-            quoteSpent: orderResult.cummulativeQuoteQty,
-            exchangeOrderId: orderResult.orderId,
-            clientOrderId: clientOrderId(scope),
-          },
-        });
-        await updateSmartTradePnl(trade.id, client);
-        void sendExecutionNotification({
-          side: "buy", symbol, quantity: orderResult.executedQty,
-          quoteAmount: orderResult.cummulativeQuoteQty, price: orderResult.avgPrice,
-          orderId: orderResult.orderId,
-        }).catch((e) => console.error("BUY notification failed", e));
+        const intent = await reserveStrategyIntent({
+          sourceKey: scope,
+          webhookLogId: log.id,
+          bot,
+          clientOrderId: clientOrderId(scope),
+          symbol,
+          side: "BUY",
+          requestedQuoteQty: quote,
+        }, strategyCrashHooks);
+        strategyIntentId = intent.id;
+        const execution = await reconcileStrategyIntent(
+          intent.id,
+          strategyMarketAdapter(client),
+          { hooks: strategyCrashHooks }
+        );
+        submissionAttempted = execution.intent.status !== "requested" &&
+          execution.intent.status !== "rejected";
+        if (execution.pending || !execution.result) {
+          throw new Error(
+            `${symbol}: strategy BUY outcome remains unresolved; deterministic reconciliation pending`
+          );
+        }
+        const orderResult = execution.result;
+        const tradeId = execution.intent.smartTradeId;
+        if (tradeId) await updateSmartTradePnl(tradeId, client);
+        if (execution.appliedNow) {
+          void sendExecutionNotification({
+            side: "buy", symbol, quantity: orderResult.executedQty,
+            quoteAmount: orderResult.cummulativeQuoteQty, price: orderResult.avgPrice,
+            orderId: orderResult.orderId,
+          }).catch((e) => console.error("BUY notification failed", e));
+        }
         result = { status: "ok", detail: { side: "buy", ...orderResult } };
       } finally {
         botBuyLocks.delete(bot.id);
@@ -418,109 +421,59 @@ export async function processWebhook(
         }
       }
 
-      // BUG-09: Removed redundant getBaseFreeBalance cap — resolveSellQuantity inside marketSellBase handles it
-      submissionAttempted = true;
-      const orderResult = await marketSellBase(client, symbol, qty, {
-        idempotencyScope: idempotencyScope(bot.id, symbol, "sell", body.dedupe_key),
-      });
-      if (partialPct != null) {
-        if (!active) throw new Error(`No active SmartTrade for ${symbol}`);
-        const soldQty = Math.min(orderResult.executedQty, active.quantity);
-        const proportionalCost = active.quoteSpent * (soldQty / active.quantity);
-        const { pnlUsdt, pnlPct } = calcRealizedPnl(orderResult.cummulativeQuoteQty, proportionalCost);
-        const newQuantity = Math.max(0, active.quantity - soldQty);
-        const newQuoteSpent = Math.max(0, active.quoteSpent - proportionalCost);
-        await prisma.$transaction([
-          prisma.partialClose.create({
-            data: {
-              tradeId: active.id,
-              pct: partialPct,
-              quantity: soldQty,
-              revenue: orderResult.cummulativeQuoteQty,
-              pnlUsdt,
-              avgPrice: orderResult.avgPrice,
-              exchangeOrderId: String(orderResult.orderId),
-            },
-          }),
-          prisma.smartTrade.update({
-            where: { id: active.id },
-            data: {
-              quantity: newQuantity,
-              quoteSpent: newQuoteSpent,
-              currentPrice: orderResult.avgPrice,
-            },
-          }),
-        ]);
-        await updateSmartTradePnl(active.id, client);
-        void sendExecutionNotification({
-          side: "sell", symbol, quantity: soldQty,
-          quoteAmount: orderResult.cummulativeQuoteQty, price: orderResult.avgPrice,
-          orderId: orderResult.orderId, pnlPct,
-        }).catch((e) => console.error("PARTIAL SELL notification failed", e));
-        result = {
-          status: "ok",
-          detail: { side: "sell", partial: true, sellPercent: partialPct, exitLeg: body.exit_leg, ...orderResult },
-        };
-      } else {
-        if (active) {
-          /*
-           * BOT-006: a "full close" that sold less than the position held used
-           * to be marked `closed` regardless, leaving dust in the wallet and a
-           * trade record claiming to be flat.
-           *
-           * `resolveSellQuantity` caps the sell against the real free balance,
-           * so a shortfall is exactly the symptom of a quantity recorded gross
-           * of commission. The entry now stores the NET quantity, so this should
-           * not trigger — and if it does, the trade stays open and says why
-           * rather than silently losing the remainder.
-           *
-           * The 0.1 % tolerance covers lot-step flooring, which legitimately
-           * leaves a fraction of a step behind.
-           */
-          const covered = orderResult.executedQty >= active.quantity * 0.999;
-          if (!covered) {
-            const remaining = active.quantity - orderResult.executedQty;
-            await prisma.smartTrade.update({
-              where: { id: active.id },
-              data: {
-                quantity: Math.max(0, remaining),
-                quoteSpent: Math.max(0, active.quoteSpent * (remaining / active.quantity)),
-                currentPrice: orderResult.avgPrice,
-              },
-            });
-            throw new Error(
-              `${symbol}: the close filled ${orderResult.executedQty} of ${active.quantity} base ` +
-              `units. The trade remains OPEN with ${remaining} outstanding — investigate before retrying.`
-            );
-          }
-          // Fetch prior partial closes so their P&L is included in the final total
-          const partials = await prisma.partialClose.findMany({ where: { tradeId: active.id } });
-          const { pnlUsdt, pnlPct } = calcFinalClosePnl(
-            orderResult.cummulativeQuoteQty,
-            active.quoteSpent,
-            partials
-          );
-          await prisma.smartTrade.update({
-            where: { id: active.id },
-            data: {
-              status: "closed",
-              closedAt: new Date(),
-              closedReason: "signal_exit",
-              currentPrice: orderResult.avgPrice,
-              pnlUsdt,
-              pnlPct,
-            },
-          });
-          // Record this close so future stale sell signals don't close the next trade
-          await recordPairClose(bot.id, symbol);
-          void sendExecutionNotification({
-            side: "sell", symbol, quantity: orderResult.executedQty,
-            quoteAmount: orderResult.cummulativeQuoteQty, price: orderResult.avgPrice,
-            orderId: orderResult.orderId, pnlPct,
-          }).catch((e) => console.error("SELL notification failed", e));
-        }
-        result = { status: "ok", detail: { side: "sell", ...orderResult } };
+      if (active && await hasUnresolvedStrategySell(active.id)) {
+        throw new Error(
+          `${symbol}: a prior strategy SELL has unresolved exchange state; reconcile it before another close`
+        );
       }
+
+      const scope = idempotencyScope(bot.id, symbol, "sell", body.dedupe_key);
+      const intent = await reserveStrategyIntent({
+        sourceKey: scope,
+        webhookLogId: log.id,
+        bot,
+        clientOrderId: clientOrderId(scope),
+        symbol,
+        side: "SELL",
+        requestedBaseQty: qty,
+        sellPercent: partialPct ?? undefined,
+        exitLeg: body.exit_leg,
+        skipExitCheck,
+        smartTradeId: active?.id,
+      }, strategyCrashHooks);
+      strategyIntentId = intent.id;
+      const execution = await reconcileStrategyIntent(
+        intent.id,
+        strategyMarketAdapter(client),
+        { hooks: strategyCrashHooks }
+      );
+      submissionAttempted = execution.intent.status !== "requested" &&
+        execution.intent.status !== "rejected";
+      if (execution.pending || !execution.result) {
+        throw new Error(
+          `${symbol}: strategy SELL outcome remains unresolved; deterministic reconciliation pending`
+        );
+      }
+      if (execution.shortfall) throw new Error(`${execution.shortfall} — investigate before retrying.`);
+
+      const orderResult = execution.result;
+      if (active && partialPct != null) await updateSmartTradePnl(active.id, client);
+      if (execution.appliedNow) {
+        const closed = active
+          ? await prisma.smartTrade.findUnique({ where: { id: active.id } })
+          : null;
+        void sendExecutionNotification({
+          side: "sell", symbol, quantity: orderResult.executedQty,
+          quoteAmount: orderResult.cummulativeQuoteQty, price: orderResult.avgPrice,
+          orderId: orderResult.orderId, pnlPct: closed?.pnlPct,
+        }).catch((e) => console.error("SELL notification failed", e));
+      }
+      result = partialPct != null
+        ? { status: "ok", detail: {
+          side: "sell", partial: true, sellPercent: partialPct,
+          exitLeg: body.exit_leg, ...orderResult,
+        }}
+        : { status: "ok", detail: { side: "sell", ...orderResult } };
     }
 
     // BUG-01: Mark the single log entry as ok on success
@@ -528,6 +481,11 @@ export async function processWebhook(
     return result;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (strategyIntentId) {
+      const durable = await prisma.strategyOrderIntent.findUnique({ where: { id: strategyIntentId } });
+      submissionAttempted = durable != null &&
+        durable.status !== "requested" && durable.status !== "rejected";
+    }
     // A known exchange rejection (or any failure before submission) created no
     // order, so a retry must be allowed. Ambiguous transport failures and local
     // post-submit failures retain the receipt to fail safe against duplication.
