@@ -17,6 +17,14 @@ export const operationalStatusSchema = z.object({
   secret: z.string().min(32).max(256),
 }).strict();
 
+/** Exact source identity used to reserve a StrategyOrderIntent. */
+export const strategyExecutionEvidenceSchema = z.object({
+  secret: z.string().min(32).max(256),
+  symbol: z.string().min(3).max(40),
+  action: z.enum(["buy", "sell"]),
+  dedupe_key: z.string().min(1).max(256),
+}).strict();
+
 export const webhookSchema = z.object({
   secret: z.string().min(32).max(256),
   action: z.string().min(1).max(40),

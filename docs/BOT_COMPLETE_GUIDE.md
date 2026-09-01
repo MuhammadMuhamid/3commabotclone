@@ -439,6 +439,24 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 | Method | Path | Behavior |
 |--------|------|----------|
 | POST | `/signal_bots` | `processWebhook(req.body)`; maps errors to 401/403/503/400 |
+| POST | `/signal_bots/execution-evidence` | Existing webhook-secret auth plus exact `{symbol, action, dedupe_key}` lookup of one persisted `StrategyOrderIntent`; read-only and rate-limited |
+
+#### Platform execution-evidence read
+
+`POST /api/manual-trading/execution-evidence/manual-orders/lookup` is mounted
+behind the existing Platform HMAC/freshness/durable-nonce middleware. The
+signed body contains exactly one `orderId` or `orderRequestId`. It returns the
+exact `ManualOrder`, its current cumulative snapshot, explicit lifecycle times,
+and at most 10 successful cancel commands whose persisted results name that
+exact order ID.
+
+Both evidence responses distinguish timestamped historical occurrences,
+identifier linkage, and current snapshots. They never reinterpret `updatedAt`
+as multiple historical transitions. Individual exchange fills, previous
+cumulative snapshots, exchange acceptance time, and a distinct manual-command
+completion time are not persisted and are not returned. These handlers use
+Prisma reads only: no reconciliation helper, Binance client, execution action,
+or risk/halt mutation is reachable from them.
 
 ### 6.5 Services
 

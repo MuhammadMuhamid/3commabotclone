@@ -18,6 +18,9 @@ import {
   reconcilePendingStrategyIntents, reconcileStrategyIntent, reserveStrategyIntent,
   strategyMarketAdapter, type StrategyMarketAdapter,
 } from "../src/services/strategyOrderIntent.js";
+import {
+  readManualExecutionEvidence, readStrategyExecutionEvidence,
+} from "../src/services/executionEvidence.js";
 
 const backendRoot = path.join(import.meta.dirname, "..");
 const testDb = path.join(backendRoot, "prisma", "tests", ".tmp-test.db");
@@ -99,6 +102,48 @@ test("durable nonce and command identities survive a database reconnect", async 
   assert.deepEqual(first, { run: 1 });
   assert.deepEqual(replay, first);
   assert.equal(runs, 1);
+});
+
+test("persisted execution evidence uses exact indexed identities and exact cancel-result linkage", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Evidence strategy", webhookSecret: "e".repeat(40),
+    pairs: JSON.stringify(["BTCUSDT"]),
+  } });
+  const sourceKey = `${bot.id}:BTCUSDT:buy:L-1788264000000`;
+  const strategy = await prisma.strategyOrderIntent.create({ data: {
+    sourceKey, botId: bot.id, botName: bot.name, clientOrderId: "strategy-evidence-client",
+    symbol: "BTCUSDT", side: "BUY", requestedQuoteQty: 100,
+    status: "submitted", submittedAt: new Date(Date.UTC(2026, 8, 1, 12, 0, 1)),
+  } });
+  const strategyRead = await readStrategyExecutionEvidence({
+    secret: bot.webhookSecret, symbol: "BTCUSDT", side: "buy", dedupeKey: "L-1788264000000",
+  });
+  assert.equal(strategyRead.evidence?.identity.strategyOrderIntentId, strategy.id);
+  assert.equal(strategyRead.evidence?.events.at(-1)?.type, "SUBMISSION_ATTEMPTED");
+
+  const account = await createAccount();
+  const order = await prisma.manualOrder.create({ data: {
+    requestId: "manual_evidence_order", exchangeAccountId: account.id,
+    symbol: "ETHUSDT", side: "BUY", orderType: "LIMIT", quantityType: "quote",
+    requestedQuoteQty: 200, limitPrice: 2000, clientOrderId: "manual-evidence-client",
+    status: "canceled", exchangeOrderId: "manual-evidence-exchange",
+    submittedAt: new Date(Date.UTC(2026, 8, 1, 12, 0, 2)),
+    completedAt: new Date(Date.UTC(2026, 8, 1, 12, 0, 3)),
+    filledBaseQty: 0.05, filledQuoteQty: 100,
+  } });
+  const linked = await prisma.manualCommand.create({ data: {
+    requestId: "manual_evidence_cancel", kind: "cancel_order", status: "succeeded",
+    result: JSON.stringify({ id: order.id, requestId: order.requestId }),
+  } });
+  await prisma.manualCommand.create({ data: {
+    requestId: "manual_evidence_unrelated", kind: "cancel_order", status: "succeeded",
+    result: JSON.stringify({ id: "unrelated-order" }),
+  } });
+  const manualRead = await readManualExecutionEvidence({ orderRequestId: order.requestId });
+  assert.equal(manualRead?.identity.manualOrderId, order.id);
+  assert.equal(manualRead?.currentState.cumulativeExecutedQuoteQuantity, 100);
+  assert.deepEqual(manualRead?.linkedCommands.map((command) => command.identity.manualCommandId),
+    [linked.id]);
 });
 
 test("accepted-then-thrown submission is persisted, discovered after reconnect, and never resubmitted", async () => {

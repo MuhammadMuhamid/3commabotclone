@@ -1,9 +1,12 @@
 import { Router } from "express";
 import { processWebhook } from "../services/webhook.js";
-import { operationalStatusSchema, positionStatusSchema, webhookSchema } from "./webhookSchema.js";
+import {
+  operationalStatusSchema, positionStatusSchema, strategyExecutionEvidenceSchema, webhookSchema,
+} from "./webhookSchema.js";
 import { httpStatusFor, isReceiverOutcome } from "../contract/webhookContract.js";
 import { readBotOperationalStatusForSecret } from "../services/operationalStatus.js";
 import { asyncHandler } from "../middleware/errors.js";
+import { readStrategyExecutionEvidence } from "../services/executionEvidence.js";
 
 export const webhooksRouter = Router();
 
@@ -19,6 +22,21 @@ export const operationalStatusHandler = asyncHandler(async (req, res) => {
   const status = await readBotOperationalStatusForSecret(parsed.data.secret);
   if (!status) return res.status(401).json({ error: "Invalid secret" });
   return res.json(status);
+});
+
+/** Read one exact persisted strategy intent; this never invokes reconciliation or Binance. */
+export const strategyExecutionEvidenceHandler = asyncHandler(async (req, res) => {
+  const parsed = strategyExecutionEvidenceSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid strategy evidence lookup" });
+  const result = await readStrategyExecutionEvidence({
+    secret: parsed.data.secret,
+    symbol: parsed.data.symbol,
+    side: parsed.data.action,
+    dedupeKey: parsed.data.dedupe_key,
+  });
+  if (!result.authenticated) return res.status(401).json({ error: "Invalid secret" });
+  if (!result.evidence) return res.status(404).json({ error: "Strategy order intent not found" });
+  return res.json(result.evidence);
 });
 
 /**

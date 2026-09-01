@@ -7,7 +7,9 @@ import { config, assertConfig } from "./config.js";
 import { exchangeRouter } from "./routes/exchange.js";
 import { botsRouter } from "./routes/bots.js";
 import { tradesRouter } from "./routes/trades.js";
-import { operationalStatusHandler, webhooksRouter } from "./routes/webhooks.js";
+import {
+  operationalStatusHandler, strategyExecutionEvidenceHandler, webhooksRouter,
+} from "./routes/webhooks.js";
 import { authRouter } from "./routes/auth.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { operationsRouter } from "./routes/operations.js";
@@ -154,6 +156,11 @@ app.post(
   "/api/webhooks/signal_bots/operations",
   webhookStatusLimiter,
   operationalStatusHandler
+);
+app.post(
+  "/api/webhooks/signal_bots/execution-evidence",
+  webhookStatusLimiter,
+  strategyExecutionEvidenceHandler
 );
 app.use("/api/webhooks", webhookLimiter, webhooksRouter);
 // Separate service-to-service HMAC contract; never accepts strategy body secrets

@@ -6,6 +6,7 @@ import {
   cancelManualOrder, listManualState, ManualTradingError,
   runIdempotentManualCommand, submitManualOrder, updateManualProtection,
 } from "../services/manualTrading.js";
+import { readManualExecutionEvidence } from "../services/executionEvidence.js";
 
 export const manualTradingRouter = Router();
 manualTradingRouter.use(requireManualAuth);
@@ -13,6 +14,13 @@ manualTradingRouter.use(requireManualAuth);
 const positive = z.number().finite().positive();
 const optionalPrice = positive.nullable().optional();
 const confirmation = z.string().max(64).optional();
+export const manualEvidenceLookupSchema = z.object({
+  orderId: z.string().uuid().optional(),
+  orderRequestId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+}).strict().refine((value) => Number(value.orderId !== undefined) +
+  Number(value.orderRequestId !== undefined) === 1, {
+  message: "provide exactly one of orderId or orderRequestId",
+});
 
 const submitSchema = z.object({
   accountId: z.string().uuid(),
@@ -41,6 +49,17 @@ manualTradingRouter.get("/state", asyncHandler(async (req, res) => {
   const parsed = z.object({ symbol: z.string().optional() }).safeParse(req.query);
   if (!parsed.success) { res.status(400).json({ error: "invalid symbol" }); return; }
   res.json(await listManualState(parsed.data.symbol));
+}));
+
+manualTradingRouter.post("/execution-evidence/manual-orders/lookup", asyncHandler(async (req, res) => {
+  const parsed = manualEvidenceLookupSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.errors[0]?.message ?? "invalid manual evidence lookup" });
+    return;
+  }
+  const evidence = await readManualExecutionEvidence(parsed.data);
+  if (!evidence) { res.status(404).json({ error: "manual order not found" }); return; }
+  res.json(evidence);
 }));
 
 manualTradingRouter.post("/orders", asyncHandler(async (req, res) => {

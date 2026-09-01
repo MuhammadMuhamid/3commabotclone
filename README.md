@@ -96,6 +96,34 @@ SQLite database. Never point them at a real database or a real key.
   halt. Dry run never sends an order, and manual live execution is restricted
   to Binance Spot with the existing testnet/mainnet confirmations.
 
+### Persisted execution evidence reads
+
+Platform can read one exact persisted order without triggering reconciliation
+or contacting Binance:
+
+- `POST /api/webhooks/signal_bots/execution-evidence` accepts the existing
+  webhook-authenticated source identity `{secret, symbol, action, dedupe_key}`.
+  It resolves the same unique `StrategyOrderIntent.sourceKey` used at
+  submission. The secret authenticates and selects the bot but is never echoed.
+- `POST /api/manual-trading/execution-evidence/manual-orders/lookup` uses the
+  existing Platform-to-Bot HMAC, freshness window, durable nonce replay check,
+  and rate limit. Its signed body supplies exactly one `orderId` or
+  `orderRequestId`.
+
+Responses label immutable timestamped occurrences as
+`AUTHORITATIVE_HISTORICAL_EVENT`, exact identifier relationships as
+`AUTHORITATIVE_LINKAGE`, and mutable order/command snapshots as
+`CURRENT_AUTHORITATIVE_STATE`. `updatedAt` is exposed only as the snapshot's
+`observedAt`; it is never expanded into inferred lifecycle events. Successful
+cancel commands are attached only when their persisted result names the exact
+manual order ID, with at most 10 returned.
+
+The Bot does not persist individual strategy or manual exchange fills, prior
+cumulative snapshots, exchange acceptance time, or a separate command
+completion timestamp. Those facts remain unavailable. The reads select only
+local persisted rows; they cannot submit, cancel, reconcile, change risk/halt
+state, or call an exchange.
+
 These are local code guarantees, not Binance acceptance. Real Binance/testnet
 must still confirm client-order-ID uniqueness and lookup timing, order status
 and cumulative-fill fields, commission-trade availability, and cancel/fill race
