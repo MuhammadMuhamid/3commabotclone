@@ -60,7 +60,40 @@ npm run lint && npm run typecheck && npm test && npm run build
 ```
 
 `npm test` loads `backend/tests/test.env`, which holds non-secret fixture values
-only. Never point it at a real database or a real key.
+only. The execution-reliability tests migrate and remove their ignored temporary
+SQLite database. Never point them at a real database or a real key.
+
+## Spot execution reliability boundary
+
+- Authenticated manual Spot commands bind timestamp, nonce, request ID, path,
+  method and body under HMAC. Nonces and command results are durable in SQLite,
+  so restart does not erase replay/idempotency identity.
+- A manual order intent and deterministic Binance client order ID are persisted
+  before submission. Startup and the bounded poller query that ID and apply
+  cumulative open, partial, filled or canceled exchange snapshots idempotently.
+- Once a manual intent is `submitted`, a not-found query does **not** authorize
+  another submission: absence cannot distinguish lookup delay from a crash just
+  before the wire call. It remains pending for later reconciliation/operator
+  review. A never-attempted `requested` intent may submit once.
+- Strategy MARKET orders also use deterministic client IDs and, after an
+  ambiguous transport exception, immediately query that ID. Only an
+  authoritative `FILLED` result is accepted (including BUY commission trades);
+  other results remain uncertain.
+- Webhook dedupe receipts are durable. Known pre-submission failures and known
+  exchange rejections release their receipts for a safe retry; ambiguous or
+  post-submission failures retain them to fail safe against a duplicate.
+- The operator halt gates both BUY and SELL submission paths. Numeric exposure,
+  concurrency and daily-loss limits continue to permit exits according to the
+  existing policy. Dry run never sends an order, and manual live execution is
+  restricted to Binance Spot with the existing testnet/mainnet confirmations.
+
+These are local code guarantees, not Binance acceptance. Real Binance/testnet
+must still confirm client-order-ID uniqueness and lookup timing, order status
+and cumulative-fill fields, commission-trade availability, and cancel/fill race
+responses. A hard process crash after a strategy order reaches Binance but
+before its immediate lookup/local SmartTrade write has no durable strategy
+order-intent reconciler; the retained webhook receipt prevents an automatic
+duplicate, but operator exchange-to-ledger recovery is still required.
 
 `scripts/ci/scan-secrets.sh` runs in CI and fails the build on
 credential-shaped literals in tracked source. It reports file and line only,

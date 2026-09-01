@@ -449,15 +449,16 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 2. **Lookup bot** by `webhookSecret`; must be `status === "active"`.
 3. **`resolveSymbol`** — `normalizeSymbol(symbol ?? tv_instrument)`.
 4. **Pair allowlist** — symbol must be in bot's `pairs` JSON array.
-5. **Dedupe `dedupe_key`** — In-memory map, TTL 120s → return `{ status: "ignored_duplicate" }`.
-6. **Trade dedupe** — Key `trade:{secret}:{symbol}:{side}`, TTL 45s (blocks double buy/sell from TV).
-7. **Log** `WebhookLog` with `status: "processing"`.
+5. **Caller dedupe `dedupe_key`** — durable hashed `WebhookReceipt`, TTL 120s. Entry scale-ins without a caller identity are deliberately not collapsed.
+6. **Exit dedupe** — durable key `trade:{bot}:{symbol}:sell:{leg}`, TTL 45s. A known pre-submit failure/rejection releases its receipt; an uncertain submission retains it.
+7. **Log** `WebhookLog` with `status: "processing"` and run the global halt/risk preflight before exchange access.
 8. **Buy branch** (`resolveAction` → buy):
    - Requires `entryEnabled`
    - `assertCanOpenTrade` (max active SmartTrades, max per-pair entry orders)
    - `getClient(bot)` → account or env
    - `calcOrderQuoteUsdt(bot, usdtBalance, quote_order_qty)`
    - `marketBuyQuote` → create `SmartTrade` active → `updateSmartTradePnl`
+   - an ambiguous submission exception queries the deterministic client order ID and accepts only authoritative `FILLED` exchange truth
 9. **Sell branch**:
    - Resolve quantity from body, else latest active SmartTrade, else wallet free base
    - Cap qty to `getBaseFreeBalance`
@@ -469,7 +470,11 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 |-------------------|-------------------|
 | buy, enterlong, long, entrylong, openlong | sell, exitlong, closelong, close, exit, closeposition, market |
 
-**In-memory dedupe:** `Map<string, number>` — lost on restart; not shared across instances.
+**Durable dedupe:** `WebhookReceipt` hashes identities in SQLite, so replay
+protection survives restarts and workers. This does not replace exchange
+reconciliation: ambiguous submissions retain their receipt, and a hard crash
+before a strategy `SmartTrade` write still needs operator exchange-to-ledger
+recovery.
 
 #### `services/binance.ts`
 
