@@ -29,6 +29,39 @@
  *
  * ── Changelog ──────────────────────────────────────────────────────────────
  *
+ *  v4  Makes the Shariah block USABLE on the direct-webhook path, which v3
+ *      left open.
+ *
+ *      v3 made the block optional so an un-updated sender kept working, and
+ *      relied on a receiver-side "enforcement latch" to stop omission becoming
+ *      a downgrade. Two things were wrong with that on the webhook path:
+ *
+ *        * nothing could arm the latch for a webhook sender. The latch is
+ *          keyed per sender scope, and the only senders that could present a
+ *          block were on a DIFFERENT scope, so a receiver whose operator had
+ *          turned enforcement on still admitted every direct webhook BUY
+ *          ungated. That was a real bypass, not a transitional gap.
+ *        * the webhook body is authenticated only by the per-bot shared secret
+ *          it carries. A block inside it could therefore lower the latch back
+ *          to `off`, and a signal source could assert its own compliance.
+ *
+ *      v4 separates the two concerns that v3 conflated:
+ *
+ *        POLICY  — whether a scope enforces at all — is set only over the
+ *                  sender's HMAC control channel, never by a webhook body.
+ *        EVIDENCE — the per-asset decision for one order — may ride in the
+ *                  webhook body, but under `enforce` it must carry a detached
+ *                  sender signature (`shariah_sig` over the canonical string
+ *                  built by `shariahEvidenceCanonical`, plus `shariah_ts`).
+ *
+ *      A direct TradingView alert can produce neither, which is the point: it
+ *      is not a screening authority. Under enforcement it is refused with
+ *      `SHARIAH_CONTEXT_REQUIRED`; with enforcement off it behaves exactly as
+ *      it always has.
+ *
+ *      SELL is untouched. An exit carries no signature requirement and is never
+ *      refused, whatever the block says or fails to say.
+ *
  *  v3  Adds the optional `shariah` execution-context block and the
  *      `shariah_blocked` receiver outcome.
  *
@@ -80,7 +113,7 @@
  */
 
 /** Bumped on any change to what is accepted or emitted. */
-export const CONTRACT_VERSION = 3;
+export const CONTRACT_VERSION = 4;
 
 /**
  * SHA-256 of this file's canonical content, computed by
@@ -91,7 +124,7 @@ export const CONTRACT_VERSION = 3;
  * hash it prints, and paste it here in BOTH repositories.
  */
 export const CONTRACT_FINGERPRINT =
-  "sha256:v3:d8c421235178a0fbdf44a0b582f61a1957e9d53d5b6cd2037f16a5b965e5d29c";
+  "sha256:v4:8f57c21b5d3e381fb1902d38a5f502179afbbb1ce52181e82c8e22bb53a356b7";
 
 // ── Payload shapes ──────────────────────────────────────────────────────────
 
@@ -183,6 +216,13 @@ export const SHARIAH_REJECTION_CODES = [
   "SHARIAH_EXCLUDED_BLOCKED",
   /** No block at all, from a sender scope already latched to `enforce`. */
   "SHARIAH_CONTEXT_REQUIRED",
+  /**
+   * A block arrived on a path that cannot authenticate it — a webhook body
+   * carrying no detached signature, one that does not verify, or one that has
+   * expired. Distinct from CONTEXT_REQUIRED so an operator can tell "the sender
+   * sent nothing" apart from "something sent a decision it could not prove".
+   */
+  "SHARIAH_EVIDENCE_UNVERIFIED",
 ] as const;
 export type ShariahRejectionCode = (typeof SHARIAH_REJECTION_CODES)[number];
 
@@ -335,6 +375,66 @@ export function shariahBlockCodeFor(
   return status === "REVIEW" ? "SHARIAH_REVIEW_BLOCKED" : "SHARIAH_EXCLUDED_BLOCKED";
 }
 
+// ── Detached evidence signature (webhook path only) ─────────────────────────
+
+/**
+ * How long a signed decision stays usable, in milliseconds.
+ *
+ * Long enough to cover the sender's delivery retries with backoff, short enough
+ * that a captured ELIGIBLE cannot be replayed weeks later against an asset that
+ * has since been excluded. The receiver's own duplicate suppression is what
+ * stops replay INSIDE the window.
+ */
+export const SHARIAH_EVIDENCE_MAX_AGE_MS = 10 * 60 * 1000;
+
+/** Wire field carrying the detached signature, and the time it was produced. */
+export const SHARIAH_SIGNATURE_FIELD = "shariah_sig";
+export const SHARIAH_TIMESTAMP_FIELD = "shariah_ts";
+
+/** `v1=` plus 64 lowercase hex characters. */
+const SHARIAH_SIGNATURE_RE = /^v1=[0-9a-f]{64}$/;
+/** Milliseconds since the epoch, as digits. */
+const SHARIAH_TIMESTAMP_RE = /^[0-9]{10,17}$/;
+
+export function isShariahSignatureShaped(value: unknown): value is string {
+  return typeof value === "string" && SHARIAH_SIGNATURE_RE.test(value);
+}
+
+export function isShariahTimestampShaped(value: unknown): value is string {
+  return typeof value === "string" && SHARIAH_TIMESTAMP_RE.test(value);
+}
+
+/**
+ * Canonical bytes both sides sign and verify. Defined here so the sender and
+ * the receiver cannot disagree about them.
+ *
+ * It binds the decision to the exact SYMBOL and SIDE of the order carrying it,
+ * so a signature captured from an ELIGIBLE BUY of one asset cannot be lifted
+ * onto a BUY of another, and to a TIMESTAMP, so it expires. The block itself is
+ * serialised field-by-field in the fixed `SHARIAH_FIELDS` order rather than
+ * with `JSON.stringify`, so key order in the transmitted JSON cannot change
+ * what was signed.
+ */
+export function shariahEvidenceCanonical(input: {
+  symbol: string;
+  side: ContractAction;
+  timestamp: string;
+  context: ShariahContext;
+}): string {
+  const context = input.context as unknown as Record<string, unknown>;
+  const fields = SHARIAH_FIELDS.map((field) => {
+    const value = context[field];
+    return `${field}=${value === undefined || value === null ? "" : String(value)}`;
+  });
+  return [
+    "TS_SHARIAH_EVIDENCE_V1",
+    input.symbol.toUpperCase().replace(/[^A-Z0-9]/g, ""),
+    input.side,
+    input.timestamp,
+    ...fields,
+  ].join("\n");
+}
+
 /** The custom-bot payload. Field names are the wire format and are frozen. */
 export interface CustomBotPayload {
   secret: string;
@@ -356,6 +456,14 @@ export interface CustomBotPayload {
    * receiver must apply the decision to a BUY.
    */
   shariah?: ShariahContext;
+  /**
+   * Detached sender signature over `shariahEvidenceCanonical`, and the
+   * timestamp it covers. Required alongside an `enforce` block on this path,
+   * because the body itself is authenticated only by the shared secret it
+   * carries — see the v4 changelog entry.
+   */
+  shariah_sig?: string;
+  shariah_ts?: string;
 }
 
 /** Bounds, in one place, so both sides cannot disagree about them. */
@@ -385,6 +493,8 @@ export const ALLOWED_FIELDS = [
   "exit_leg",
   "dedupe_key",
   "shariah",
+  SHARIAH_SIGNATURE_FIELD,
+  SHARIAH_TIMESTAMP_FIELD,
 ] as const;
 
 // ── Validation ──────────────────────────────────────────────────────────────
@@ -405,7 +515,8 @@ export interface ValidationFailure {
     | "quantity_and_sell_percent"
     | "exit_leg"
     | "dedupe_key"
-    | "shariah";
+    | "shariah"
+    | "shariah_signature";
   message: string;
 }
 
@@ -522,6 +633,25 @@ export function validateCustomBotPayload(input: unknown): ValidationResult {
   if (shariah !== undefined) {
     const checked = validateShariahContext(shariah);
     if (!checked.ok) return fail("shariah", `${checked.code}: ${checked.message}`);
+  }
+
+  /*
+   * Shape only. Whether a signature is REQUIRED, and whether it verifies, is
+   * the receiver's decision: only the receiver holds the shared secret, and
+   * only the receiver knows whether the scope is enforcing. Rejecting a
+   * malformed one here would also let it 400 a SELL, which must never happen.
+   */
+  const shariahSig = body[SHARIAH_SIGNATURE_FIELD];
+  if (shariahSig !== undefined && !isShariahSignatureShaped(shariahSig)) {
+    return fail("shariah_signature", `${SHARIAH_SIGNATURE_FIELD} must be "v1=" plus 64 hex characters`);
+  }
+  const shariahTs = body[SHARIAH_TIMESTAMP_FIELD];
+  if (shariahTs !== undefined && !isShariahTimestampShaped(shariahTs)) {
+    return fail("shariah_signature", `${SHARIAH_TIMESTAMP_FIELD} must be epoch milliseconds`);
+  }
+  if ((shariahSig === undefined) !== (shariahTs === undefined)) {
+    return fail("shariah_signature",
+      `${SHARIAH_SIGNATURE_FIELD} and ${SHARIAH_TIMESTAMP_FIELD} are emitted together or not at all`);
   }
 
   return { ok: true, payload: body as unknown as CustomBotPayload };
@@ -743,14 +873,23 @@ export function emittablePayloads(secret: string): CustomBotPayload[] {
     },
   ];
   for (const shariah of shariahBlocks) {
-    out.push({
-      secret, action: "buy", symbol, quote_order_qty: 100,
-      dedupe_key: dedupeKey("buy", barTime), shariah,
-    });
-    out.push({
-      secret, action: "sell", symbol,
-      dedupe_key: dedupeKey("sell", barTime), shariah,
-    });
+    // Both shapes the sender emits: bare (the manual HMAC channel, where the
+    // request signature already covers the block) and detached-signed (the
+    // webhook path, where it does not).
+    const signed = {
+      [SHARIAH_SIGNATURE_FIELD]: `v1=${"0".repeat(64)}`,
+      [SHARIAH_TIMESTAMP_FIELD]: String(barTime),
+    };
+    for (const extra of [{}, signed]) {
+      out.push({
+        secret, action: "buy", symbol, quote_order_qty: 100,
+        dedupe_key: dedupeKey("buy", barTime), shariah, ...extra,
+      });
+      out.push({
+        secret, action: "sell", symbol,
+        dedupe_key: dedupeKey("sell", barTime), shariah, ...extra,
+      });
+    }
   }
 
   return out;

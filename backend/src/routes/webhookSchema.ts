@@ -69,6 +69,15 @@ export const webhookSchema = z.object({
    * alert, which cannot produce one) omits it and keeps its existing behaviour.
    */
   shariah: shariahContextSchema,
+  /*
+   * The detached Platform signature over the decision, and the timestamp it
+   * covers. Shape-checked here (a fixed-width opaque token cannot 400 a SELL
+   * the way a rich object could); whether one is REQUIRED, and whether it
+   * verifies, is the service's decision — only it holds the secret and knows
+   * whether this installation enforces.
+   */
+  shariah_sig: z.string().regex(/^v1=[0-9a-f]{64}$/).optional(),
+  shariah_ts: z.string().regex(/^[0-9]{10,17}$/).optional(),
 }).strict()
   .refine((b) => Boolean(b.symbol || b.tv_instrument), {
     message: "symbol or tv_instrument required",

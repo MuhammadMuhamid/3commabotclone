@@ -10,8 +10,9 @@
  * What IS enforceable locally, and is enforced here:
  *   - the version is pinned exactly, so a fresh install cannot pull an
  *     unreviewed 0.12.x into the order-signing path;
- *   - the surface this bot uses stays down to the four calls it needs, so the
- *     replacement stays a bounded piece of work;
+ *   - the surface this bot uses stays down to the calls it needs, so the
+ *     replacement stays a bounded piece of work. The set is pinned exactly, so
+ *     growing it is a deliberate edit here rather than a drift nobody notices;
  *   - the signing scheme the bot depends on is asserted, so a dependency that
  *     silently changes shape fails here rather than at Binance.
  */
@@ -42,10 +43,12 @@ test("the lockfile agrees, and carries an integrity hash", () => {
   assert.ok(entry.integrity?.startsWith("sha512-"), "the signing dependency must be integrity-pinned");
 });
 
-test("the bot uses FOUR calls from it, so a replacement is bounded", () => {
+test("the bot uses a small pinned set of calls from it, so a replacement is bounded", () => {
   const src = read("src/services/binance.ts");
   const used = [...src.matchAll(/client\.([a-zA-Z]+)\(/g)].map((m) => m[1]);
-  assert.deepEqual([...new Set(used)].sort(), ["accountInfo", "exchangeInfo", "order", "prices"]);
+  assert.deepEqual([...new Set(used)].sort(),
+    ["accountInfo", "exchangeInfo", "getOrder", "myTrades", "order", "prices"],
+    "adding an SDK call widens what a replacement has to reimplement; add it here deliberately");
 });
 
 test("nothing outside services/binance.ts imports the SDK directly", () => {

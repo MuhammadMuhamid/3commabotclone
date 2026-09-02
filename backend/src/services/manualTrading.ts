@@ -242,8 +242,11 @@ export async function submitManualOrder(
   const shariahContext = input.side === "BUY"
     ? (await admitSpotEntry({
       scope: shariahScope, symbol: input.symbol, context: readShariahContext(input.shariah),
+      // The request HMAC already covers the whole body, so the block arrives
+      // authenticated to exactly the same standard as `side` and `symbol`.
+      auth: { kind: "request-signature" },
     })).persisted
-    : await noteSpotExit(shariahScope, input.shariah);
+    : await noteSpotExit(shariahScope, input.shariah, { symbol: input.symbol });
 
   const adapter = adapterFactory(account);
   if (input.side === "SELL") await assertSellAssociation(input, account, adapter);

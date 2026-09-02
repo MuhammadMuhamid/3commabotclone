@@ -17,7 +17,10 @@ import {
   evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
   shouldLatchHalt,
 } from "./riskControls.js";
-import type { ReceiverOutcome } from "../contract/webhookContract.js";
+import {
+  SHARIAH_SIGNATURE_FIELD, SHARIAH_TIMESTAMP_FIELD,
+  type ReceiverOutcome,
+} from "../contract/webhookContract.js";
 import { calcOrderQuoteUsdt, isPerBotUnit } from "../lib/investment.js";
 import { getLastCloseTs } from "../lib/tradeCloseTracker.js";
 import crypto from "crypto";
@@ -96,6 +99,13 @@ export type WebhookBody = {
    * shared contract's validator.
    */
   shariah?: unknown;
+  /**
+   * The detached Platform signature over that decision, and the timestamp it
+   * covers. Also `unknown`: caller-supplied, and only the enforcement service
+   * may decide whether either is usable.
+   */
+  shariah_sig?: unknown;
+  shariah_ts?: unknown;
 };
 
 export function resolveAction(action: string): "buy" | "sell" {
@@ -273,11 +283,26 @@ export async function processWebhook(
      * that could stop one.
      */
     const shariahScope = shariahScopeForBot(bot.id);
+    /*
+     * This path authenticates the SENDER with a shared secret carried in the
+     * body, which authorises placing an order — not certifying one. So the
+     * decision block, if present, has to prove itself separately: a detached
+     * Platform signature over the symbol, the side and the decision. A direct
+     * TradingView alert can produce neither the block nor the signature, which
+     * is why enforcement refuses it rather than silently trusting it.
+     */
+    const shariahAuth = {
+      kind: "detached" as const,
+      side,
+      signature: body[SHARIAH_SIGNATURE_FIELD],
+      timestamp: body[SHARIAH_TIMESTAMP_FIELD],
+    };
     let shariahEvidence: string | null = null;
     if (side === "buy") {
       try {
         shariahEvidence = (await admitSpotEntry({
           scope: shariahScope, symbol, context: readShariahContext(body.shariah),
+          auth: shariahAuth,
         })).persisted;
       } catch (error) {
         if (!(error instanceof ShariahEnforcementError)) throw error;
@@ -287,7 +312,8 @@ export async function processWebhook(
         return { status: "shariah_blocked", detail: { code: error.code, reason: error.message } };
       }
     } else {
-      shariahEvidence = await noteSpotExit(shariahScope, body.shariah);
+      shariahEvidence = await noteSpotExit(shariahScope, body.shariah,
+        { symbol, auth: shariahAuth });
     }
 
     if (side === "buy") {

@@ -23,10 +23,15 @@
  *     no polling, and no outbound request. The bot reacts only to authenticated
  *     execution intents that arrive on their own.
  */
+import { createHmac, timingSafeEqual } from "node:crypto";
 import {
-  shariahBlockCodeFor, shariahStatusPermitsEntry, validateShariahContext,
-  type ShariahContext, type ShariahMode, type ShariahRejectionCode, type ShariahStatus,
+  isShariahSignatureShaped, isShariahTimestampShaped, shariahBlockCodeFor,
+  shariahEvidenceCanonical, shariahStatusPermitsEntry, SHARIAH_EVIDENCE_MAX_AGE_MS,
+  validateShariahContext,
+  type ContractAction, type ShariahContext, type ShariahMode, type ShariahRejectionCode,
+  type ShariahStatus,
 } from "../contract/webhookContract.js";
+import { config } from "../config.js";
 import { prisma } from "../lib/prisma.js";
 import { isQuoteAsset, normalizeSymbol } from "../lib/symbols.js";
 
@@ -104,6 +109,22 @@ export const shariahScopeForManualAccount = (accountId: string): string =>
   `manual-account:${accountId}`;
 
 /**
+ * The installation-wide floor, and the reason a webhook BUY cannot outrun the
+ * operator.
+ *
+ * Per-sender scopes alone left a hole. A scope is latched by a request that
+ * carries a decision, and the senders that could carry one were never on the
+ * webhook scope — so a receiver whose operator had turned Shariah mode ON still
+ * admitted every direct webhook BUY ungated, because `bot:<id>` had no row.
+ *
+ * This scope is written ONLY by the sender's HMAC control channel
+ * (`setInstallationShariahMode`), never by an order body. Enforcement is the
+ * strictest of it and the per-sender scope, so a floor of `enforce` cannot be
+ * shadowed by a scope row, and turning it back off is an authenticated act.
+ */
+export const SHARIAH_INSTALLATION_SCOPE = "installation";
+
+/**
  * The last mode the Platform asserted for a scope.
  *
  * This is the anti-downgrade latch, and it is the reason omission is not a
@@ -146,20 +167,80 @@ function withScopeAdmission<T>(scope: string, run: () => Promise<T>): Promise<T>
   return result;
 }
 
-export async function readShariahMode(scope: string): Promise<ShariahMode> {
+/** The mode stored against one exact scope key, with no floor applied. */
+async function storedShariahMode(scope: string): Promise<ShariahMode> {
   const row = await prisma.shariahEnforcement.findUnique({ where: { scope } });
   return row?.mode === "enforce" ? "enforce" : "off";
 }
 
-async function recordShariahMode(scope: string, context: ShariahContext): Promise<void> {
-  const policyVersion = context.policyVersion ?? null;
+/**
+ * The mode that actually governs a sender: the STRICTEST of the installation
+ * floor and the sender's own scope.
+ *
+ * Strictest-wins is what makes the floor unshadowable. A scope row saying `off`
+ * cannot lower an installation that says `enforce`, so there is no order in
+ * which requests can arrive that reopens the gate.
+ */
+export async function readShariahMode(scope: string): Promise<ShariahMode> {
+  if (scope !== SHARIAH_INSTALLATION_SCOPE &&
+      await storedShariahMode(SHARIAH_INSTALLATION_SCOPE) === "enforce") {
+    return "enforce";
+  }
+  return storedShariahMode(scope);
+}
+
+async function writeShariahMode(
+  scope: string, mode: ShariahMode, policyVersion: string | null
+): Promise<void> {
   const existing = await prisma.shariahEnforcement.findUnique({ where: { scope } });
-  if (existing?.mode === context.mode && existing.policyVersion === policyVersion) return;
+  if (existing?.mode === mode && existing.policyVersion === policyVersion) return;
   await prisma.shariahEnforcement.upsert({
     where: { scope },
-    create: { scope, mode: context.mode, policyVersion },
-    update: { mode: context.mode, policyVersion },
+    create: { scope, mode, policyVersion },
+    update: { mode, policyVersion },
   });
+}
+
+/**
+ * Latch a per-sender scope from an AUTHENTICATED order body.
+ *
+ * Monotone on purpose: a request body may raise a scope to `enforce`, never
+ * lower it back to `off`. The scope latch is a side effect of an order, and an
+ * order is not where policy is decided — lowering is reserved for the control
+ * channel, which is the only caller that can prove it speaks for the operator.
+ * The module comment has always claimed this property; before v4 the webhook
+ * path did not actually have it.
+ */
+async function recordShariahMode(scope: string, context: ShariahContext): Promise<void> {
+  if (context.mode !== "enforce") return;
+  await writeShariahMode(scope, "enforce", context.policyVersion ?? null);
+}
+
+/**
+ * Set the installation floor. The ONLY way enforcement is turned off, and the
+ * only writer of `SHARIAH_INSTALLATION_SCOPE`.
+ *
+ * Callable only from a route behind `requireManualAuth`, whose HMAC covers the
+ * whole body — the same authentication that already authorises a real order.
+ */
+export async function setInstallationShariahMode(
+  mode: ShariahMode, policyVersion: string | null
+): Promise<ShariahMode> {
+  await withScopeAdmission(SHARIAH_INSTALLATION_SCOPE, () =>
+    writeShariahMode(SHARIAH_INSTALLATION_SCOPE, mode, mode === "enforce" ? policyVersion : null));
+  return mode;
+}
+
+/** What the installation floor currently says. Read-only, for the control route. */
+export async function readInstallationShariahMode(): Promise<{
+  mode: ShariahMode; policyVersion: string | null;
+}> {
+  const row = await prisma.shariahEnforcement.findUnique({
+    where: { scope: SHARIAH_INSTALLATION_SCOPE } });
+  return {
+    mode: row?.mode === "enforce" ? "enforce" : "off",
+    policyVersion: row?.policyVersion ?? null,
+  };
 }
 
 // ── Context handling ────────────────────────────────────────────────────────
@@ -226,6 +307,114 @@ function decideEntry(context: ShariahContext, symbol: string): ShariahClearance 
   return clearance(symbol, "enforce", status);
 }
 
+// ── How a decision is authenticated on the path it arrived by ───────────────
+
+/**
+ * What proves a Shariah block on THIS request actually came from the Platform.
+ *
+ * `request-signature` — the whole body is covered by the manual HMAC
+ *   (`requireManualAuth`). The block is authenticated for free, exactly as
+ *   `side` and `symbol` are, and needs nothing further.
+ *
+ * `detached` — the direct-webhook path. Its only authentication is the per-bot
+ *   shared secret carried INSIDE the body, which authorises placing an order,
+ *   not asserting a screening decision. A block here is trusted only with a
+ *   detached sender signature over `shariahEvidenceCanonical`.
+ *
+ * There is deliberately no third variant meaning "trust it anyway".
+ */
+export type ShariahEvidenceAuth =
+  | { kind: "request-signature" }
+  | { kind: "detached"; side: ContractAction; signature?: unknown; timestamp?: unknown };
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const left = Buffer.from(a, "utf8");
+  const right = Buffer.from(b, "utf8");
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+/**
+ * Verify a detached signature over one decision, bound to this exact symbol,
+ * side and time.
+ *
+ * Keyed by the manual HMAC secret, which the Platform already shares with this
+ * bot and a TradingView alert does not have. That asymmetry is the whole
+ * mechanism: a signal source can ask for a BUY, but it cannot certify one.
+ */
+export function verifyShariahEvidence(input: {
+  symbol: string;
+  side: ContractAction;
+  context: ShariahContext;
+  signature: unknown;
+  timestamp: unknown;
+  now?: number;
+}): { ok: true } | { ok: false; reason: string } {
+  const secret = config.manualTradingHmacSecret;
+  if (!secret) return { ok: false, reason: "this bot holds no Platform signing secret" };
+  if (!isShariahSignatureShaped(input.signature)) {
+    return { ok: false, reason: "the Shariah decision carries no usable signature" };
+  }
+  if (!isShariahTimestampShaped(input.timestamp)) {
+    return { ok: false, reason: "the Shariah decision carries no usable timestamp" };
+  }
+  const age = (input.now ?? Date.now()) - Number(input.timestamp);
+  if (!Number.isFinite(age) || Math.abs(age) > SHARIAH_EVIDENCE_MAX_AGE_MS) {
+    return { ok: false, reason: "the Shariah decision signature is outside its freshness window" };
+  }
+  const canonical = shariahEvidenceCanonical({
+    symbol: input.symbol, side: input.side,
+    timestamp: input.timestamp, context: input.context,
+  });
+  const expected = `v1=${createHmac("sha256", secret).update(canonical).digest("hex")}`;
+  if (!constantTimeEquals(expected, input.signature)) {
+    return { ok: false, reason: "the Shariah decision signature does not verify" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Decide whether a block, on the path it arrived by, is entitled to be ACTED ON
+ * as the Platform's decision.
+ *
+ * `trusted: false` does not mean "ignore it". An unproven block may still make
+ * things stricter — see `admitSpotEntry`, which honours any refusal it produces
+ * and discards only the permission. What it may never do is authorise an entry,
+ * latch a scope, or be persisted as the decision a later recovery re-reads.
+ */
+function authenticatedDecision(input: {
+  symbol: string;
+  context: ShariahContext | undefined;
+  auth: ShariahEvidenceAuth;
+}): { trusted: boolean; context: ShariahContext | undefined; unverified: string | null } {
+  if (!input.context) return { trusted: true, context: undefined, unverified: null };
+  if (input.auth.kind === "request-signature") {
+    return { trusted: true, context: input.context, unverified: null };
+  }
+  const verified = verifyShariahEvidence({
+    symbol: input.symbol, side: input.auth.side, context: input.context,
+    signature: input.auth.signature, timestamp: input.auth.timestamp,
+  });
+  // A signature is what makes the block the Platform's statement rather than
+  // the order sender's, so it is checked FIRST — including for `mode: "off"`,
+  // which a Platform that is not enforcing legitimately sends.
+  if (verified.ok) return { trusted: true, context: input.context, unverified: null };
+  /*
+   * Unverified, so it is not the Platform speaking. What survives is only what
+   * is safe in the strict direction:
+   *
+   *   `off`     — dropped entirely. Honouring it would let the sender of an
+   *               order assert that policy does not apply to it.
+   *   `enforce` — carried through untrusted, so it can still REFUSE an entry
+   *               (see `admitSpotEntry`) but can never authorise one.
+   */
+  return {
+    trusted: false,
+    context: input.context.mode === "enforce" ? input.context : undefined,
+    unverified: verified.reason,
+  };
+}
+
 // ── The two gates ───────────────────────────────────────────────────────────
 
 export interface EntryAdmission {
@@ -245,21 +434,38 @@ export function admitSpotEntry(input: {
   scope: string;
   symbol: string;
   context: ShariahContext | undefined;
+  /** How this path proves the block came from the Platform. Never optional. */
+  auth: ShariahEvidenceAuth;
 }): Promise<EntryAdmission> {
   return withScopeAdmission(input.scope, async () => {
-    if (!input.context) {
+    const { trusted, context, unverified } = authenticatedDecision(input);
+    if (context && !trusted) {
+      /*
+       * An unproven decision may only ever make things stricter.
+       *
+       * Running the real rule and keeping ONLY its refusals is what stops the
+       * signature requirement from becoming a safety regression: before v4 an
+       * unsigned EXCLUDED block did block the BUY, and it still does. What it
+       * can no longer do is the opposite — an unsigned ELIGIBLE returns a
+       * clearance here, and that clearance is deliberately thrown away.
+       */
+      decideEntry(context, input.symbol);
+    }
+    if (!trusted || !context) {
       if (await readShariahMode(input.scope) === "enforce") {
-        throw new ShariahEnforcementError(
-          "SHARIAH_CONTEXT_REQUIRED",
-          `${normalizeSymbol(input.symbol)}: this sender is enforcing Shariah policy, ` +
-          "so a BUY must carry an authenticated Shariah decision");
+        throw unverified
+          ? new ShariahEnforcementError("SHARIAH_EVIDENCE_UNVERIFIED",
+            `${normalizeSymbol(input.symbol)}: ${unverified}`)
+          : new ShariahEnforcementError("SHARIAH_CONTEXT_REQUIRED",
+            `${normalizeSymbol(input.symbol)}: this installation is enforcing Shariah policy, ` +
+            "so a BUY must carry an authenticated Shariah decision");
       }
       return { clearance: clearance(input.symbol, "off", null), persisted: null };
     }
-    await recordShariahMode(input.scope, input.context);
+    await recordShariahMode(input.scope, context);
     return {
-      clearance: decideEntry(input.context, input.symbol),
-      persisted: serializeShariahContext(input.context),
+      clearance: decideEntry(context, input.symbol),
+      persisted: serializeShariahContext(context),
     };
   });
 }
@@ -273,10 +479,24 @@ export function admitSpotEntry(input: {
  * It exists only so an exit keeps the enforcement latch current and leaves the
  * same audit evidence an entry does.
  */
-export async function noteSpotExit(scope: string, raw: unknown): Promise<string | null> {
+export async function noteSpotExit(scope: string, raw: unknown, opts: {
+  /** The symbol the exit names, so a detached signature verifies against it. */
+  symbol?: string;
+  auth?: ShariahEvidenceAuth;
+} = {}): Promise<string | null> {
   try {
-    const context = readShariahContext(raw);
-    if (!context) return null;
+    // Authenticated exactly as an entry is: an exit can no more assert an
+    // unproven decision than a BUY can. An unverifiable block simply records
+    // nothing, which is the stricter outcome and never touches the exit.
+    const decision = authenticatedDecision({
+      symbol: opts.symbol ?? "",
+      context: readShariahContext(raw),
+      auth: opts.auth ?? { kind: "request-signature" },
+    });
+    // Only a proven decision is recorded. An unproven one is not evidence of
+    // anything, and must not latch a scope an operator never armed.
+    if (!decision.trusted || !decision.context) return null;
+    const context = decision.context;
     // Queued behind entry admission for the same scope, so an exit's latch
     // write cannot land in the middle of an entry's read-then-decide.
     await withScopeAdmission(scope, () => recordShariahMode(scope, context));
