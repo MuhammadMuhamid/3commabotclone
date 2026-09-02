@@ -102,7 +102,8 @@ test("the registry names every Float field the schema calls money", () => {
   // If a monetary column is added to schema.prisma and not listed here, its
   // writes silently stop being quantized. This is the reminder.
   assert.deepEqual(Object.keys(MONEY_FIELDS).sort(),
-    ["PartialClose", "RiskControl", "SignalBot", "SmartTrade"]);
+    ["PartialClose", "RiskControl", "SignalBot", "SmartTrade", "StrategyOrderIntent"]);
   assert.ok(MONEY_FIELDS.SmartTrade!.includes("pnlUsdt"));
   assert.ok(MONEY_FIELDS.PartialClose!.includes("revenue"));
+  assert.ok(MONEY_FIELDS.StrategyOrderIntent!.includes("filledQuoteQty"));
 });

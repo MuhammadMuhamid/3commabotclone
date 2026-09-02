@@ -7,6 +7,7 @@ import {
   reconcileStrategyIntent,
   reserveStrategyIntent,
 } from "../../src/services/strategyOrderIntent.js";
+import { canonicalJson, platformWebhookIdentity } from "../../src/contract/realizationEventContract.js";
 
 const instant = (suffix) => new Date(`2026-09-02T12:00:${suffix}Z`);
 const botId = "bot-backup-fixture";
@@ -108,6 +109,10 @@ async function seed() {
     requestedBaseQty: 0.25,
     sellPercent: 25,
     exitLeg: "tp1",
+    platformDeploymentId: "11111111-1111-4111-8111-111111111111",
+    platformOrderIntentId: "41",
+    platformDedupeKey: "X-fixed",
+    platformWebhookIdentity: platformWebhookIdentity(webhookSecret),
     smartTradeId: strategyTradeId,
     status: "reconciled",
     exchangeOrderId: "exchange-partial-fixed",
@@ -131,6 +136,25 @@ async function seed() {
     exchangeOrderId: "exchange-partial-fixed",
     strategyIntentId: partialIntentId,
     createdAt: instant("12.123"),
+  }});
+  const realizationPayload = canonicalJson({
+    contractVersion: 1, type: "BOT_CUSTOM_REALIZATION",
+    eventId: "bot-realization-v1:partial:partial-close-fixture", kind: "partial",
+    realizedAt: instant("12.123").toISOString(), realizedPnlQuote: "3.125",
+    realizedQuantity: "0.25", exitPrice: "112.5", exitRevenueQuote: "28.125",
+    quoteCurrency: "USDT", symbol: "BTCUSDT", positionDirection: "long", exitSide: "sell",
+    strategyOrderIntentId: partialIntentId, exchangeOrderId: "exchange-partial-fixed",
+    platformWebhookIdentity: platformWebhookIdentity(webhookSecret),
+    platformDeploymentId: "11111111-1111-4111-8111-111111111111",
+    platformOrderIntentId: "41", platformDedupeKey: "X-fixed", exitLeg: "tp1",
+    accounting: { pnlBasis: "modeled_fee_adjusted", feeModel: "fixed_rate_both_sides",
+      buyFeeRate: "0.001", sellFeeRate: "0.001",
+      commissionSource: "modeled_not_exchange_observed" },
+  });
+  await prisma.realizationEvent.create({ data: {
+    id: "bot-realization-v1:partial:partial-close-fixture", strategyIntentId: partialIntentId,
+    kind: "partial", eventTime: instant("12.123"), payload: realizationPayload,
+    payloadSha256: createHash("sha256").update(realizationPayload).digest("hex"),
   }});
   await prisma.strategyOrderIntent.create({ data: {
     id: pendingIntentId,
@@ -265,6 +289,7 @@ async function snapshot() {
     manualNonces: await prisma.manualNonce.findMany({ orderBy: { nonce: "asc" } }),
     partialCloses: await prisma.partialClose.findMany({ orderBy: { id: "asc" } }),
     strategyOrderIntents: await prisma.strategyOrderIntent.findMany({ orderBy: { id: "asc" } }),
+    realizationEvents: await prisma.realizationEvent.findMany({ orderBy: { id: "asc" } }),
     webhookLogs: await prisma.webhookLog.findMany({ orderBy: { id: "asc" } }),
     webhookReceipts: await prisma.webhookReceipt.findMany({ orderBy: { id: "asc" } }),
     pairCloseMarks: await prisma.pairCloseMark.findMany({ orderBy: { id: "asc" } }),
@@ -287,6 +312,10 @@ async function verifyRecoveryBehavior() {
     requestedBaseQty: 0.25,
     sellPercent: 25,
     exitLeg: "tp1",
+    platformDeploymentId: "11111111-1111-4111-8111-111111111111",
+    platformOrderIntentId: "41",
+    platformDedupeKey: "X-fixed",
+    platformWebhookIdentity: platformWebhookIdentity(webhookSecret),
     smartTradeId: strategyTradeId,
   });
   let reconciledSubmitCalls = 0;
@@ -346,6 +375,7 @@ async function verifyRecoveryBehavior() {
     commandReplay,
     commandActionCalls,
     nonceReplay,
+    realizationEventCount: await prisma.realizationEvent.count(),
     webhookReplay,
     webhookClientCalls,
   };

@@ -16,7 +16,7 @@ import { mapWithConcurrency } from "../lib/scheduler.js";
  */
 const PRICE_CONCURRENCY = 4;
 const PNL_CONCURRENCY = 4;
-import { sumMoney } from "../lib/money.js";
+import { quantize, sumMoney } from "../lib/money.js";
 
 // F3: Binance charges 0.1% on each side. Factor both into every P&L calculation.
 const BUY_FEE  = 1.001; // effective buy cost multiplier
@@ -70,13 +70,17 @@ export function calcFinalClosePnl(
   finalRevenue: number,
   remainingQuoteSpent: number,
   partials: { pnlUsdt: number; revenue: number }[]
-): { pnlUsdt: number; pnlPct: number } {
+): { pnlUsdt: number; pnlPct: number; finalLegPnlUsdt: number } {
   // P&L for the remaining position being closed now
   const { pnlUsdt: finalLegPnl } = calcRealizedPnl(finalRevenue, remainingQuoteSpent);
 
   // Sum in all prior partial close P&Ls
   const partialsPnl = sumMoney(partials.map((p) => p.pnlUsdt));
   const totalPnlUsdt = finalLegPnl + partialsPnl;
+  // This is the exact stored-accounting delta, not a second formula: subtract
+  // already-persisted partial economics from the same cumulative result after
+  // applying the existing SQLite storage quantization.
+  const finalLegPnlUsdt = sumMoney([quantize(totalPnlUsdt), -partialsPnl]);
 
   // Reconstruct the original total effective cost for an accurate percentage.
   // From calcRealizedPnl: pnlUsdt = revenue * SELL_FEE - proportionalCost * BUY_FEE
@@ -87,7 +91,7 @@ export function calcFinalClosePnl(
   const totalEffectiveCost = remainingQuoteSpent * BUY_FEE + partialEffectiveCost;
   const pnlPct = totalEffectiveCost > 0 ? (totalPnlUsdt / totalEffectiveCost) * 100 : 0;
 
-  return { pnlUsdt: totalPnlUsdt, pnlPct };
+  return { pnlUsdt: totalPnlUsdt, pnlPct, finalLegPnlUsdt };
 }
 
 export async function updateSmartTradePnl(

@@ -89,6 +89,21 @@ SQLite database. Never point them at a real database or a real key.
   Pre-submission failures and authoritative rejections may release a receipt;
   ambiguous/post-submission failures retain it. A released receipt never resets
   an existing intent's attempted state.
+- A real dedupe-keyed custom SELL also writes one immutable
+  `RealizationEvent` in the same SQLite transaction as its `PartialClose` or
+  final SmartTrade accounting update. Partial events carry that slice's P&L;
+  final events carry only the remaining final-leg delta, so their sum equals
+  SmartTrade cumulative realized P&L. Canonical decimal strings and the
+  authoritative timestamp are captured once and replayed from storage.
+- Exact provenance is the Bot intent plus exchange order, Platform dedupe key,
+  and a one-way webhook-credential identity. New Platform commands additionally
+  carry deployment/order-intent IDs in HTTP headers old Bots safely ignore;
+  events created behind an old Platform retain the exact key/credential
+  correlation for resolution after Platform upgrades.
+- The accounting basis is the existing modeled adjustment: 0.1% on buy cost
+  and 0.1% on sell revenue. It is not exchange-observed net P&L. A bounded
+  50-event HMAC-authenticated outbox batch retries with backoff; Platform
+  failure never rolls back Bot accounting.
 - The operator halt gates both BUY and SELL submission paths. Numeric exposure,
   concurrency and daily-loss limits continue to permit exits according to the
   existing policy. A never-attempted strategy intent rechecks those gates, while
@@ -278,7 +293,8 @@ Per-bot secrets are generated when you create a bot; Binance keys are stored per
 
 SQLite `bot.db` is the authoritative local recovery artifact. It includes bot
 configuration and webhook secrets; exchange-account routing and encrypted API
-key blobs; `SmartTrade`, `PartialClose`, `StrategyOrderIntent`, `ManualOrder`,
+key blobs; `SmartTrade`, `PartialClose`, `StrategyOrderIntent`, immutable
+`RealizationEvent` payload/outbox state, `ManualOrder`,
 `ManualCommand`, nonce/receipt dedupe records, close marks, risk/halt state,
 execution logs, users/sessions/push subscriptions, and Prisma migration history.
 The live-price/PnL snapshots in those rows can be refreshed, but identities,

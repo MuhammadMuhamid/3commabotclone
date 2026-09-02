@@ -13,6 +13,7 @@ BOT_REQUIRED_TABLES=(
   ManualNonce
   PartialClose
   StrategyOrderIntent
+  RealizationEvent
   WebhookLog
   User
   PushSubscription

@@ -516,6 +516,16 @@ attempted row is queried even if trading is later halted; a query miss remains
 exactly once. BUY lookup requires commission trades so recovered base quantity
 stays net of base-asset fees.
 
+For dedupe-keyed custom exits, `RealizationEvent` is a fourth, narrow
+publication responsibility: it captures the already-established accounting
+result transactionally and immutably; it does not calculate economics. Existing
+history is not backfilled, and dry-run, manual/no-dedupe, and 3Commas paths do
+not emit. Exact Platform provenance uses direct deployment/order-intent headers
+when available, or the durable dedupe key plus one-way webhook-credential
+identity during an old-Platform rollout. The final event is the final-leg delta
+rather than cumulative SmartTrade P&L, and delivery verifies then retries the
+canonical stored v1 payload after restart.
+
 These are local SQLite/fake-exchange guarantees. Binance testnet still needs to
 confirm client-ID lookup timing/eventual visibility, MARKET partial-fill and
 user-data timing, and commission-trade availability/timing.

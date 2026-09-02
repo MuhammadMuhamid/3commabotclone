@@ -7,6 +7,7 @@ import {
   marketSellBase, MinNotionalError, queryFilledMarketOrder,
 } from "./binance.js";
 import { calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
+import { persistStrategyRealization } from "./realizationEvents.js";
 import {
   evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
   shouldLatchHalt,
@@ -25,6 +26,10 @@ export interface StrategyIntentReservation {
   requestedQuoteQty?: number;
   sellPercent?: number;
   exitLeg?: string;
+  platformDeploymentId?: string;
+  platformOrderIntentId?: string;
+  platformDedupeKey?: string;
+  platformWebhookIdentity?: string;
   skipExitCheck?: boolean;
   smartTradeId?: string;
 }
@@ -67,7 +72,11 @@ function assertReservationMatches(
     sameNumber(existing.requestedQuoteQty, input.requestedQuoteQty) &&
     sameNumber(existing.sellPercent, input.sellPercent) &&
     existing.skipExitCheck === (input.skipExitCheck ?? false) &&
-    existing.smartTradeId === (input.smartTradeId ?? null);
+    existing.smartTradeId === (input.smartTradeId ?? null) &&
+    existing.platformDeploymentId === (input.platformDeploymentId ?? null) &&
+    existing.platformOrderIntentId === (input.platformOrderIntentId ?? null) &&
+    existing.platformDedupeKey === (input.platformDedupeKey ?? null) &&
+    existing.platformWebhookIdentity === (input.platformWebhookIdentity ?? null);
   if (!matches) {
     throw new Error(
       `Durable strategy intent conflict for ${input.clientOrderId}; ` +
@@ -97,6 +106,10 @@ export async function reserveStrategyIntent(
       requestedQuoteQty: input.requestedQuoteQty,
       sellPercent: input.sellPercent,
       exitLeg: input.exitLeg,
+      platformDeploymentId: input.platformDeploymentId,
+      platformOrderIntentId: input.platformOrderIntentId,
+      platformDedupeKey: input.platformDedupeKey,
+      platformWebhookIdentity: input.platformWebhookIdentity,
       skipExitCheck: input.skipExitCheck ?? false,
       smartTradeId: input.smartTradeId,
     }});
@@ -214,7 +227,8 @@ async function applyAuthoritativeResult(
           const proportionalCost = trade.quantity > 0
             ? trade.quoteSpent * (soldQty / trade.quantity) : 0;
           const { pnlUsdt } = calcRealizedPnl(result.cummulativeQuoteQty, proportionalCost);
-          await tx.partialClose.create({ data: {
+          const realizedAt = new Date();
+          const partial = await tx.partialClose.create({ data: {
             tradeId: trade.id,
             pct: intent.sellPercent,
             quantity: soldQty,
@@ -223,12 +237,19 @@ async function applyAuthoritativeResult(
             avgPrice: result.avgPrice,
             exchangeOrderId: result.orderId,
             strategyIntentId: intent.id,
+            createdAt: realizedAt,
           }});
           await tx.smartTrade.update({ where: { id: trade.id }, data: {
             quantity: Math.max(0, trade.quantity - soldQty),
             quoteSpent: Math.max(0, trade.quoteSpent - proportionalCost),
             currentPrice: result.avgPrice,
           }});
+          await persistStrategyRealization(tx, {
+            intent, kind: "partial", sourceId: partial.id, realizedAt,
+            realizedPnlQuote: pnlUsdt, realizedQuantity: soldQty,
+            exitPrice: result.avgPrice, exitRevenueQuote: result.cummulativeQuoteQty,
+            exchangeOrderId: result.orderId, simulated: result.simulated,
+          });
         }
       } else if (trade.status === "active") {
         const covered = result.executedQty >= trade.quantity * 0.999;
@@ -243,11 +264,12 @@ async function applyAuthoritativeResult(
             `${trade.quantity} base units. The trade remains OPEN with ${remaining} outstanding`;
         } else {
           const partials = await tx.partialClose.findMany({ where: { tradeId: trade.id } });
-          const { pnlUsdt, pnlPct } = calcFinalClosePnl(
+          const { pnlUsdt, pnlPct, finalLegPnlUsdt } = calcFinalClosePnl(
             result.cummulativeQuoteQty, trade.quoteSpent, partials);
+          const realizedAt = new Date();
           await tx.smartTrade.update({ where: { id: trade.id }, data: {
             status: "closed",
-            closedAt: new Date(),
+            closedAt: realizedAt,
             closedReason: "signal_exit",
             currentPrice: result.avgPrice,
             pnlUsdt,
@@ -257,6 +279,13 @@ async function applyAuthoritativeResult(
             where: { botId_pair: { botId: intent.botId, pair: intent.symbol } },
             create: { botId: intent.botId, pair: intent.symbol, closedAt: new Date() },
             update: { closedAt: new Date() },
+          });
+          await persistStrategyRealization(tx, {
+            intent, kind: "final", sourceId: intent.id, realizedAt,
+            realizedPnlQuote: finalLegPnlUsdt,
+            realizedQuantity: result.executedQty,
+            exitPrice: result.avgPrice, exitRevenueQuote: result.cummulativeQuoteQty,
+            exchangeOrderId: result.orderId, simulated: result.simulated,
           });
         }
       }

@@ -10,7 +10,7 @@ const backendRoot = path.join(import.meta.dirname, "..");
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "strategy-intent-migration-"));
 const scratchPrisma = path.join(scratch, "prisma");
 const database = path.join(scratch, "populated.db");
-const migrationName = "20260901000000_strategy_order_intent";
+const migrationName = "20260902000000_realization_events";
 const databaseUrl = `file:${database}`;
 
 after(() => fs.rmSync(scratch, { recursive: true, force: true }));
@@ -22,7 +22,7 @@ function deploy(): void {
   ], { cwd: scratch, env: { ...process.env, DATABASE_URL: databaseUrl }, stdio: "pipe" });
 }
 
-test("strategy intent migration preserves populated SmartTrade and PartialClose history", async () => {
+test("realization migration preserves history and creates no historical events", async () => {
   fs.mkdirSync(path.join(scratchPrisma, "migrations"), { recursive: true });
   fs.copyFileSync(
     path.join(backendRoot, "prisma", "schema.prisma"),
@@ -74,6 +74,8 @@ test("strategy intent migration preserves populated SmartTrade and PartialClose 
     "SELECT id, strategyIntentId FROM PartialClose ORDER BY id");
   const intents = await afterMigration.$queryRawUnsafe<Array<{ count: bigint }>>(
     "SELECT COUNT(*) AS count FROM StrategyOrderIntent");
+  const events = await afterMigration.$queryRawUnsafe<Array<{ count: bigint }>>(
+    "SELECT COUNT(*) AS count FROM RealizationEvent");
   await afterMigration.$disconnect();
 
   assert.deepEqual(trades, [{ id: "trade-old", quantity: 1 }]);
@@ -82,4 +84,5 @@ test("strategy intent migration preserves populated SmartTrade and PartialClose 
     { id: "partial-old-2", strategyIntentId: null },
   ]);
   assert.equal(Number(intents[0]?.count), 0);
+  assert.equal(Number(events[0]?.count), 0);
 });

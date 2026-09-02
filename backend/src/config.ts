@@ -99,6 +99,12 @@ export const config = {
   mainnetManualTradingEnabled: process.env.MAINNET_MANUAL_TRADING_ENABLED === "true",
   manualTradingHmacSecret: process.env.MANUAL_TRADING_HMAC_SECRET ?? "",
 
+  // Durable Bot -> Platform realization outbox delivery. Accounting never
+  // depends on this peer being available.
+  realizationDeliveryEnabled: process.env.REALIZATION_DELIVERY_ENABLED === "true",
+  realizationPlatformUrl: process.env.REALIZATION_PLATFORM_URL ?? "",
+  realizationHmacSecret: process.env.REALIZATION_HMAC_SECRET ?? "",
+
   vapidPublicKey: process.env.VAPID_PUBLIC_KEY ?? "",
   vapidPrivateKey: process.env.VAPID_PRIVATE_KEY ?? "",
   vapidSubject: process.env.VAPID_SUBJECT ?? "mailto:alerts@localhost",
@@ -144,6 +150,23 @@ export function collectConfigErrors(): string[] {
     errors.push("MANUAL_TRADING_HMAC_SECRET must be at least 32 characters when manual trading is enabled");
   } else if (config.manualTradingEnabled && isPublishedPlaceholder(config.manualTradingHmacSecret)) {
     errors.push("MANUAL_TRADING_HMAC_SECRET is a published placeholder value — generate a real one");
+  }
+
+  if (config.realizationDeliveryEnabled && config.realizationHmacSecret.length < 32) {
+    errors.push("REALIZATION_HMAC_SECRET must be at least 32 characters when realization delivery is enabled");
+  } else if (config.realizationDeliveryEnabled && isPublishedPlaceholder(config.realizationHmacSecret)) {
+    errors.push("REALIZATION_HMAC_SECRET is a published placeholder value — generate a real one");
+  }
+  if (config.realizationDeliveryEnabled) {
+    try {
+      const url = new URL(config.realizationPlatformUrl);
+      const loopback = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+      if ((url.protocol !== "https:" && !(loopback && url.protocol === "http:"))
+          || url.username || url.password || url.search || url.hash
+          || url.pathname !== "/api/internal/realization-events/v1") throw new Error();
+    } catch {
+      errors.push("REALIZATION_PLATFORM_URL must be the HTTPS ingestion endpoint (plain HTTP is allowed only on loopback)");
+    }
   }
 
   const vapidCount = [config.vapidPublicKey, config.vapidPrivateKey].filter(Boolean).length;

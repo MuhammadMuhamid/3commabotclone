@@ -21,6 +21,10 @@ import {
 import {
   readManualExecutionEvidence, readStrategyExecutionEvidence,
 } from "../src/services/executionEvidence.js";
+import { deliverPendingRealizations } from "../src/services/realizationEvents.js";
+import { canonicalJson, normalizeRealizationEvent, platformWebhookIdentity,
+  type RealizationEventV1 } from "../src/contract/realizationEventContract.js";
+import { sumMoney } from "../src/lib/money.js";
 
 const backendRoot = path.join(import.meta.dirname, "..");
 const testDb = path.join(backendRoot, "prisma", "tests", ".tmp-test.db");
@@ -28,6 +32,9 @@ const originalConfig = {
   dryRun: config.dryRun,
   manualTradingEnabled: config.manualTradingEnabled,
   mainnetManualTradingEnabled: config.mainnetManualTradingEnabled,
+  realizationDeliveryEnabled: config.realizationDeliveryEnabled,
+  realizationPlatformUrl: config.realizationPlatformUrl,
+  realizationHmacSecret: config.realizationHmacSecret,
 };
 
 function snapshot(status: ManualOrderSnapshot["status"], base = 0, quote = 0,
@@ -45,6 +52,7 @@ async function createAccount(overrides: Partial<ExchangeAccount> = {}): Promise<
 }
 
 async function clearDatabase(): Promise<void> {
+  await prisma.realizationEvent.deleteMany();
   await prisma.partialClose.deleteMany();
   await prisma.strategyOrderIntent.deleteMany();
   await prisma.smartTrade.deleteMany();
@@ -551,6 +559,170 @@ test("a known webhook exchange rejection releases its receipt but the durable in
   assert.equal(wireOrders, 1);
   assert.equal(await prisma.webhookReceipt.count(), 0);
   assert.equal((await prisma.strategyOrderIntent.findFirstOrThrow()).status, "rejected");
+});
+
+async function runRealizationLifecycle(
+  legs: Array<{ qty: number; revenue: number; percent: number; leg: "tp1" | "tp2" }>,
+  final: { qty: number; revenue: number; leg: "runner" | "stop" | "signal" },
+  suffix: string,
+  directPlatformCorrelation = true
+): Promise<{ events: RealizationEventV1[]; cumulativePnl: number; tradeId: string }> {
+  const bot = await prisma.signalBot.create({ data: {
+    name: `Realization ${suffix}`, webhookSecret: `realization-${suffix}-${"s".repeat(32)}`,
+    pairs: JSON.stringify(["BTCUSDT"]), exitEnabled: true,
+  }});
+  const trade = await prisma.smartTrade.create({ data: {
+    botId: bot.id, botName: bot.name, pair: "BTCUSDT", status: "active",
+    direction: "long", quantity: 1, quoteSpent: 100,
+  }});
+  const deploymentId = "11111111-1111-4111-8111-111111111111";
+  const webhookIdentity = platformWebhookIdentity(bot.webhookSecret);
+  let ordinal = 1;
+  for (const leg of legs) {
+    const dedupe = `X-${suffix}-${ordinal}`;
+    const sourceKey = `${bot.id}:BTCUSDT:sell:${dedupe}`;
+    const reserved = await reserveStrategyIntent({ sourceKey, bot, symbol: "BTCUSDT", side: "SELL",
+      clientOrderId: clientOrderId(sourceKey), requestedBaseQty: leg.qty,
+      sellPercent: leg.percent, exitLeg: leg.leg, smartTradeId: trade.id,
+      platformDeploymentId: directPlatformCorrelation ? deploymentId : undefined,
+      platformOrderIntentId: directPlatformCorrelation ? String(ordinal) : undefined,
+      platformDedupeKey: dedupe, platformWebhookIdentity: webhookIdentity });
+    await prisma.strategyOrderIntent.update({ where: { id: reserved.id },
+      data: { status: "submitted", submittedAt: new Date() } });
+    const adapter: StrategyMarketAdapter = { submit: async () => { throw new Error("not used"); },
+      query: async () => ({ orderId: `exchange-${suffix}-${ordinal}`,
+        executedQty: leg.qty, cummulativeQuoteQty: leg.revenue,
+        avgPrice: leg.revenue / leg.qty, simulated: false }) };
+    await reconcileStrategyIntent(reserved.id, adapter);
+    await reconcileStrategyIntent(reserved.id, adapter);
+    ordinal++;
+  }
+  const dedupe = `X-${suffix}-final`;
+  const sourceKey = `${bot.id}:BTCUSDT:sell:${dedupe}`;
+  const finalIntent = await reserveStrategyIntent({ sourceKey, bot, symbol: "BTCUSDT", side: "SELL",
+    clientOrderId: clientOrderId(sourceKey), requestedBaseQty: final.qty,
+    exitLeg: final.leg, smartTradeId: trade.id,
+    platformDeploymentId: directPlatformCorrelation ? deploymentId : undefined,
+    platformOrderIntentId: directPlatformCorrelation ? String(ordinal) : undefined,
+    platformDedupeKey: dedupe,
+    platformWebhookIdentity: webhookIdentity });
+  await prisma.strategyOrderIntent.update({ where: { id: finalIntent.id },
+    data: { status: "submitted", submittedAt: new Date() } });
+  const finalAdapter: StrategyMarketAdapter = { submit: async () => { throw new Error("not used"); },
+    query: async () => ({ orderId: `exchange-${suffix}-final`, executedQty: final.qty,
+      cummulativeQuoteQty: final.revenue, avgPrice: final.revenue / final.qty, simulated: false }) };
+  await reconcileStrategyIntent(finalIntent.id, finalAdapter);
+  await reconcileStrategyIntent(finalIntent.id, finalAdapter);
+  const stored = await prisma.realizationEvent.findMany({ orderBy: [{ eventTime: "asc" }, { id: "asc" }] });
+  const events = stored.map((row) => normalizeRealizationEvent(JSON.parse(row.payload)));
+  const closed = await prisma.smartTrade.findUniqueOrThrow({ where: { id: trade.id } });
+  return { events, cumulativePnl: closed.pnlUsdt, tradeId: trade.id };
+}
+
+test("realization outbox stores exactly one final event for a no-partial close", async () => {
+  const result = await runRealizationLifecycle([], { qty: 1, revenue: 120, leg: "signal" }, "full");
+  assert.equal(result.events.length, 1);
+  assert.equal(result.events[0]?.kind, "final");
+  assert.equal(Number(result.events[0]?.realizedPnlQuote), result.cumulativePnl);
+});
+
+test("one partial plus final stores per-event economics whose sum is cumulative accounting", async () => {
+  const result = await runRealizationLifecycle(
+    [{ qty: 0.4, revenue: 48, percent: 40, leg: "tp1" }],
+    { qty: 0.6, revenue: 78, leg: "runner" }, "one-partial");
+  assert.deepEqual(result.events.map((event) => event.kind), ["partial", "final"]);
+  const sum = sumMoney(result.events.map((event) => Number(event.realizedPnlQuote)));
+  assert.equal(sum, result.cumulativePnl);
+});
+
+test("multiple partials plus final preserve exact deltas and repeated reconciliation emits nothing extra", async () => {
+  const result = await runRealizationLifecycle([
+    { qty: 0.2, revenue: 24, percent: 20, leg: "tp1" },
+    { qty: 0.3, revenue: 39, percent: 37.5, leg: "tp2" },
+  ], { qty: 0.5, revenue: 70, leg: "runner" }, "multi-partial");
+  assert.deepEqual(result.events.map((event) => event.kind), ["partial", "partial", "final"]);
+  const sum = sumMoney(result.events.map((event) => Number(event.realizedPnlQuote)));
+  assert.equal(sum, result.cumulativePnl);
+  assert.equal(await prisma.realizationEvent.count(), 3);
+});
+
+test("new Bot with old Platform keeps an immutable event pending for later exact correlation", async () => {
+  const result = await runRealizationLifecycle(
+    [], { qty: 1, revenue: 120, leg: "signal" }, "old-platform", false);
+  assert.equal(result.events.length, 1);
+  assert.equal(result.events[0]?.platformDeploymentId, null);
+  assert.equal(result.events[0]?.platformOrderIntentId, null);
+  assert.match(result.events[0]?.platformWebhookIdentity ?? "", /^sha256:[0-9a-f]{64}$/);
+  assert.equal((await prisma.realizationEvent.findFirstOrThrow()).deliveryStatus, "pending");
+});
+
+test("persisted payload survives restart and is retried verbatim after an ambiguous outage", async () => {
+  await runRealizationLifecycle([], { qty: 1, revenue: 125, leg: "stop" }, "replay");
+  const original = await prisma.realizationEvent.findFirstOrThrow();
+  await prisma.smartTrade.updateMany({ data: { pnlUsdt: -999, quantity: 999, currentPrice: 1 } });
+  await prisma.$disconnect();
+  assert.equal((await prisma.realizationEvent.findUniqueOrThrow({ where: { id: original.id } })).payload,
+    original.payload, "restart reopens the immutable stored payload");
+
+  config.realizationDeliveryEnabled = true;
+  config.realizationPlatformUrl = "http://127.0.0.1/api/internal/realization-events/v1";
+  config.realizationHmacSecret = "r".repeat(40);
+  const bodies: string[] = [];
+  const lostResponse: typeof fetch = async (_url, init) => {
+    bodies.push(String(init?.body));
+    throw new Error("response lost after durable peer commit");
+  };
+  assert.deepEqual(await deliverPendingRealizations(lostResponse, new Date()),
+    { attempted: 1, delivered: 0 });
+  const pending = await prisma.realizationEvent.findUniqueOrThrow({ where: { id: original.id } });
+  assert.equal(pending.deliveryStatus, "pending");
+  await prisma.realizationEvent.update({ where: { id: original.id }, data: { nextAttemptAt: new Date(0) } });
+  const accepted: typeof fetch = async (_url, init) => {
+    bodies.push(String(init?.body));
+    return new Response(JSON.stringify({ status: "accepted", acceptedEventIds: [original.id] }),
+      { status: 200, headers: { "content-type": "application/json" } });
+  };
+  assert.deepEqual(await deliverPendingRealizations(accepted, new Date()),
+    { attempted: 1, delivered: 1 });
+  assert.equal(bodies.length, 2);
+  const firstEvent = (JSON.parse(bodies[0]!) as { events: unknown[] }).events[0];
+  const secondEvent = (JSON.parse(bodies[1]!) as { events: unknown[] }).events[0];
+  assert.equal(canonicalJson(firstEvent), original.payload);
+  assert.equal(canonicalJson(secondEvent), original.payload);
+  assert.deepEqual(firstEvent, secondEvent);
+});
+
+test("delivery fails closed when immutable stored payload no longer matches its hash", async () => {
+  await runRealizationLifecycle([], { qty: 1, revenue: 125, leg: "stop" }, "corrupt");
+  const stored = await prisma.realizationEvent.findFirstOrThrow();
+  await prisma.realizationEvent.update({ where: { id: stored.id },
+    data: { payload: stored.payload.replace('"realizedPnlQuote":"', '"realizedPnlQuote":"9') } });
+  config.realizationDeliveryEnabled = true;
+  let calls = 0;
+  const forbidden: typeof fetch = async () => { calls++; throw new Error("must not deliver"); };
+  assert.deepEqual(await deliverPendingRealizations(forbidden, new Date()),
+    { attempted: 1, delivered: 0 });
+  assert.equal(calls, 0);
+  const quarantined = await prisma.realizationEvent.findUniqueOrThrow({ where: { id: stored.id } });
+  assert.equal(quarantined.deliveryStatus, "integrity_error");
+});
+
+test("snapshots, rejected orders, unfilled cancellations, and uncorrelated history emit no realization", async () => {
+  const bot = await prisma.signalBot.create({ data: { name: "Non-events",
+    webhookSecret: `non-events-${"s".repeat(32)}`, pairs: JSON.stringify(["BTCUSDT"]) } });
+  await prisma.strategyOrderIntent.create({ data: { sourceKey: "snapshot-only", botId: bot.id,
+    botName: bot.name, clientOrderId: "snapshot-only-client", symbol: "BTCUSDT", side: "SELL",
+    requestedBaseQty: 1, status: "rejected", exchangeStatus: "REJECTED", filledBaseQty: 0,
+    filledQuoteQty: 0, error: "rejected", reconciledAt: new Date() } });
+  const account = await createAccount();
+  await prisma.manualOrder.create({ data: { requestId: "canceled-unfilled",
+    exchangeAccountId: account.id, symbol: "BTCUSDT", side: "SELL", orderType: "LIMIT",
+    quantityType: "base", requestedBaseQty: 1, clientOrderId: "canceled-unfilled-client",
+    status: "canceled", filledBaseQty: 0, filledQuoteQty: 0 } });
+  await prisma.partialClose.create({ data: { trade: { create: { botId: bot.id, botName: bot.name,
+    pair: "BTCUSDT", quantity: 0.5, quoteSpent: 50, status: "closed", closedAt: new Date() } },
+    pct: 50, quantity: 0.5, revenue: 55, pnlUsdt: 4.945, avgPrice: 110 } });
+  assert.equal(await prisma.realizationEvent.count(), 0);
 });
 
 test("a query miss never resubmits an already-attempted intent, while an unattempted request can submit", async () => {

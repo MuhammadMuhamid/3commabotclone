@@ -3,7 +3,10 @@ import { processWebhook } from "../services/webhook.js";
 import {
   operationalStatusSchema, positionStatusSchema, strategyExecutionEvidenceSchema, webhookSchema,
 } from "./webhookSchema.js";
-import { httpStatusFor, isReceiverOutcome } from "../contract/webhookContract.js";
+import {
+  httpStatusFor, isReceiverOutcome, PLATFORM_DEPLOYMENT_ID_HEADER,
+  PLATFORM_ORDER_INTENT_ID_HEADER,
+} from "../contract/webhookContract.js";
 import { readBotOperationalStatusForSecret } from "../services/operationalStatus.js";
 import { asyncHandler } from "../middleware/errors.js";
 import { readStrategyExecutionEvidence } from "../services/executionEvidence.js";
@@ -74,7 +77,15 @@ webhooksRouter.post("/signal_bots", async (req, res) => {
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.errors[0]?.message ?? "Invalid webhook payload" });
     }
-    const result = await processWebhook(parsed.data);
+    const deploymentId = req.get(PLATFORM_DEPLOYMENT_ID_HEADER);
+    const orderIntentId = req.get(PLATFORM_ORDER_INTENT_ID_HEADER);
+    if (Boolean(deploymentId) !== Boolean(orderIntentId)
+        || (deploymentId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deploymentId))
+        || (orderIntentId && !/^[1-9]\d{0,18}$/.test(orderIntentId))) {
+      return res.status(400).json({ error: "Invalid Platform correlation headers" });
+    }
+    const result = await processWebhook(parsed.data, { platformCorrelation:
+      deploymentId && orderIntentId ? { deploymentId, orderIntentId } : undefined });
     /*
      * X-12: three different meanings used to share HTTP 200, and the sender's
      * success test was `res.ok`. `ignored_stale_sell` in particular means NO

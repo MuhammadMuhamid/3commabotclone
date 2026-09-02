@@ -243,6 +243,11 @@ model StrategyOrderIntent {
   requestedQuoteQty Float?
   sellPercent       Float?
   exitLeg           String?
+  /** Exact Platform provenance supplied by the custom delivery contract. */
+  platformDeploymentId String?
+  platformOrderIntentId String?
+  platformDedupeKey     String?
+  platformWebhookIdentity String?
   skipExitCheck     Boolean  @default(false)
   smartTradeId      String?
   status            String   @default("requested")
@@ -261,6 +266,29 @@ model StrategyOrderIntent {
   @@index([status, createdAt])
   @@index([smartTradeId, status])
   @@index([botId, symbol, status])
+}
+
+/**
+ * Immutable publication outbox for real custom-strategy accounting results.
+ * `payload` is the canonical v1 wire payload captured at the accounting
+ * transaction; delivery never rebuilds it from mutable SmartTrade state.
+ */
+model RealizationEvent {
+  id               String   @id
+  strategyIntentId String   @unique
+  kind             String
+  eventTime        DateTime
+  payload          String
+  payloadSha256    String
+  deliveryStatus   String   @default("pending")
+  attempts         Int      @default(0)
+  nextAttemptAt    DateTime @default(now())
+  deliveredAt      DateTime?
+  lastError        String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([deliveryStatus, nextAttemptAt, createdAt])
 }
 
 model WebhookLog {

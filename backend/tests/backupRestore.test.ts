@@ -84,6 +84,7 @@ test("a task-owned Bot database backs up and restores into an independent applic
       commandReplay: unknown;
       commandActionCalls: number;
       nonceReplay: boolean;
+      realizationEventCount: number;
       webhookReplay: unknown;
       webhookClientCalls: number;
     };
@@ -109,6 +110,7 @@ test("a task-owned Bot database backs up and restores into an independent applic
   });
   assert.equal(verified.recoveryBehavior.commandActionCalls, 0);
   assert.equal(verified.recoveryBehavior.nonceReplay, false);
+  assert.equal(verified.recoveryBehavior.realizationEventCount, 1);
   assert.deepEqual(verified.recoveryBehavior.webhookReplay, { status: "ignored_duplicate" });
   assert.equal(verified.recoveryBehavior.webhookClientCalls, 0);
 

@@ -23,6 +23,7 @@ import { errorHandler, notFoundHandler } from "./middleware/errors.js";
 import { startInterval } from "./lib/scheduler.js";
 import { checkManualProtection, reconcileManualTrading } from "./services/manualProtection.js";
 import { reconcilePendingStrategyIntents } from "./services/strategyOrderIntent.js";
+import { deliverPendingRealizations } from "./services/realizationEvents.js";
 
 // Hard-fail in production if any critical secret is missing
 assertConfig();
@@ -208,6 +209,8 @@ startInterval("manual-tpsl", 30_000, checkManualProtection);
 void reconcilePendingStrategyIntents().catch(
   (e) => console.error("strategy intent reconciliation failed", e));
 startInterval("strategy-intent-reconcile", 30_000, reconcilePendingStrategyIntents);
+void deliverPendingRealizations().catch((e) => console.error("realization delivery failed", e));
+startInterval("realization-delivery", 30_000, async () => { await deliverPendingRealizations(); });
 
 // Webhook log retention — prune entries older than 30 days, and the durable
 // stale-sell markers past their TTL (BOT-019).

@@ -27,6 +27,7 @@ import {
   hasUnresolvedStrategySell, reconcileStrategyIntent, reserveStrategyIntent,
   strategyMarketAdapter, type StrategyCrashHooks,
 } from "./strategyOrderIntent.js";
+import { platformWebhookIdentity } from "../contract/realizationEventContract.js";
 
 const DEDUPE_TTL = 120_000;
 /** Blocks a second buy/sell for same bot+pair within this window (TV order-fill duplicate guard) */
@@ -144,10 +145,12 @@ async function assertCanOpenTrade(bot: SignalBot, symbol: string): Promise<void>
 
 export async function processWebhook(
   body: WebhookBody,
-  { skipExitCheck = false, clientFactory = getClient, strategyCrashHooks }: {
+  { skipExitCheck = false, clientFactory = getClient, strategyCrashHooks,
+    platformCorrelation }: {
     skipExitCheck?: boolean;
     clientFactory?: (bot: SignalBot) => Promise<BinanceClient>;
     strategyCrashHooks?: StrategyCrashHooks;
+    platformCorrelation?: { deploymentId: string; orderIntentId: string };
   } = {}
 ): Promise<{ status: string; detail?: unknown }> {
   if (isPlaceholderPayload(body)) {
@@ -440,6 +443,10 @@ export async function processWebhook(
         exitLeg: body.exit_leg,
         skipExitCheck,
         smartTradeId: active?.id,
+        platformDeploymentId: platformCorrelation?.deploymentId,
+        platformOrderIntentId: platformCorrelation?.orderIntentId,
+        platformDedupeKey: body.dedupe_key,
+        platformWebhookIdentity: body.dedupe_key ? platformWebhookIdentity(secret) : undefined,
       }, strategyCrashHooks);
       strategyIntentId = intent.id;
       const execution = await reconcileStrategyIntent(
