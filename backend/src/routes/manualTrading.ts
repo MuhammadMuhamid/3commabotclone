@@ -7,6 +7,8 @@ import {
   runIdempotentManualCommand, submitManualOrder, updateManualProtection,
 } from "../services/manualTrading.js";
 import { readManualExecutionEvidence } from "../services/executionEvidence.js";
+import { shariahContextSchema } from "./webhookSchema.js";
+import { ShariahEnforcementError } from "../services/shariah.js";
 
 export const manualTradingRouter = Router();
 manualTradingRouter.use(requireManualAuth);
@@ -34,6 +36,16 @@ const submitSchema = z.object({
   stopLossPrice: optionalPrice,
   positionId: z.string().uuid().optional(),
   mainnetConfirmation: confirmation,
+  /*
+   * Optional, and covered by the request HMAC for free: the manual signature is
+   * computed over a canonical hash of the WHOLE body, so this block is
+   * authenticated by the same signature as the side and the symbol. Changing
+   * any field of it after signing invalidates the request.
+   *
+   * Interpreted by the service, not here — see `shariahContextSchema` for why a
+   * malformed block must not be able to 400 a SELL.
+   */
+  shariah: shariahContextSchema,
 }).strict();
 
 function requestId(res: Response): string {
@@ -93,6 +105,12 @@ manualTradingRouter.patch("/positions/:id/protection", asyncHandler(async (req, 
 }));
 
 manualTradingRouter.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (error instanceof ShariahEnforcementError) {
+    // Reported with its own bounded code so an operator can tell this apart
+    // from an authentication failure, a risk refusal, or a Binance failure.
+    res.status(error.httpStatus).json({ error: error.message, code: error.code });
+    return;
+  }
   if (error instanceof ManualTradingError) { res.status(error.httpStatus).json({ error: error.message }); return; }
   next(error);
 });

@@ -12,6 +12,10 @@ import {
   setBotTradingHalted, shouldLatchHalt,
 } from "./riskControls.js";
 import { calcRealizedPnl } from "./smartTrade.js";
+import {
+  admitSpotEntry, noteSpotExit, readShariahContext, ShariahEnforcementError,
+  shariahScopeForManualAccount,
+} from "./shariah.js";
 
 const PENDING_STATUSES = ["requested", "submitted", "open", "partially_filled"];
 export const MAINNET_MANUAL_CONFIRMATION = "PLACE_MAINNET_ORDER";
@@ -37,6 +41,17 @@ export interface SubmitManualOrderInput {
   stopLossPrice?: number | null;
   positionId?: string;
   mainnetConfirmation?: string;
+  /**
+   * The Platform's authenticated Shariah decision. `unknown` because it is
+   * caller-supplied: only the shared contract's validator interprets it.
+   *
+   * It needs no separate signature. `requireManualAuth` verifies an HMAC over a
+   * canonical hash of the entire body, so this block is covered by the same
+   * signature as `side` and `symbol` — flipping EXCLUDED to ELIGIBLE, or
+   * `enforce` to `off`, or the base asset, invalidates the request before it
+   * reaches here.
+   */
+  shariah?: unknown;
 }
 
 type AdapterFactory = (account: ExchangeAccount) => ManualExchangeAdapter;
@@ -82,7 +97,10 @@ function intentFromOrder(order: ManualOrder): ManualOrderIntent {
     orderType: order.orderType as "MARKET" | "LIMIT",
     quoteQuantity: order.requestedQuoteQty ?? undefined,
     baseQuantity: order.requestedBaseQty ?? undefined,
-    limitPrice: order.limitPrice ?? undefined, clientOrderId: order.clientOrderId };
+    limitPrice: order.limitPrice ?? undefined, clientOrderId: order.clientOrderId,
+    // Carried through from the durable row, so a first submission and a
+    // reconciliation resubmission are proved by the same stored decision.
+    shariahContext: order.shariahContext };
 }
 
 function isComplete(status: string): boolean {
@@ -208,6 +226,25 @@ export async function submitManualOrder(
     throw new ManualTradingError("LIMIT requires a positive limit price", 422);
   if (input.side === "SELL" && (input.takeProfitPrice != null || input.stopLossPrice != null))
     throw new ManualTradingError("TP/SL can only be attached to a long BUY entry", 422);
+
+  /*
+   * The Shariah gate, at the earliest point where the symbol and side are both
+   * known: after authentication and request validation, and before the exchange
+   * adapter, the risk gate, the per-account lock and — critically — before
+   * `manualOrder.create`, which is where the client order id is claimed. A
+   * refusal throws out of a purely synchronous check, so nothing is reserved
+   * and nothing needs unwinding.
+   *
+   * A SELL only records what it asserted. There is no path below on which a
+   * Shariah status can refuse an exit.
+   */
+  const shariahScope = shariahScopeForManualAccount(account.id);
+  const shariahContext = input.side === "BUY"
+    ? (await admitSpotEntry({
+      scope: shariahScope, symbol: input.symbol, context: readShariahContext(input.shariah),
+    })).persisted
+    : await noteSpotExit(shariahScope, input.shariah);
+
   const adapter = adapterFactory(account);
   if (input.side === "SELL") await assertSellAssociation(input, account, adapter);
   let order: ManualOrder | null = null;
@@ -228,6 +265,7 @@ export async function submitManualOrder(
           ? "bot-managed" : null,
         protectionState: input.side === "BUY" && (input.takeProfitPrice != null || input.stopLossPrice != null)
           ? "pending_entry" : "none",
+        shariahContext,
         clientOrderId: clientOrderId(`manual:${input.requestId}`),
       }});
     } catch (error) {
@@ -247,8 +285,12 @@ export async function submitManualOrder(
       data: { status: "submitted", submittedAt: new Date() } });
     return await applyManualSnapshot(order.id, await adapter.submit(intentFromOrder(order)));
   } catch (error) {
+    // A Shariah refusal is raised before the exchange call, so no order exists
+    // to reconcile: record it as the rejection it is rather than leaving the
+    // row `submitted` and pending forever.
     const rejected = error instanceof MinNotionalError ||
       error instanceof ManualOrderValidationError ||
+      error instanceof ShariahEnforcementError ||
       (error instanceof ExchangeError && error.code !== undefined);
     const failed = !rejected && config.dryRun;
     return prisma.manualOrder.update({ where: { id: order.id }, data: {

@@ -4,6 +4,7 @@ import type { ExchangeAccount } from "@prisma/client";
 import { decrypt } from "../lib/crypto.js";
 import { config } from "../config.js";
 import { parsePair, toBinanceSymbol } from "../lib/symbols.js";
+import { assertClearedForSymbol, type ShariahClearance } from "./shariah.js";
 
 /** binance-api-node is CJS; under Node ESM the factory lives on `.default` */
 const Binance =
@@ -197,13 +198,34 @@ export async function getMinNotional(client: BinanceClient, symbol: string): Pro
   return 0;
 }
 
+/**
+ * The single MARKET BUY chokepoint, and therefore the last place new Spot
+ * exposure can be stopped.
+ *
+ * `shariahClearance` is REQUIRED, and only `services/shariah.ts` can produce
+ * one. That makes the gate structural rather than a convention: a new caller
+ * cannot reach this function without going through the enforcement module, and
+ * the clearance it holds is bound to a symbol, so a proof issued for one asset
+ * cannot be carried across to another.
+ *
+ * `marketSellBase` has no such parameter, and must never gain one — that
+ * asymmetry is what guarantees no exit can be refused on Shariah grounds.
+ */
 export async function marketBuyQuote(
   client: BinanceClient,
   symbol: string,
   quoteUsdt: number,
-  opts: { idempotencyScope?: string; explicitClientOrderId?: string; dryRun?: boolean } = {}
+  opts: {
+    idempotencyScope?: string;
+    explicitClientOrderId?: string;
+    dryRun?: boolean;
+    shariahClearance: ShariahClearance;
+  }
 ): Promise<OrderResult> {
   const sym = toBinanceSymbol(symbol);
+  // Before the dry-run branch, before the notional check, before anything: a
+  // refusal here must be indistinguishable from the order never being tried.
+  assertClearedForSymbol(opts.shariahClearance, sym);
   const quote = floorQuote(quoteUsdt);
   if (quote <= 0) throw new Error(`${sym}: nothing to spend after flooring ${quoteUsdt}`);
 

@@ -7,6 +7,7 @@ import {
   marketSellBase, MinNotionalError, queryFilledMarketOrder,
 } from "./binance.js";
 import { calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
+import { clearanceForPersistedEntry, ShariahEnforcementError } from "./shariah.js";
 import { persistStrategyRealization } from "./realizationEvents.js";
 import {
   evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
@@ -32,6 +33,12 @@ export interface StrategyIntentReservation {
   platformWebhookIdentity?: string;
   skipExitCheck?: boolean;
   smartTradeId?: string;
+  /**
+   * The exact authenticated Shariah decision this order was admitted under, as
+   * the shared contract serialises it. Null means none was attached, which is
+   * how every pre-Shariah intent reads.
+   */
+  shariahContext?: string | null;
 }
 
 export interface StrategyMarketAdapter {
@@ -112,6 +119,7 @@ export async function reserveStrategyIntent(
       platformWebhookIdentity: input.platformWebhookIdentity,
       skipExitCheck: input.skipExitCheck ?? false,
       smartTradeId: input.smartTradeId,
+      shariahContext: input.shariahContext ?? null,
     }});
   } catch (error) {
     if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") {
@@ -310,7 +318,25 @@ async function assertNeverAttemptedMaySubmit(intent: StrategyOrderIntent): Promi
     throw new Error("Exit orders disabled on this bot");
   }
 
+  /*
+   * Re-prove the ORIGINAL authenticated Shariah decision before this intent may
+   * claim the submission boundary.
+   *
+   * It is deliberately here rather than at the adapter: a throw at this point
+   * leaves the intent in `requested`, which is provably abandonable and still
+   * retryable. Throwing after the compare-and-set would strand it in
+   * `submitted`, where no resubmission is ever permitted.
+   *
+   * It re-reads the stored decision and never fetches a fresher status. A retry
+   * that has not reached the wire must still satisfy the gate it was admitted
+   * under; it must not be re-judged against a status that changed since.
+   *
+   * SELL is absent on purpose. An exit is never gated here, so a status that
+   * moved to REVIEW or EXCLUDED after entry cannot trap a position.
+   */
   if (intent.side === "BUY") {
+    clearanceForPersistedEntry(intent.shariahContext, intent.symbol);
+
     const [activeCount, pairCount] = await Promise.all([
       prisma.smartTrade.count({ where: { botId: bot.id, status: "active" } }),
       prisma.smartTrade.count({ where: { botId: bot.id, pair: intent.symbol, status: "active" } }),
@@ -360,6 +386,9 @@ export function strategyMarketAdapter(
     submit: (intent) => intent.side === "BUY"
       ? marketBuyQuote(client, intent.symbol, intent.requestedQuoteQty ?? 0, {
         explicitClientOrderId: intent.clientOrderId, dryRun,
+        // Derived from the durable decision, so a first submission and a
+        // recovery resubmission are proved by exactly the same evidence.
+        shariahClearance: clearanceForPersistedEntry(intent.shariahContext, intent.symbol),
       })
       : marketSellBase(client, intent.symbol, intent.requestedBaseQty ?? 0, {
         explicitClientOrderId: intent.clientOrderId, dryRun,
@@ -426,7 +455,16 @@ export async function reconcileStrategyIntent(
     await options.hooks?.afterExchangeResult?.(intent, result);
     return await applyAuthoritativeResult(intent.id, result);
   } catch (error) {
+    /*
+     * A Shariah refusal is a rejection, not an ambiguous outcome. The clearance
+     * assertion is the first statement in `marketBuyQuote` and precedes the
+     * exchange call in the manual LIMIT path, so nothing was ever sent. Without
+     * this the intent would be marked `submitted` — a state that may only ever
+     * be queried — and would sit unresolved forever against an order that does
+     * not exist.
+     */
     const rejected = error instanceof MinNotionalError ||
+      error instanceof ShariahEnforcementError ||
       (error instanceof ExchangeError && error.code !== undefined);
     await prisma.strategyOrderIntent.updateMany({
       where: { id: intent.id, status: { not: "reconciled" } },

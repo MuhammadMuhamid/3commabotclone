@@ -28,6 +28,10 @@ import {
   strategyMarketAdapter, type StrategyCrashHooks,
 } from "./strategyOrderIntent.js";
 import { platformWebhookIdentity } from "../contract/realizationEventContract.js";
+import {
+  admitSpotEntry, noteSpotExit, readShariahContext, ShariahEnforcementError,
+  shariahScopeForBot,
+} from "./shariah.js";
 
 const DEDUPE_TTL = 120_000;
 /** Blocks a second buy/sell for same bot+pair within this window (TV order-fill duplicate guard) */
@@ -86,6 +90,12 @@ export type WebhookBody = {
   /** Stable exit identity; allows TP1 and TP2 on the same candle without defeating dedupe. */
   exit_leg?: "tp1" | "tp2" | "runner" | "stop" | "signal";
   dedupe_key?: string;
+  /**
+   * The Platform's authenticated Shariah decision. Deliberately `unknown`: this
+   * is caller-supplied data, and the only thing entitled to interpret it is the
+   * shared contract's validator.
+   */
+  shariah?: unknown;
 };
 
 export function resolveAction(action: string): "buy" | "sell" {
@@ -250,6 +260,36 @@ export async function processWebhook(
       return { status: preflight.outcome, detail: preflight.reason };
     }
 
+    /*
+     * The Shariah gate, alongside the operator halt and for the same reason:
+     * this is the earliest point where the bot, the symbol and the side are all
+     * known, and nothing has been claimed yet. It runs before `entryEnabled`,
+     * before any credential or balance is read, before a client order id
+     * exists, and before `reserveStrategyIntent` — so a refusal leaves no
+     * durable reservation and reaches no exchange.
+     *
+     * Only a BUY can be refused here. A SELL merely records what it asserted:
+     * an exit is never blocked on a Shariah status, so there is no branch below
+     * that could stop one.
+     */
+    const shariahScope = shariahScopeForBot(bot.id);
+    let shariahEvidence: string | null = null;
+    if (side === "buy") {
+      try {
+        shariahEvidence = (await admitSpotEntry({
+          scope: shariahScope, symbol, context: readShariahContext(body.shariah),
+        })).persisted;
+      } catch (error) {
+        if (!(error instanceof ShariahEnforcementError)) throw error;
+        await prisma.webhookLog.update({ where: { id: log.id },
+          data: { status: "blocked", message: `${error.code}: ${error.message}` } });
+        await releasePersistentDedupe(reservedDedupeKeys);
+        return { status: "shariah_blocked", detail: { code: error.code, reason: error.message } };
+      }
+    } else {
+      shariahEvidence = await noteSpotExit(shariahScope, body.shariah);
+    }
+
     if (side === "buy") {
       if (!bot.entryEnabled) throw new Error("Entry orders disabled on this bot");
 
@@ -342,6 +382,7 @@ export async function processWebhook(
           symbol,
           side: "BUY",
           requestedQuoteQty: quote,
+          shariahContext: shariahEvidence,
         }, strategyCrashHooks);
         strategyIntentId = intent.id;
         const execution = await reconcileStrategyIntent(
@@ -468,6 +509,8 @@ export async function processWebhook(
         platformOrderIntentId: platformCorrelation?.orderIntentId,
         platformDedupeKey: body.dedupe_key,
         platformWebhookIdentity: body.dedupe_key ? platformWebhookIdentity(secret) : undefined,
+        // Evidence only. Nothing reads this back to decide whether to exit.
+        shariahContext: shariahEvidence,
       }, strategyCrashHooks);
       strategyIntentId = intent.id;
       const execution = await reconcileStrategyIntent(

@@ -13,6 +13,7 @@ import { applyManualSnapshot, cancelManualOrder, reconcileOneManualOrder,
   reconcilePendingManualOrders, runIdempotentManualCommand,
   submitManualOrder } from "../src/services/manualTrading.js";
 import { clientOrderId, marketBuyQuote, marketSellBase } from "../src/services/binance.js";
+import { clearanceForPersistedEntry } from "../src/services/shariah.js";
 import { processWebhook } from "../src/services/webhook.js";
 import {
   reconcilePendingStrategyIntents, reconcileStrategyIntent, reserveStrategyIntent,
@@ -221,7 +222,10 @@ test("strategy MARKET wrappers recover an accepted-then-thrown FILLED order by c
     myTrades: async () => [{ commission: "0.001", commissionAsset: "BTC" }],
   };
   const buy = await marketBuyQuote(client as never, "BTCUSDT", 50,
-    { idempotencyScope: "strategy-buy", dryRun: false });
+    // A null stored decision is a pre-Shariah intent: ungated, which is the
+    // behaviour this recovery test is about.
+    { idempotencyScope: "strategy-buy", dryRun: false,
+      shariahClearance: clearanceForPersistedEntry(null, "BTCUSDT") });
   const sell = await marketSellBase(client as never, "BTCUSDT", 0.5,
     { idempotencyScope: "strategy-sell", dryRun: false });
   assert.equal(buy.executedQty, 0.499);

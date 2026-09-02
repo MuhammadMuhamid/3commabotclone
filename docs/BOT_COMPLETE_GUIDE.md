@@ -14,7 +14,8 @@
 3. [System architecture](#3-system-architecture)
 4. [Tech stack](#4-tech-stack)
 5. [Directory tree](#5-directory-tree)
-6. [Backend deep dive](#6-backend-deep-dive)
+6. [Backend deep dive](#6-backend-deep-dive) — including
+   [6.8 Shariah exposure enforcement](#68-shariah-exposure-enforcement-servicesshariahts)
 7. [Frontend deep dive](#7-frontend-deep-dive)
 8. [TradingView integration](#8-tradingview-integration)
 9. [Deployment](#9-deployment)
@@ -653,6 +654,89 @@ signal**, not the restart count. Grep for `stayed up` when auditing.
 credential limiter (20 per 15 min) that guards login/register/TOTP. A long-lived
 session legitimately refreshes on a schedule; sharing the brute-force budget
 locked users out mid-session.
+
+---
+
+## 6.8 Shariah exposure enforcement (`services/shariah.ts`)
+
+The Bot owns no Shariah policy. The Platform screens, decides, and transmits the
+decision; the Bot's only job is the last gate before Binance.
+
+**Explicitly not here.** No coin research, no internet access, no model call, no
+registry, no screening methodology. `services/shariah.ts` imports the shared
+contract, the symbol parser and Prisma — nothing else — and makes no network
+call. It is never invoked from a scheduler, so no classification change can
+cause an order.
+
+### The wire shape
+
+The optional `shariah` block is defined in the vendored
+`contract/webhookContract.ts` (v3), so the Platform and the Bot cannot drift
+about it — the fingerprint test fails on both sides until both copies match.
+It carries `mode`, `policyVersion` (`TS_SHARIAH_V1`), `assetId`, `baseAsset`,
+`effectiveStatus` (`ELIGIBLE` / `REVIEW` / `EXCLUDED`) and `publicationId`.
+`validateShariahContext` is strict and bounded: an exact key allow-list, no
+nested objects, no arrays, own-property reads only, and a `publicationId` that
+may be null only for an unresolved `REVIEW`.
+
+That validator is the *only* place those rules live. The route schemas take the
+block as an opaque value rather than re-checking it, for two reasons: a second
+copy of the rules could disagree with the first, and validating at the edge
+would let a malformed block reject the whole request with a 400 — and that
+request might be a SELL. The parent schemas stay `.strict()`, so every other
+unknown field is still refused at the edge, and the body stays size-capped.
+
+### Signature coverage
+
+No second crypto scheme was added.
+
+- **Manual (`/api/manual-trading/*`)** — `manualCanonicalRequest` hashes
+  `canonicalJson(body)` recursively over the whole object, so a nested block is
+  covered automatically. Tampering with any field of it, or removing it, changes
+  the body hash and fails the existing 401 check before any handler runs.
+- **Webhook (`/api/webhooks/signal_bots`)** — no HMAC exists on this path by
+  design; the per-bot secret in the payload is the credential, and it is the same
+  one that already authorises placing real orders. The block is therefore
+  authenticated at exactly the trust level of the order it accompanies.
+
+### The rule, and where it runs
+
+Mode `off` or an absent block is byte-for-byte the previous behaviour. Under
+`enforce`, a BUY is admitted only for `ELIGIBLE`; a SELL is never gated.
+
+`admitSpotEntry` runs at request admission — before the per-bot entry checks,
+before any credential or balance read, before the deterministic client order ID,
+and before the `StrategyOrderIntent` / `ManualOrder` reservation. It is a
+synchronous decision plus one latch upsert, so a refusal unwinds nothing.
+
+`baseAsset` is bound to the symbol by requiring the symbol to be exactly that
+base followed by a member of `QUOTE_ASSETS` (`lib/symbols.ts`). Stripping a
+suffix instead would let `BTCUSDT` satisfy a proof for `BTCUSD`; requiring the
+remainder to *be* a quote asset does not.
+
+### Durability and recovery
+
+The admitting decision is persisted as `shariahContext` on the intent row.
+`clearanceForPersistedEntry` re-derives clearance from it at submission — first
+attempt and recovery resubmission alike — and never consults a fresher status.
+In `assertNeverAttemptedMaySubmit` the re-check sits *before* the
+`requested → submitted` compare-and-set, so a refusal leaves the intent
+abandonable rather than stranded past the submission boundary. A `null` context
+is a pre-Shariah intent and keeps its original ungated semantics.
+
+`marketBuyQuote` requires a `ShariahClearance` whose brand is a module-private
+`Symbol`, so no other file can fabricate one, and it re-asserts the symbol
+binding at the wire. `marketSellBase` has no such parameter and must never gain
+one — that asymmetry is what guarantees no exit can be refused.
+
+### Anti-downgrade latch
+
+`ShariahEnforcement` records the last mode a sender scope authenticated
+(`bot:<id>` or `manual-account:<id>`). After an authenticated `enforce`, a BUY
+that omits the block is refused `SHARIAH_CONTEXT_REQUIRED` instead of falling
+back to mode off. It holds a mode and a policy identity only — never an asset,
+a status, or any screening input — and is per scope, so enabling the feature for
+one bot never enables it for a user who did not ask.
 
 ---
 

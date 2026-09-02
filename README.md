@@ -151,6 +151,112 @@ commission-trade timing.
 credential-shaped literals in tracked source. It reports file and line only,
 never the value.
 
+## Shariah exposure enforcement
+
+The Platform decides. The Bot enforces one rule, once, at the exchange boundary.
+
+**There is no screening engine here.** The Bot never researches an asset, never
+browses, never calls a model, never stores a Shariah registry, and applies no
+screening methodology of its own. The Platform is the sole authority for what
+any asset's status is. The Bot's entire role is:
+
+> verify the authenticated Platform intent → refuse to create new Spot exposure
+> against it.
+
+### The signed context
+
+Both Platform→Bot order paths accept one optional block alongside the order:
+
+```json
+"shariah": {
+  "mode": "off" | "enforce",
+  "policyVersion": "TS_SHARIAH_V1",
+  "assetId": "<Platform registry identity>",
+  "baseAsset": "<base asset of the exact Spot symbol>",
+  "effectiveStatus": "ELIGIBLE" | "REVIEW" | "EXCLUDED",
+  "publicationId": "<current publication, or null for an unresolved REVIEW>"
+}
+```
+
+The Platform resolves its internal UNSCREENED and STALE states to `REVIEW`
+before transmission, so the Bot never has to decide what they mean.
+
+**Signature coverage is inherited, not added.** No second crypto scheme was
+introduced. On `POST /api/manual-trading/orders` the existing HMAC is computed
+over a canonical hash of the *entire* body, so the block is authenticated by the
+same signature as `side` and `symbol`: flipping `ELIGIBLE` to `REVIEW`, or
+`enforce` to `off`, or `baseAsset`, or removing the block, all invalidate the
+request with a 401 before any handler runs. On `POST /api/webhooks/signal_bots`
+the block travels inside the payload the per-bot webhook secret authenticates —
+the same credential that already authorises placing real orders — and the shared
+contract's strict allow-list rejects anything else.
+
+### What the rule is
+
+| Mode | Side | Behaviour |
+| --- | --- | --- |
+| block absent | any | exactly the pre-Shariah behaviour |
+| `off` | any | exactly the pre-Shariah behaviour |
+| `enforce` | BUY | placed **only** when `effectiveStatus` is `ELIGIBLE` |
+| `enforce` | SELL | **never** refused on Shariah grounds |
+
+A BUY is refused for `REVIEW`, `EXCLUDED`, a policy version this build cannot
+apply, a missing or malformed context, or a base asset that is not the base of
+the symbol being traded. Refusals carry their own bounded codes —
+`SHARIAH_REVIEW_BLOCKED`, `SHARIAH_EXCLUDED_BLOCKED`, `SHARIAH_POLICY_MISMATCH`,
+`SHARIAH_ASSET_MISMATCH`, `SHARIAH_CONTEXT_INVALID`, `SHARIAH_CONTEXT_REQUIRED`
+— so a Shariah refusal is never mistaken for an authentication failure, a risk
+refusal, or a Binance failure. The webhook outcome is `shariah_blocked` with
+HTTP 409, and `mayAdvanceLocalState` is false: the sender is still flat.
+
+### SELL is never blocked, and nothing is ever liquidated
+
+Reducing or exiting exposure is not gated. A signal exit, take-profit,
+stop-loss, partial close, dashboard close, manual sell, and every recovery of
+those, all proceed whatever the status says — including an asset that has since
+become `EXCLUDED`. This is structural, not a convention: `marketSellBase` has no
+clearance parameter and the manual adapter derives one only for a BUY, so there
+is no code path on which an exit could fail this check.
+
+**No auto-liquidation exists.** The Bot does not poll the Platform, does not
+watch for status changes, and creates no order when a classification moves. It
+reacts only to authenticated execution intents that arrive on their own.
+
+### Where the check happens, and why there
+
+Enforcement runs at request admission, before anything is claimed: before the
+per-bot entry checks, before any exchange credential or balance is read, before
+a deterministic client order ID exists, and before the durable
+`StrategyOrderIntent` / `ManualOrder` reservation. A refusal therefore leaves no
+reservation to unwind and burns no client order ID.
+
+The decision that admitted an order is then persisted beside it
+(`shariahContext`). Recovery re-reads *that* decision and never substitutes a
+fresher status: reconciling an intent that already crossed the wire is not a new
+exposure decision, and a retry that has not yet reached the wire must still
+satisfy the gate it was admitted under. The re-check sits before the
+`requested → submitted` compare-and-set, so a refusal leaves the intent
+abandonable rather than stranded.
+
+Finally, `marketBuyQuote` — the single MARKET BUY chokepoint — *requires* a
+clearance that only the enforcement module can produce, and that clearance is
+bound to a symbol. An `ELIGIBLE` proof for one asset cannot authorise a BUY of
+another, and a new caller cannot reach the exchange without going through the
+gate.
+
+### Omission is not a downgrade
+
+Enforcement is remembered per sender scope (per bot, per manual account) in
+`ShariahEnforcement`. Once a scope has authenticated `mode: "enforce"`, a later
+BUY that simply leaves the block out is refused with
+`SHARIAH_CONTEXT_REQUIRED` rather than silently falling back to pre-Shariah
+behaviour. Turning enforcement off again takes an explicit, equally
+authenticated `mode: "off"`.
+
+That table holds a mode and a policy identity only — never an asset, a status,
+or any screening input. It is not a registry. Enabling Shariah mode for one bot
+never switches it on for a user who did not ask for it.
+
 ## Project layout
 
 ```

@@ -161,6 +161,10 @@ model ManualOrder {
   stopLossPrice         Float?
   protectionType        String?
   protectionState       String?
+  /// The exact authenticated Shariah decision this order was admitted under,
+  /// or null for an order placed with no decision attached. Recovery re-reads
+  /// this rather than taking a fresh decision.
+  shariahContext        String?
   status                String           @default("requested")
   exchangeOrderId       String?
   clientOrderId         String            @unique
@@ -248,6 +252,10 @@ model StrategyOrderIntent {
   platformOrderIntentId String?
   platformDedupeKey     String?
   platformWebhookIdentity String?
+  /// The exact authenticated Shariah decision this intent was admitted under,
+  /// or null when none was attached. For a SELL this is evidence only: an exit
+  /// is never gated on it.
+  shariahContext    String?
   skipExitCheck     Boolean  @default(false)
   smartTradeId      String?
   status            String   @default("requested")
@@ -266,6 +274,21 @@ model StrategyOrderIntent {
   @@index([status, createdAt])
   @@index([smartTradeId, status])
   @@index([botId, symbol, status])
+}
+
+/// The last Shariah enforcement mode the Platform asserted for one sender
+/// scope, so omitting the block cannot silently downgrade a scope that was
+/// already told to enforce.
+///
+/// This is NOT a Shariah registry: it holds a mode and a policy identity, never
+/// an asset, a status, or any screening input. The Platform remains the sole
+/// authority for what any asset's status is.
+model ShariahEnforcement {
+  scope         String   @id
+  mode          String
+  policyVersion String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 }
 
 /**

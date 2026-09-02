@@ -29,6 +29,26 @@
  *
  * ── Changelog ──────────────────────────────────────────────────────────────
  *
+ *  v3  Adds the optional `shariah` execution-context block and the
+ *      `shariah_blocked` receiver outcome.
+ *
+ *      The Platform is the ONLY authority for Shariah screening: it resolves an
+ *      asset against its own registry and transmits the resulting DECISION.
+ *      This receiver holds no registry, performs no screening, and reacts only
+ *      to authenticated execution intents. Its single job is the final exposure
+ *      rule — refuse to CREATE new Spot exposure unless the authenticated
+ *      decision says ELIGIBLE for the base asset of the symbol actually traded.
+ *
+ *      The block is OPTIONAL, so a sender that has not been updated (including
+ *      a direct TradingView alert, which cannot produce one) keeps exactly its
+ *      current non-Shariah behaviour. Omission is NOT a downgrade path once a
+ *      scope has been told `mode: "enforce"` — see the receiver's enforcement
+ *      latch, which is receiver state, not contract state.
+ *
+ *      SELL is deliberately absent from every rule below. Shariah
+ *      classification may never prevent reducing or exiting exposure, and the
+ *      receiver never creates a SELL because a classification changed.
+ *
  *  v2  Adds optional paired Platform deployment/order-intent correlation.
  *      Platform emits it as HTTP headers, which an old Bot safely ignores;
  *      the legacy JSON body remains unchanged. Direct TradingView payloads
@@ -60,7 +80,7 @@
  */
 
 /** Bumped on any change to what is accepted or emitted. */
-export const CONTRACT_VERSION = 2;
+export const CONTRACT_VERSION = 3;
 
 /**
  * SHA-256 of this file's canonical content, computed by
@@ -71,7 +91,7 @@ export const CONTRACT_VERSION = 2;
  * hash it prints, and paste it here in BOTH repositories.
  */
 export const CONTRACT_FINGERPRINT =
-  "sha256:v2:8bae811b4ed68fbc22a9382915f367ac1b510a4f3d76c1f6b8cd2f76d5e8c3bf";
+  "sha256:v3:d8c421235178a0fbdf44a0b582f61a1957e9d53d5b6cd2037f16a5b965e5d29c";
 
 // ── Payload shapes ──────────────────────────────────────────────────────────
 
@@ -84,6 +104,236 @@ export const PLATFORM_ORDER_INTENT_ID_HEADER = "x-platform-order-intent-id";
 /** Exit legs the strategy engines can emit. Stable identities, not free text. */
 export const EXIT_LEGS = ["tp1", "tp2", "runner", "stop", "signal"] as const;
 export type ExitLeg = (typeof EXIT_LEGS)[number];
+
+// ── Shariah execution context ───────────────────────────────────────────────
+
+/**
+ * `off`   — the sender is not enforcing; the receiver behaves exactly as it did
+ *           before this block existed.
+ * `enforce` — the sender asserts a screening decision the receiver must apply
+ *           to new Spot exposure.
+ */
+export type ShariahMode = "off" | "enforce";
+
+/** The only policy identity this contract version accepts under `enforce`. */
+export const SHARIAH_POLICY_VERSION = "TS_SHARIAH_V1";
+
+/**
+ * The three statuses that can cross the wire. The sender resolves its internal
+ * UNSCREENED and STALE states to REVIEW before transmission, so the receiver
+ * never has to know they exist — and never has to decide what they mean.
+ */
+export const SHARIAH_STATUSES = ["ELIGIBLE", "REVIEW", "EXCLUDED"] as const;
+export type ShariahStatus = (typeof SHARIAH_STATUSES)[number];
+
+/**
+ * The signed decision block.
+ *
+ * `assetId`       the sender's authoritative registry identity.
+ * `baseAsset`     base asset of the exact Spot symbol being traded. This is the
+ *                 field that binds a decision to a symbol, so an ELIGIBLE proof
+ *                 for one asset cannot authorise a BUY of another.
+ * `publicationId` the current publication identity where one exists. It may be
+ *                 null ONLY for a genuinely unresolved REVIEW.
+ */
+export interface ShariahContext {
+  mode: ShariahMode;
+  policyVersion?: string | null;
+  assetId?: string | null;
+  baseAsset?: string | null;
+  effectiveStatus?: ShariahStatus | null;
+  publicationId?: string | null;
+}
+
+/** Every field the block permits. Anything else is rejected. */
+export const SHARIAH_FIELDS = [
+  "mode",
+  "policyVersion",
+  "assetId",
+  "baseAsset",
+  "effectiveStatus",
+  "publicationId",
+] as const;
+
+/** Bounds, in one place, so neither side can disagree about them. */
+export const SHARIAH_LIMITS = {
+  identityMax: 128,
+  baseAssetMin: 2,
+  baseAssetMax: 20,
+} as const;
+
+const SHARIAH_IDENTITY_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const SHARIAH_BASE_ASSET_RE = /^[A-Z0-9]{2,20}$/;
+
+/**
+ * Bounded reason codes, so an operator can tell a Shariah refusal apart from an
+ * authentication failure, a risk refusal, or an exchange failure — and can tell
+ * the five Shariah refusals apart from each other.
+ */
+export const SHARIAH_REJECTION_CODES = [
+  /** The block is structurally unusable: bad shape, bad status, bad identity. */
+  "SHARIAH_CONTEXT_INVALID",
+  /** `enforce` was requested against a policy identity this build cannot apply. */
+  "SHARIAH_POLICY_MISMATCH",
+  /** The decision names a different base asset than the symbol being traded. */
+  "SHARIAH_ASSET_MISMATCH",
+  /** Screening is unresolved. New exposure is refused; exits stay open. */
+  "SHARIAH_REVIEW_BLOCKED",
+  /** Screening excluded the asset. New exposure is refused; exits stay open. */
+  "SHARIAH_EXCLUDED_BLOCKED",
+  /** No block at all, from a sender scope already latched to `enforce`. */
+  "SHARIAH_CONTEXT_REQUIRED",
+] as const;
+export type ShariahRejectionCode = (typeof SHARIAH_REJECTION_CODES)[number];
+
+export type ShariahContextResult =
+  | { ok: true; context: ShariahContext }
+  | { ok: false; code: ShariahRejectionCode; message: string };
+
+const shariahFail = (
+  code: ShariahRejectionCode,
+  message: string
+): ShariahContextResult => ({ ok: false, code, message });
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read an own property only.
+ *
+ * `JSON.parse` materialises a literal `"__proto__"` key as an OWN property, so
+ * a caller-supplied object can carry keys that plain member access would
+ * resolve against the prototype chain instead. Every read here goes through
+ * this, and the unknown-key sweep below rejects `__proto__` outright anyway.
+ */
+function ownField(body: Record<string, unknown>, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(body, key) ? body[key] : undefined;
+}
+
+function absent(value: unknown): boolean {
+  return value === undefined || value === null;
+}
+
+/**
+ * The single source of truth for what a Shariah block may contain.
+ *
+ * Deliberately strict and bounded: no nested objects, no arrays, no free text,
+ * no unknown keys. This validates SHAPE and internal consistency only. Whether
+ * a valid block permits a given order is the receiver's decision, because only
+ * the receiver knows the symbol actually being sent to the exchange.
+ */
+export function validateShariahContext(input: unknown): ShariahContextResult {
+  if (!isPlainRecord(input)) {
+    return shariahFail("SHARIAH_CONTEXT_INVALID", "shariah must be a JSON object");
+  }
+
+  const allowed = new Set<string>(SHARIAH_FIELDS as readonly string[]);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) {
+      return shariahFail("SHARIAH_CONTEXT_INVALID", `unexpected shariah field: ${key}`);
+    }
+  }
+
+  const mode = ownField(input, "mode");
+  if (mode !== "off" && mode !== "enforce") {
+    return shariahFail("SHARIAH_CONTEXT_INVALID", 'shariah.mode must be "off" or "enforce"');
+  }
+
+  const policyVersion = ownField(input, "policyVersion");
+  const assetId = ownField(input, "assetId");
+  const baseAsset = ownField(input, "baseAsset");
+  const effectiveStatus = ownField(input, "effectiveStatus");
+  const publicationId = ownField(input, "publicationId");
+
+  for (const [name, value] of [
+    ["policyVersion", policyVersion],
+    ["assetId", assetId],
+    ["baseAsset", baseAsset],
+    ["effectiveStatus", effectiveStatus],
+    ["publicationId", publicationId],
+  ] as const) {
+    if (!absent(value) && typeof value !== "string") {
+      return shariahFail("SHARIAH_CONTEXT_INVALID", `shariah.${name} must be a string or null`);
+    }
+  }
+
+  if (mode === "off") {
+    /*
+     * An explicit `off` carries no decision to check. It is still meaningful:
+     * it is the sender stating, under the same authentication as an order, that
+     * enforcement is not active for this scope.
+     */
+    return { ok: true, context: { mode } };
+  }
+
+  if (policyVersion !== SHARIAH_POLICY_VERSION) {
+    return shariahFail(
+      "SHARIAH_POLICY_MISMATCH",
+      `shariah.policyVersion must be ${SHARIAH_POLICY_VERSION} to enforce`
+    );
+  }
+  if (typeof effectiveStatus !== "string" ||
+      !(SHARIAH_STATUSES as readonly string[]).includes(effectiveStatus)) {
+    return shariahFail(
+      "SHARIAH_CONTEXT_INVALID",
+      `shariah.effectiveStatus must be one of ${SHARIAH_STATUSES.join(", ")}`
+    );
+  }
+  if (typeof assetId !== "string" || !SHARIAH_IDENTITY_RE.test(assetId)) {
+    return shariahFail("SHARIAH_CONTEXT_INVALID", "shariah.assetId is not a valid registry identity");
+  }
+  if (typeof baseAsset !== "string" || !SHARIAH_BASE_ASSET_RE.test(baseAsset)) {
+    return shariahFail("SHARIAH_CONTEXT_INVALID", "shariah.baseAsset is not a valid base asset");
+  }
+  if (!absent(publicationId) &&
+      (typeof publicationId !== "string" || !SHARIAH_IDENTITY_RE.test(publicationId))) {
+    return shariahFail(
+      "SHARIAH_CONTEXT_INVALID",
+      "shariah.publicationId is not a valid publication identity"
+    );
+  }
+  /*
+   * A missing publication is legitimate only while screening is genuinely
+   * unresolved. An ELIGIBLE with no publication behind it is not a decision the
+   * sender could have published, so it fails closed rather than authorising an
+   * entry.
+   */
+  if (absent(publicationId) && effectiveStatus !== "REVIEW") {
+    return shariahFail(
+      "SHARIAH_CONTEXT_INVALID",
+      "shariah.publicationId may be null only for an unresolved REVIEW"
+    );
+  }
+
+  return {
+    ok: true,
+    context: {
+      mode,
+      policyVersion,
+      assetId,
+      baseAsset,
+      effectiveStatus: effectiveStatus as ShariahStatus,
+      publicationId: absent(publicationId) ? null : (publicationId as string),
+    },
+  };
+}
+
+/**
+ * The fixed V1 rule for CREATING new Spot exposure. ELIGIBLE and nothing else.
+ *
+ * There is no SELL counterpart on purpose: an exit is never gated here.
+ */
+export function shariahStatusPermitsEntry(status: ShariahStatus): status is "ELIGIBLE" {
+  return status === "ELIGIBLE";
+}
+
+/** The refusal code a non-entry-permitting status maps to. */
+export function shariahBlockCodeFor(
+  status: Exclude<ShariahStatus, "ELIGIBLE">
+): Extract<ShariahRejectionCode, "SHARIAH_REVIEW_BLOCKED" | "SHARIAH_EXCLUDED_BLOCKED"> {
+  return status === "REVIEW" ? "SHARIAH_REVIEW_BLOCKED" : "SHARIAH_EXCLUDED_BLOCKED";
+}
 
 /** The custom-bot payload. Field names are the wire format and are frozen. */
 export interface CustomBotPayload {
@@ -100,6 +350,12 @@ export interface CustomBotPayload {
   sell_percent?: number | null;
   exit_leg?: ExitLeg;
   dedupe_key?: string;
+  /**
+   * Optional. Absent means "this sender is not enforcing", which keeps the
+   * receiver's pre-Shariah behaviour exactly. Present and `enforce` means the
+   * receiver must apply the decision to a BUY.
+   */
+  shariah?: ShariahContext;
 }
 
 /** Bounds, in one place, so both sides cannot disagree about them. */
@@ -128,6 +384,7 @@ export const ALLOWED_FIELDS = [
   "sell_percent",
   "exit_leg",
   "dedupe_key",
+  "shariah",
 ] as const;
 
 // ── Validation ──────────────────────────────────────────────────────────────
@@ -147,7 +404,8 @@ export interface ValidationFailure {
     | "sell_percent_on_buy"
     | "quantity_and_sell_percent"
     | "exit_leg"
-    | "dedupe_key";
+    | "dedupe_key"
+    | "shariah";
   message: string;
 }
 
@@ -260,6 +518,12 @@ export function validateCustomBotPayload(input: unknown): ValidationResult {
     }
   }
 
+  const shariah = body.shariah;
+  if (shariah !== undefined) {
+    const checked = validateShariahContext(shariah);
+    if (!checked.ok) return fail("shariah", `${checked.code}: ${checked.message}`);
+  }
+
   return { ok: true, payload: body as unknown as CustomBotPayload };
 }
 
@@ -335,6 +599,12 @@ export const RECEIVER_OUTCOMES = [
   "halted",
   /** A risk limit refused the order. No order was placed. */
   "risk_blocked",
+  /**
+   * The authenticated Shariah decision does not permit CREATING new exposure.
+   * No order was placed and the receiver's position is unchanged. Only a BUY
+   * can produce this: an exit is never refused on Shariah grounds.
+   */
+  "shariah_blocked",
 ] as const;
 export type ReceiverOutcome = (typeof RECEIVER_OUTCOMES)[number];
 
@@ -356,6 +626,9 @@ export function orderPlaced(outcome: ReceiverOutcome): boolean {
  * position the sender wanted closed. Advancing to flat here is exactly how the
  * platform ends up issuing a fresh BUY into a position it does not know it
  * holds.
+ *
+ * `shariah_blocked` NO: no entry was made, so the sender is still flat and must
+ * not record a position it does not have.
  */
 export function mayAdvanceLocalState(outcome: ReceiverOutcome): boolean {
   return outcome === "ok" || outcome === "ignored_duplicate";
@@ -376,6 +649,7 @@ export function httpStatusFor(outcome: ReceiverOutcome): number {
     case "ignored_stale_sell":
     case "halted":
     case "risk_blocked":
+    case "shariah_blocked":
       return 409;
   }
 }
@@ -441,6 +715,43 @@ export function emittablePayloads(secret: string): CustomBotPayload[] {
     quantity: 1.23456789,
     dedupe_key: dedupeKey("sell", barTime),
   });
+
+  // Every Shariah block the sender can legitimately produce.
+  //
+  // Entries appear for all three statuses because the sender emits the DECISION
+  // it holds; refusing REVIEW and EXCLUDED is the receiver's job, and a payload
+  // the receiver refuses on policy grounds must still be a VALID payload. Exits
+  // appear for all three because an exit is never gated on the status.
+  const shariahBlocks: ShariahContext[] = [
+    { mode: "off" },
+    ...SHARIAH_STATUSES.map((effectiveStatus) => ({
+      mode: "enforce" as const,
+      policyVersion: SHARIAH_POLICY_VERSION,
+      assetId: "reg_apt_0001",
+      baseAsset: "APT",
+      effectiveStatus,
+      publicationId: "pub_2026_09_02",
+    })),
+    // The one legitimate null publication: an unresolved REVIEW.
+    {
+      mode: "enforce",
+      policyVersion: SHARIAH_POLICY_VERSION,
+      assetId: "reg_apt_0001",
+      baseAsset: "APT",
+      effectiveStatus: "REVIEW",
+      publicationId: null,
+    },
+  ];
+  for (const shariah of shariahBlocks) {
+    out.push({
+      secret, action: "buy", symbol, quote_order_qty: 100,
+      dedupe_key: dedupeKey("buy", barTime), shariah,
+    });
+    out.push({
+      secret, action: "sell", symbol,
+      dedupe_key: dedupeKey("sell", barTime), shariah,
+    });
+  }
 
   return out;
 }

@@ -7,6 +7,9 @@ import {
 } from "./binance.js";
 import type { ExchangeAccount } from "@prisma/client";
 import { parsePair, toBinanceSymbol } from "../lib/symbols.js";
+import {
+  assertClearedForSymbol, clearanceForPersistedEntry, type ShariahClearance,
+} from "./shariah.js";
 
 export type ManualExchangeStatus =
   | "NEW" | "PARTIALLY_FILLED" | "FILLED" | "CANCELED" | "REJECTED" | "EXPIRED";
@@ -19,6 +22,12 @@ export interface ManualOrderIntent {
   baseQuantity?: number;
   limitPrice?: number;
   clientOrderId: string;
+  /**
+   * The exact authenticated Shariah decision the durable order was admitted
+   * under, or null for one placed before this existed. Read only on a BUY; a
+   * SELL never consults it.
+   */
+  shariahContext?: string | null;
 }
 
 export interface ManualOrderSnapshot {
@@ -150,11 +159,25 @@ export class BinanceManualExchange implements ManualExchangeAdapter {
     return getBaseTotalBalance(this.client, symbol);
   }
 
+  /**
+   * Re-prove the stored Shariah decision for a BUY.
+   *
+   * Called by both submission shapes and on every attempt — a first submission
+   * and a reconciliation resubmission alike — so the two are gated by exactly
+   * the same evidence. There is deliberately no SELL counterpart.
+   */
+  private clearBuy(intent: ManualOrderIntent): ShariahClearance {
+    const proof = clearanceForPersistedEntry(intent.shariahContext, intent.symbol);
+    assertClearedForSymbol(proof, intent.symbol);
+    return proof;
+  }
+
   async submit(intent: ManualOrderIntent): Promise<ManualOrderSnapshot> {
     if (intent.orderType === "MARKET") {
       const result = intent.side === "BUY"
           ? await marketBuyQuote(this.client, intent.symbol, intent.quoteQuantity ?? 0, {
             explicitClientOrderId: intent.clientOrderId, dryRun: this.dryRun,
+            shariahClearance: this.clearBuy(intent),
           })
         : await marketSellBase(this.client, intent.symbol, intent.baseQuantity ?? 0, {
             explicitClientOrderId: intent.clientOrderId, dryRun: this.dryRun,
@@ -169,6 +192,11 @@ export class BinanceManualExchange implements ManualExchangeAdapter {
         simulated: result.simulated,
       };
     }
+
+    // The manual LIMIT path is the one submission that does not funnel through
+    // `marketBuyQuote`, so it proves the same thing itself — and before the
+    // exchange-filter lookup, so a refusal costs no network call either.
+    if (intent.side === "BUY") this.clearBuy(intent);
 
     const sym = toBinanceSymbol(intent.symbol);
     const rawPrice = intent.limitPrice ?? 0;

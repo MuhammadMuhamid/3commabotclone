@@ -25,6 +25,25 @@ export const strategyExecutionEvidenceSchema = z.object({
   dedupe_key: z.string().min(1).max(256),
 }).strict();
 
+/**
+ * The Shariah block is accepted here unvalidated, on purpose.
+ *
+ * Its strict, bounded validation lives in ONE place — the shared contract's
+ * `validateShariahContext` — so the two repositories cannot drift about what a
+ * well-formed decision is, and so a second copy of those rules cannot disagree
+ * with the first.
+ *
+ * Validating it at this layer would also give a malformed block the power to
+ * reject the whole request with a 400, and that request might be a SELL. A
+ * Shariah block must never be able to stand between a position and its exit,
+ * so the service is what interprets it: refusing a BUY with a specific code,
+ * and ignoring it entirely on an exit.
+ *
+ * The parent schema is still `.strict()`, so no OTHER unknown field gets in,
+ * and the body remains size-capped by `express.json({ limit: "10kb" })`.
+ */
+export const shariahContextSchema = z.unknown().optional();
+
 export const webhookSchema = z.object({
   secret: z.string().min(32).max(256),
   action: z.string().min(1).max(40),
@@ -45,6 +64,11 @@ export const webhookSchema = z.object({
   sell_percent: z.number().finite().positive().max(100).nullable().optional(),
   exit_leg: z.enum(["tp1", "tp2", "runner", "stop", "signal"]).optional(),
   dedupe_key: z.string().min(1).max(256).optional(),
+  /*
+   * Optional: a sender that does not enforce (including a direct TradingView
+   * alert, which cannot produce one) omits it and keeps its existing behaviour.
+   */
+  shariah: shariahContextSchema,
 }).strict()
   .refine((b) => Boolean(b.symbol || b.tv_instrument), {
     message: "symbol or tv_instrument required",

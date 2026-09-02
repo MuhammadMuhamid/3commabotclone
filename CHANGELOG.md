@@ -1,5 +1,64 @@
 # Changelog
 
+## 2026-09-02 — Shariah exposure enforcement (Trading Scene Shariah V1)
+
+### Added: a final new-exposure gate, and nothing else
+
+The Platform screens assets and decides; this Bot now refuses to **create** new
+Spot exposure against an authenticated decision that does not say `ELIGIBLE`.
+
+No screening engine was added. The Bot does no research, no browsing, no model
+call, and stores no Shariah registry — `services/shariah.ts` makes no network
+call and is never reached from a scheduler.
+
+**Wire contract.** `contract/webhookContract.ts` goes to v3 with an optional
+`shariah` block (`mode`, `policyVersion`, `assetId`, `baseAsset`,
+`effectiveStatus`, `publicationId`) and a `shariah_blocked` receiver outcome
+(HTTP 409, `mayAdvanceLocalState` false). The file is vendored byte-for-byte
+into the Platform, so its fingerprint test fails on both sides until both copies
+match — which is the point.
+
+**Signature coverage is inherited.** The manual HMAC already hashes a canonical
+serialisation of the whole body, so the block is signed by the same signature as
+`side` and `symbol`; flipping the status, the mode, or the base asset — or
+removing the block — invalidates the request with a 401. No second crypto scheme
+was introduced.
+
+**The rule.** Mode `off`, or no block at all, is exactly the previous behaviour.
+Under `enforce` a BUY is placed only for `ELIGIBLE`, and is refused for `REVIEW`,
+`EXCLUDED`, a policy version this build cannot apply, a malformed context, or a
+base asset that is not the base of the symbol traded. Refusals carry their own
+codes so they are never confused with an auth failure, a risk refusal, or a
+Binance failure.
+
+**SELL is never refused, and nothing is liquidated.** Signal exits, TP, SL,
+partial closes, dashboard closes, manual sells and every recovery of those all
+proceed whatever the status says. This is structural: `marketSellBase` has no
+clearance parameter. The Bot does not poll the Platform, does not watch for
+status changes, and creates no order when a classification moves.
+
+**Where it runs.** At request admission — before the per-bot entry checks,
+before any credential or balance read, before the deterministic client order ID,
+and before the durable reservation. The admitting decision is persisted on the
+intent, and recovery re-reads *that* decision rather than a fresher status; the
+re-check sits before the `requested → submitted` compare-and-set so a refusal
+leaves the intent abandonable rather than stranded. `marketBuyQuote` then
+requires a symbol-bound clearance only the enforcement module can produce, so a
+proof for one asset cannot authorise a BUY of another.
+
+**Omission is not a downgrade.** `ShariahEnforcement` remembers the last mode a
+sender scope authenticated. After an `enforce`, a BUY that leaves the block out
+is refused rather than silently reverting to pre-Shariah behaviour; turning it
+off again takes an explicit authenticated `mode: "off"`. It stores a mode and a
+policy identity only, per scope — never an asset, a status, or any screening
+input.
+
+**Unchanged:** Spot-only execution, no futures/leverage/margin/short, HMAC with
+timestamp/nonce/replay protection, durable request and client order IDs,
+query-first recovery with no blind resubmit, the BUY `dedupe_key` requirement,
+the global halt, shared risk limits, automated TP/SL halt handling, and the
+existing idempotency and accounting protections.
+
 ## 2026-08-24 — Session stability
 
 ### Fixed: users logged out every few minutes, backend crashing
