@@ -907,6 +907,11 @@ curl -sf https://bot.alphawebstudioz.com/health
 
 Or use `deploy/finish-on-server.sh` after SSH.
 
+Before destructive host or volume work, use the explicit SQLite backup/restore
+procedure in [README.md](../README.md#backup-and-restore). It covers the current
+intent/manual/idempotency/risk tables, requires a fresh or explicitly replaced
+target, and documents the separate environment-key prerequisites.
+
 ### 9.5 Local development
 
 ```bash

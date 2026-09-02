@@ -274,6 +274,90 @@ With `DRY_RUN=false`, the API refuses to start unless `ENCRYPTION_KEY`,
 
 Per-bot secrets are generated when you create a bot; Binance keys are stored per exchange account in the DB.
 
+## Backup and restore
+
+SQLite `bot.db` is the authoritative local recovery artifact. It includes bot
+configuration and webhook secrets; exchange-account routing and encrypted API
+key blobs; `SmartTrade`, `PartialClose`, `StrategyOrderIntent`, `ManualOrder`,
+`ManualCommand`, nonce/receipt dedupe records, close marks, risk/halt state,
+execution logs, users/sessions/push subscriptions, and Prisma migration history.
+The live-price/PnL snapshots in those rows can be refreshed, but identities,
+quantities, linkage and lifecycle state must be preserved.
+
+The database does **not** include `backend/.env`. Re-provision configuration
+separately. In particular, the original `ENCRYPTION_KEY` and `SCRYPT_SALT` are
+needed to decrypt restored exchange credentials (otherwise re-enter those
+credentials). `JWT_SECRET`, `SETUP_TOKEN`, the manual HMAC secret, VAPID private
+key, and any legacy environment-based Binance credentials also remain
+environment-managed; changing the JWT secret invalidates existing sessions. A
+production backup is sensitive even though API keys are encrypted: it also
+contains webhook/TOTP/authentication material and is decryptable with the
+separate keys. Store it with permissions and retention appropriate for
+credentials.
+
+Both scripts require the native `sqlite3` CLI. The backend image includes it.
+Create the destination directory yourself so an output-path typo fails closed.
+For a running Docker backend:
+
+```bash
+install -d -m 700 /secure/trading-bot-backups
+scripts/backup-db.sh \
+  --container "$(docker compose ps -q backend)" \
+  --output "/secure/trading-bot-backups/bot-$(date -u +%Y%m%dT%H%M%SZ).db"
+```
+
+For a stopped local backend, name the source and output explicitly:
+
+```bash
+scripts/backup-db.sh --source backend/data/bot.db --output /secure/trading-bot-backups/bot.db
+```
+
+Backup refuses an existing output. It uses SQLite's online backup API rather
+than copying a live database, then checks SQLite integrity, foreign keys, every
+current durable table, and every migration in this checkout. It prints the
+artifact SHA-256, SQLite version, size and compatibility result; record that
+output with the protected artifact.
+
+Restore always requires an explicit fresh destination. Stop the backend first:
+
+```bash
+scripts/restore-db.sh --backup /secure/trading-bot-backups/bot.db \
+  --target /explicit/recovery/path/bot.db
+```
+
+For Docker, build the current image, stop (or on a replacement machine create)
+the backend container, and identify that stopped target explicitly:
+
+```bash
+docker compose build backend
+docker compose stop backend                 # use `docker compose create backend` on a fresh target
+scripts/restore-db.sh --backup /secure/trading-bot-backups/bot.db \
+  --container "$(docker compose ps -aq backend)"
+docker compose start backend
+```
+
+Restore refuses a running/ambiguous container and refuses any existing local
+database or SQLite WAL/SHM sidecar. For an intentional replacement, add
+`--replace`; the prior database and sidecars are moved to timestamped safety
+copies before the validated artifact is installed. No test-only marker is
+required, so the same command works for a genuine new recovery target. The
+backup must match all migrations in the checkout; use the matching Bot checkout
+for an older artifact, then let the normal backend entrypoint run
+`prisma migrate deploy` before application startup.
+
+The disposable regression proof is:
+
+```bash
+cd backend
+node --env-file=tests/test.env --import tsx --test tests/backupRestore.test.ts
+```
+
+It migrates and seeds one task-owned source through Prisma, backs it up, removes
+that source from the read path, restores a separate fresh target, reopens the
+target through the Bot Prisma layer, compares recovery fields exactly, and
+proves restored strategy/manual/webhook replay identities suppress resubmission
+without exchange access.
+
 ## Security notes
 
 - **Never commit `backend/.env` or `*.db`** — both are gitignored. The database holds

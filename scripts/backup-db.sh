@@ -1,73 +1,103 @@
 #!/usr/bin/env bash
-# Back up the bot's SQLite database.
+# Create a consistent SQLite backup of the Bot database.
 #
-# `backend/data/bot.db` holds the AES-256-GCM-encrypted Binance API keys, every
-# SmartTrade, every partial close and the whole webhook log. Nothing in this
-# repository backed it up, and `docker compose down -v` destroys the volume
-# irrecoverably (finding BOT-029).
-#
-# The backup is a real SQLite backup, not a file copy: `.backup` is safe against
-# a live writer, whereas `cp` of a database with a hot WAL produces a file that
-# may not open.
-#
-# The output is STILL SENSITIVE. It contains the encrypted key blobs, which are
-# decryptable by anyone who also has ENCRYPTION_KEY and SCRYPT_SALT. Store it
-# where you would store the keys themselves. `backups/` is gitignored.
+# The artifact contains the entire database, including encrypted exchange-key
+# blobs, webhook credentials and authentication state. Treat it as sensitive.
 set -euo pipefail
+umask 077
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/sqlite-db-common.sh
+source scripts/sqlite-db-common.sh
 
-DB="${DB_PATH:-backend/data/bot.db}"
-OUT_DIR="${BACKUP_DIR:-backups}"
-KEEP="${BACKUP_KEEP:-30}"
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-DEST="$OUT_DIR/bot-$STAMP.db"
+usage() {
+  echo "usage: $0 (--source <bot.db> | --container <backend-container>) --output <backup.db>" >&2
+  exit 2
+}
 
-# In the deployed setup the database lives in a Docker volume, not on the host.
-CONTAINER="${BACKEND_CONTAINER:-}"
+SOURCE=""
+CONTAINER=""
+OUTPUT=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --source) [ "$#" -ge 2 ] || usage; SOURCE="$2"; shift 2 ;;
+    --container) [ "$#" -ge 2 ] || usage; CONTAINER="$2"; shift 2 ;;
+    --output) [ "$#" -ge 2 ] || usage; OUTPUT="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
 
-mkdir -p "$OUT_DIR"
-chmod 700 "$OUT_DIR"
+[ -n "$OUTPUT" ] || usage
+if { [ -n "$SOURCE" ] && [ -n "$CONTAINER" ]; } ||
+   { [ -z "$SOURCE" ] && [ -z "$CONTAINER" ]; }; then
+  usage
+fi
+[ ! -e "$OUTPUT" ] && [ ! -L "$OUTPUT" ] || {
+  echo "refusing to overwrite existing backup: $OUTPUT" >&2
+  exit 1
+}
+OUTPUT_DIR="$(dirname "$OUTPUT")"
+[ -d "$OUTPUT_DIR" ] || {
+  echo "backup output directory does not exist: $OUTPUT_DIR" >&2
+  exit 1
+}
 
-if [ -n "$CONTAINER" ]; then
-  echo "backing up from container $CONTAINER"
-  docker exec "$CONTAINER" sh -c \
-    "command -v sqlite3 >/dev/null || { echo 'sqlite3 not installed in the container' >&2; exit 1; }
-     sqlite3 /app/data/bot.db \".backup '/tmp/backup.db'\""
-  docker cp "$CONTAINER:/tmp/backup.db" "$DEST"
-  docker exec "$CONTAINER" rm -f /tmp/backup.db
+require_sqlite3
+if command -v sha256sum >/dev/null 2>&1; then
+  HASH_TOOL=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+  HASH_TOOL=shasum
 else
-  [ -f "$DB" ] || { echo "no database at $DB (set DB_PATH or BACKEND_CONTAINER)" >&2; exit 1; }
-  if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$DB" ".backup '$DEST'"
-  else
-    echo "sqlite3 not found — falling back to a file copy." >&2
-    echo "Stop the backend first, or the copy may be unreadable." >&2
-    cp "$DB" "$DEST"
+  echo "a SHA-256 tool (sha256sum or shasum) is required" >&2
+  exit 1
+fi
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/trading-scene-bot-backup.XXXXXX")"
+STAGED="$SCRATCH/backup.db"
+REMOTE=""
+cleanup() {
+  if [ -n "$REMOTE" ] && [ -n "$CONTAINER" ]; then
+    docker exec "$CONTAINER" rm -f "$REMOTE" >/dev/null 2>&1 || true
   fi
+  rm -rf "$SCRATCH"
+}
+trap cleanup EXIT HUP INT TERM
+
+if [ -n "$SOURCE" ]; then
+  [ -f "$SOURCE" ] || {
+    echo "source database is not a regular file: $SOURCE" >&2
+    exit 1
+  }
+  sqlite3 "$SOURCE" ".backup '$STAGED'"
+else
+  command -v docker >/dev/null 2>&1 || {
+    echo "docker is required for --container" >&2
+    exit 1
+  }
+  running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
+  [ "$running" = "true" ] || {
+    echo "container backup requires the explicitly named backend container to be running" >&2
+    exit 1
+  }
+  REMOTE="/tmp/trading-scene-bot-backup-${RANDOM}-$$.db"
+  docker exec "$CONTAINER" sh -c \
+    "set -eu; command -v sqlite3 >/dev/null; test ! -e '$REMOTE'; sqlite3 /app/data/bot.db \".backup '$REMOTE'\"; chmod 600 '$REMOTE'"
+  docker cp "$CONTAINER:$REMOTE" "$STAGED" >/dev/null
+  docker exec "$CONTAINER" rm -f "$REMOTE"
+  REMOTE=""
 fi
 
-chmod 600 "$DEST"
-
-# Verify the backup actually opens and carries the tables that matter, so a
-# silently truncated file is not mistaken for a backup.
-if command -v sqlite3 >/dev/null 2>&1; then
-  integrity="$(sqlite3 "$DEST" 'PRAGMA integrity_check;')"
-  [ "$integrity" = "ok" ] || { echo "backup failed integrity_check: $integrity" >&2; exit 1; }
-  for table in ExchangeAccount SignalBot SmartTrade; do
-    sqlite3 "$DEST" "SELECT 1 FROM $table LIMIT 1;" >/dev/null 2>&1 || {
-      echo "backup is missing table $table" >&2; exit 1; }
-  done
-  echo "integrity_check ok; core tables present"
+validate_bot_database "$STAGED" "backup"
+chmod 600 "$STAGED"
+bytes="$(wc -c <"$STAGED" | tr -d ' ')"
+if [ "$HASH_TOOL" = "sha256sum" ]; then
+  hash="$(sha256sum "$STAGED" | awk '{print $1}')"
+else
+  hash="$(shasum -a 256 "$STAGED" | awk '{print $1}')"
 fi
+version="$(sqlite3 --version | awk '{print $1}')"
+mv "$STAGED" "$OUTPUT"
+chmod 600 "$OUTPUT"
 
-echo "wrote $DEST ($(wc -c <"$DEST" | tr -d ' ') bytes)"
-
-# Retention: keep the newest $KEEP files, delete the rest.
-count="$(find "$OUT_DIR" -maxdepth 1 -name 'bot-*.db' | wc -l | tr -d ' ')"
-if [ "$count" -gt "$KEEP" ]; then
-  find "$OUT_DIR" -maxdepth 1 -name 'bot-*.db' -print0 \
-    | xargs -0 ls -1t \
-    | tail -n +"$((KEEP + 1))" \
-    | while read -r old; do echo "pruning $old"; rm -f "$old"; done
-fi
+echo "wrote $OUTPUT ($bytes bytes)"
+echo "SHA-256 $hash"
+echo "SQLite $version; Prisma migration compatibility verified"

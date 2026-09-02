@@ -11,7 +11,7 @@ RUN npm run build
 
 FROM node:22-alpine AS runtime
 WORKDIR /app
-RUN apk add --no-cache openssl wget
+RUN apk add --no-cache openssl sqlite wget
 
 # NODE_ENV was set nowhere, so Express returned a full stack trace on any
 # unhandled synchronous throw — and this process holds decrypted Binance API
