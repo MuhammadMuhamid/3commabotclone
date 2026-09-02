@@ -374,6 +374,74 @@ target through the Bot Prisma layer, compares recovery fields exactly, and
 proves restored strategy/manual/webhook replay identities suppress resubmission
 without exchange access.
 
+## Paired Platform+Bot release and rollback
+
+Bot and Platform ship as a pair: the durable `RealizationEvent` outbox
+(`services/realizationEvents.ts`) delivers to Platform's ingestion route
+using the vendored `webhookContract.ts` and `realizationEventContract.ts`
+files, which must stay byte-for-byte identical between the two repositories.
+`scripts/release.sh` is read/report only — it never touches Git history, the
+database, or a running process:
+
+```bash
+scripts/release.sh identity
+scripts/release.sh gate --peer-platform-root /path/to/platform
+scripts/release.sh rollback-check --since <bot-git-ref> [--database backend/data/bot.db]
+```
+
+`identity` prints the exact commit, the Prisma migration set and its hash,
+and both contract versions/fingerprints. `gate` adds a clean-worktree check,
+tool availability (`sqlite3`), a byte-identical diff of both vendored
+contract files against a Platform checkout, `npm run typecheck`, and the
+realization-focused test files (`strategyIntentMigration.test.ts`,
+`spotExecutionReliability.test.ts`, `backupRestore.test.ts`). Delivery is
+opt-in: `REALIZATION_DELIVERY_ENABLED` (here) and Platform's
+`REALIZATION_INGESTION_ENABLED` both default to `false`.
+
+**Known-good pairs** (Bot commit / Platform commit):
+
+| Pair | Bot | Platform |
+|---|---|---|
+| Previous known-good | `fda4d1b` | `93e7544` |
+| Current accepted | `2bc543e` | `21bedb1` |
+
+**The pending-realization-event rule.** `RealizationEvent` and the new
+`StrategyOrderIntent` provenance columns are additive — the previous Bot
+build's Prisma Client simply never selects them, and `prisma migrate deploy`
+against a database ahead of the checkout's own migrations reports nothing
+pending rather than erroring (proven directly: the previous commit's
+`migrate deploy` and a raw Prisma read were run unmodified against a
+disposable SQLite database seeded at the current schema). That makes
+**already-`delivered`** rows, and a database with **no** `RealizationEvent`
+rows at all, `BACKWARD_COMPATIBLE`: old Bot code may start directly against
+either, exactly like the accepted OLD BOT + NEW PLATFORM state — it will not
+publish any *future* event, but nothing already-durable is lost or touched.
+
+A **`pending`** (or `integrity_error`) row is different: the previous build
+does not run `deliverPendingRealizations` at all, so that row would sit
+undelivered indefinitely — a real operational loss of authoritative
+economics, not merely "ignored." `rollback-check --database <bot.db>`
+classifies exactly this, per-database, and fails closed
+(`ROLLBACK_INCOMPATIBLE`, non-zero exit) whenever any row is not
+`delivered`, or `UNKNOWN` if no `--database` is given at all:
+
+```bash
+scripts/release.sh rollback-check --since fda4d1b --database backend/data/bot.db
+```
+
+Before a Bot code rollback: stop the process taking new closes, run the
+check above, and either (a) if it reports `ROLLBACK_INCOMPATIBLE`, wait for
+`deliverPendingRealizations` to drain those rows to `delivered` (it retries
+automatically with bounded backoff) and re-run the check, or (b) restore
+Platform and Bot to the pre-release backups (this file's Backup and restore
+section; `platform/scripts/backup-platform-db.sh` on the Platform side)
+instead of a code-only rollback. Never start old Bot code against a database
+this check has not classified `BACKWARD_COMPATIBLE`.
+
+**Preferred upgrade order:** Platform first, then Bot — see the Platform
+`docs/OPERATIONS.md` §7 for the full reasoning and the scenario-specific
+rollback order (bad Platform only / bad Bot only / full paired rollback).
+
 ## Security notes
 
 - **Never commit `backend/.env` or `*.db`** — both are gitignored. The database holds
