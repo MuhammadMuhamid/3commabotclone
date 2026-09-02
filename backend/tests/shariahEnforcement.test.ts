@@ -38,6 +38,9 @@ const { config } = await import("../src/config.js");
 const { prisma } = await import("../src/lib/prisma.js");
 const { processWebhook } = await import("../src/services/webhook.js");
 const { submitManualOrder } = await import("../src/services/manualTrading.js");
+const { AuthorizationNonceReplayError, reserveStrategyIntent } =
+  await import("../src/services/strategyOrderIntent.js");
+const { authorizationNonceHash } = await import("../src/services/shariah.js");
 const { reconcileStrategyIntent, strategyMarketAdapter } =
   await import("../src/services/strategyOrderIntent.js");
 const { marketBuyQuote, marketSellBase } = await import("../src/services/binance.js");
@@ -57,7 +60,7 @@ const {
   setInstallationShariahMode, shariahScopeForManualAccount, verifyShariahEvidence,
 } = await import("../src/services/shariah.js");
 const { reconcileOneManualOrder } = await import("../src/services/manualTrading.js");
-const { createHmac } = await import("node:crypto");
+const { createHmac, randomBytes } = await import("node:crypto");
 const { webhookSchema } = await import("../src/routes/webhookSchema.js");
 
 const originalDryRun = config.dryRun;
@@ -101,15 +104,18 @@ const eligible = (over: Record<string, unknown> = {}) => ({
  */
 function signedShariah(
   symbol: string, side: "buy" | "sell", context: Record<string, unknown>,
-  over: { timestamp?: string; secret?: string } = {}
+  over: { timestamp?: string; secret?: string; nonce?: string } = {}
 ) {
   const timestamp = over.timestamp ?? String(Date.now());
+  // Mirrors the Platform's `mintShariahNonce`: 24 CSPRNG bytes, base64url.
+  const nonce = over.nonce ?? randomBytes(24).toString("base64url");
   const canonical = shariahEvidenceCanonical({
-    symbol, side, timestamp, context: context as never });
+    symbol, side, timestamp, nonce, context: context as never });
   const secret = over.secret ?? config.manualTradingHmacSecret;
   return {
     shariah: context,
     shariah_ts: timestamp,
+    shariah_nonce: nonce,
     shariah_sig: `v1=${createHmac("sha256", secret).update(canonical).digest("hex")}`,
   };
 }
@@ -1116,4 +1122,572 @@ test("the admission helper writes nothing when it refuses", async () => {
   // that statement is what a later omission is measured against.
   const row = await prisma.shariahEnforcement.findUnique({ where: { scope } });
   assert.equal(row?.mode, "enforce");
+});
+
+// ── Single-use authorisation: the replay defence (contract v5) ──────────────
+//
+// Everything above proves the Platform is the only thing that can CERTIFY a
+// BUY. Everything below proves it can only certify one at a time.
+//
+// The weakness these close: a v4 signature named a symbol, a side, a decision
+// and a time — nothing that identified the ORDER. Every ordinary idempotency
+// control on this receiver is keyed by `dedupe_key`, which the sender of the
+// replay chooses, so a captured payload re-sent with a new key looked like a
+// brand new order to all of them. The only thing bounding it was the freshness
+// window, which is an expiry, not a defence.
+//
+// No network and no Binance: every submission below goes to `recordingClient`.
+
+/** One enforcing installation, one bot, one recording exchange. */
+async function replayFixture() {
+  // A generous per-Bot allowance. Investment sizing is a different control with
+  // its own tests; leaving the default here would let it refuse an entry these
+  // tests expect to succeed, and a green suite would be proving the wrong thing.
+  const bot = await createBot({ maxInvestmentUnit: "usdt_bot", maxInvestmentPct: 10_000 });
+  const { client, orders } = recordingClient();
+  await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+  const call = (extra: Record<string, unknown>, over: Record<string, unknown> = {}) =>
+    processWebhook(
+      { secret: bot.webhookSecret, action: "buy", symbol: "APTUSDT", quote_order_qty: 100,
+        dedupe_key: uniq("W"), ...extra, ...over },
+      { clientFactory: async () => client as never });
+  return { bot, client, orders, call };
+}
+
+test("A: one valid ELIGIBLE signed webhook BUY reaches the mocked exchange", async () => {
+  const { orders, call } = await replayFixture();
+  const out = await call(signedShariah("APTUSDT", "buy", eligible()));
+
+  assert.equal(out.status, "ok");
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0].side, "BUY");
+  assert.equal(orderPlaced("ok"), true);
+});
+
+test("B: an EXACT replay of the same payload places no second order", async () => {
+  const { orders, call } = await replayFixture();
+  const evidence = signedShariah("APTUSDT", "buy", eligible());
+  const dedupe_key = uniq("W");
+
+  assert.equal((await call(evidence, { dedupe_key })).status, "ok");
+  const replayed = await call(evidence, { dedupe_key });
+
+  /*
+   * Byte-identical, so it is indistinguishable from the sender's own delivery
+   * retry — and it is answered as one. The ordinary caller-key guard suppresses
+   * it, which is the correct outcome: `ignored_duplicate` truthfully tells the
+   * sender the original order did execute.
+   *
+   * What matters, and what is asserted, is that no SECOND order exists.
+   */
+  assert.equal(replayed.status, "ignored_duplicate");
+  assert.equal(orderPlaced(replayed.status as never), false);
+  assert.equal(orders.length, 1);
+});
+
+test("C: the same signed evidence under a FRESH dedupe key is refused as a replay",
+  async () => {
+    const { orders, call } = await replayFixture();
+    const evidence = signedShariah("APTUSDT", "buy", eligible());
+
+    assert.equal((await call(evidence, { dedupe_key: uniq("W") })).status, "ok");
+
+    /*
+     * THE weakness. Under v4 this was an `ok` and a second position: a fresh
+     * `dedupe_key` produces a fresh caller key, a fresh `sourceKey` and a fresh
+     * `clientOrderId`, so every idempotency control on this path saw a new
+     * order — and the evidence was still inside its freshness window, so the
+     * signature verified.
+     */
+    const replayed = await call(evidence, { dedupe_key: uniq("W") });
+    assert.equal(replayed.status, "shariah_blocked");
+    assert.equal((replayed.detail as { code: string }).code, "SHARIAH_EVIDENCE_REPLAYED");
+    assert.equal(orders.length, 1, "a replay must not create a second position");
+
+    // And the refusal is a refusal: the sender is told it is still flat.
+    assert.equal(mayAdvanceLocalState("shariah_blocked"), false);
+    assert.equal(httpStatusFor("shariah_blocked"), 409);
+  });
+
+test("C2: changing the dedupe key ANY number of times never buys twice", async () => {
+  const { orders, call } = await replayFixture();
+  const evidence = signedShariah("APTUSDT", "buy", eligible());
+
+  assert.equal((await call(evidence, { dedupe_key: uniq("W") })).status, "ok");
+  for (let i = 0; i < 8; i++) {
+    const out = await call(evidence, { dedupe_key: uniq("W") });
+    assert.equal(out.status, "shariah_blocked");
+    assert.equal((out.detail as { code: string }).code, "SHARIAH_EVIDENCE_REPLAYED");
+  }
+  assert.equal(orders.length, 1);
+});
+
+test("D: the same nonce lifted onto a different symbol fails its binding", async () => {
+  const bot = await createBot();
+  const { client, orders } = recordingClient();
+  await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+  const evidence = signedShariah("APTUSDT", "buy", eligible());
+  const nonce = evidence.shariah_nonce;
+
+  // Keep the nonce and the signature; change the symbol the order names.
+  const out = await processWebhook(
+    { secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT", quote_order_qty: 100,
+      dedupe_key: uniq("W"), ...evidence },
+    { clientFactory: async () => client as never });
+
+  assert.equal(out.status, "shariah_blocked");
+  /*
+   * SHARIAH_ASSET_MISMATCH, not EVIDENCE_UNVERIFIED, and that is the stronger
+   * answer rather than a looser one.
+   *
+   * Two independent things refuse this. The signature covers the symbol, so
+   * lifting it onto BTCUSDT breaks it — and the base-asset binding refuses an
+   * APT decision for a BTC order whether or not anything verified, which is the
+   * v4 rule that an unproven decision may still REFUSE. The binding is checked
+   * first, so it is the code the operator sees.
+   */
+  assert.equal((out.detail as { code: string }).code, "SHARIAH_ASSET_MISMATCH");
+  assert.equal(orders.length, 0);
+
+  /*
+   * And the failed attempt did not SPEND the authorisation. An attacker must
+   * not be able to burn a legitimate sender's nonce by presenting it somewhere
+   * it does not belong — that would turn the replay defence into a denial of
+   * the order it is meant to protect.
+   */
+  const spent = await prisma.strategyOrderIntent.findUnique({
+    where: { authorizationNonceHash: authorizationNonceHash(String(nonce)) } });
+  assert.equal(spent, null);
+});
+
+test("E: the same nonce with a modified Shariah status fails its signature", async () => {
+  const { orders, call } = await replayFixture();
+  const signed = signedShariah("APTUSDT", "buy", eligible());
+
+  /*
+   * Every field of the decision is inside the signed bytes, so keeping the
+   * nonce and the signature while rewriting the verdict cannot verify.
+   *
+   * Downgrading it is refused on the verdict itself: an unproven decision may
+   * still make things STRICTER, so a rewritten REVIEW or EXCLUDED is honoured
+   * as a refusal rather than discarded. Either way no order is placed.
+   */
+  for (const status of ["REVIEW", "EXCLUDED"] as const) {
+    const out = await call({ ...signed, shariah: eligible({ effectiveStatus: status }) });
+    assert.equal(out.status, "shariah_blocked");
+    assert.equal((out.detail as { code: string }).code,
+      status === "REVIEW" ? "SHARIAH_REVIEW_BLOCKED" : "SHARIAH_EXCLUDED_BLOCKED");
+  }
+
+  // The reverse, which is the one that would matter: an EXCLUDED decision
+  // rewritten to ELIGIBLE while keeping its nonce and signature.
+  const excluded = signedShariah("APTUSDT", "buy", eligible({ effectiveStatus: "EXCLUDED" }));
+  const upgraded = await call({ ...excluded, shariah: eligible() });
+  assert.equal(upgraded.status, "shariah_blocked");
+  assert.equal((upgraded.detail as { code: string }).code, "SHARIAH_EVIDENCE_UNVERIFIED");
+
+  assert.equal(orders.length, 0);
+});
+
+test("E2: swapping in a DIFFERENT, unspent nonce invalidates the signature", async () => {
+  const { orders, call } = await replayFixture();
+  const first = signedShariah("APTUSDT", "buy", eligible());
+  const second = signedShariah("APTUSDT", "buy", eligible());
+
+  assert.equal((await call(first)).status, "ok");
+  assert.equal(orders.length, 1);
+
+  /*
+   * The nonce is INSIDE the signed bytes, not merely alongside them. So a
+   * replayer holding a spent signature cannot pair it with a fresh nonce to get
+   * a second entry: the swap breaks the very signature that made the decision
+   * the Platform's. Minting an unspent nonce requires the signing key, which is
+   * the one thing a signal source does not have.
+   */
+  const spliced = await call({ ...first, shariah_nonce: second.shariah_nonce });
+  assert.equal(spliced.status, "shariah_blocked");
+  assert.equal((spliced.detail as { code: string }).code, "SHARIAH_EVIDENCE_UNVERIFIED");
+  assert.equal(orders.length, 1);
+});
+
+test("F: two CONCURRENT requests on one authorisation admit at most one BUY", async () => {
+  // Two different bots on one installation, because the in-process buy lock
+  // serialises same-bot entries and would hide the race this is testing. It is
+  // also the sharper case: the signing key is installation-wide, so evidence
+  // minted for one bot verifies against another.
+  const botA = await createBot();
+  const botB = await createBot();
+  const { client, orders } = recordingClient();
+  await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+  const evidence = signedShariah("APTUSDT", "buy", eligible());
+
+  const fire = (secret: string) => processWebhook(
+    { secret, action: "buy", symbol: "APTUSDT", quote_order_qty: 100,
+      dedupe_key: uniq("W"), ...evidence },
+    { clientFactory: async () => client as never })
+    .then((r) => r, (e: Error) => ({ status: "threw", detail: e.message }));
+
+  const results = await Promise.all([fire(botA.webhookSecret), fire(botB.webhookSecret)]);
+
+  assert.equal(results.filter((r) => r.status === "ok").length, 1,
+    "exactly one of two concurrent requests on one authorisation may buy");
+  assert.equal(orders.length, 1, "only one order may reach the exchange");
+
+  const loser = results.find((r) => r.status !== "ok");
+  assert.equal(loser?.status, "shariah_blocked");
+  assert.equal((loser?.detail as { code: string }).code, "SHARIAH_EVIDENCE_REPLAYED");
+
+  // Exactly one durable claim exists for the authorisation, whichever won.
+  const claims = await prisma.strategyOrderIntent.findMany({
+    where: { authorizationNonceHash: authorizationNonceHash(String(evidence.shariah_nonce)) } });
+  assert.equal(claims.length, 1);
+});
+
+test("F2: the unique constraint, not the pre-check, is what decides the race", async () => {
+  /*
+   * The read in `admitSpotEntry` cannot arbitrate a tie — two racing requests
+   * both see an unspent authorisation. This drives the reservation directly,
+   * with the pre-check bypassed entirely, to prove the database is the
+   * authority and that it fails with a reason rather than a raw constraint
+   * error leaking out of the persistence layer.
+   */
+  const bot = await createBot();
+  const hash = authorizationNonceHash(randomBytes(24).toString("base64url"));
+  const reserve = (sourceKey: string) => reserveStrategyIntent({
+    sourceKey, bot, clientOrderId: uniq("coid"), symbol: "APTUSDT", side: "BUY",
+    requestedQuoteQty: 100, authorizationNonceHash: hash,
+  });
+
+  const first = await reserve(uniq("scope"));
+  assert.equal(first.authorizationNonceHash, hash);
+
+  await assert.rejects(() => reserve(uniq("scope")), AuthorizationNonceReplayError);
+
+  // A different authorisation on the same bot is unaffected.
+  const other = await reserveStrategyIntent({
+    sourceKey: uniq("scope"), bot, clientOrderId: uniq("coid"), symbol: "APTUSDT",
+    side: "BUY", requestedQuoteQty: 100,
+    authorizationNonceHash: authorizationNonceHash(randomBytes(24).toString("base64url")),
+  });
+  assert.notEqual(other.id, first.id);
+});
+
+test("F3: intents carrying NO authorisation never collide with each other", async () => {
+  // The column is nullable-unique, and every SELL, every manual order and
+  // everything admitted while enforcement is off writes null. If nulls
+  // collided, the second such order in the installation's life would fail.
+  const bot = await createBot();
+  const made = [];
+  for (let i = 0; i < 3; i++) {
+    made.push(await reserveStrategyIntent({
+      sourceKey: uniq("scope"), bot, clientOrderId: uniq("coid"), symbol: "APTUSDT",
+      side: "SELL", requestedBaseQty: 1,
+    }));
+  }
+  assert.equal(new Set(made.map((m) => m.id)).size, 3);
+  assert.deepEqual(made.map((m) => m.authorizationNonceHash), [null, null, null]);
+});
+
+test("G: a consumed authorisation is still refused after the process restarts", async () => {
+  const { orders, call } = await replayFixture();
+  const evidence = signedShariah("APTUSDT", "buy", eligible());
+  assert.equal((await call(evidence)).status, "ok");
+
+  const hash = authorizationNonceHash(String(evidence.shariah_nonce));
+  const claim = await prisma.strategyOrderIntent.findUnique({
+    where: { authorizationNonceHash: hash } });
+  assert.ok(claim, "the claim must be a durable row, not process memory");
+
+  /*
+   * The restart. Dropping the connection discards every in-process cache,
+   * promise chain and lock this module holds; the next query reopens the SQLite
+   * file from disk. If the defence lived in a `Set`, it would be gone here —
+   * which is exactly why it does not.
+   */
+  await prisma.$disconnect();
+
+  const afterRestart = await call(evidence);
+  assert.equal(afterRestart.status, "shariah_blocked");
+  assert.equal((afterRestart.detail as { code: string }).code, "SHARIAH_EVIDENCE_REPLAYED");
+  assert.equal(orders.length, 1);
+});
+
+test("H: evidence older than the freshness window is refused on its face", async () => {
+  const { orders, call } = await replayFixture();
+
+  for (const age of [SHARIAH_EVIDENCE_MAX_AGE_MS + 1_000, SHARIAH_EVIDENCE_MAX_AGE_MS * 10]) {
+    const stale = signedShariah("APTUSDT", "buy", eligible(),
+      { timestamp: String(Date.now() - age) });
+    const out = await call(stale);
+    assert.equal(out.status, "shariah_blocked");
+    assert.equal((out.detail as { code: string }).code, "SHARIAH_EVIDENCE_UNVERIFIED");
+  }
+  assert.equal(orders.length, 0);
+
+  /*
+   * Defence in depth, deliberately kept. The nonce is now the replay defence,
+   * so this bound is no longer load-bearing for that — but ancient signed
+   * evidence is refused before storage is consulted at all, so the replay store
+   * never has to be the first line and never has to be trusted to be complete.
+   */
+  assert.equal(SHARIAH_EVIDENCE_MAX_AGE_MS, 120 * 1000);
+});
+
+test("I: a genuinely new authorisation buys again, immediately", async () => {
+  const { orders, call } = await replayFixture();
+
+  // Same symbol, same side, same decision, same second — four distinct
+  // authorisations. Nothing about the nonce is derived from the order, so
+  // legitimate back-to-back entries are unaffected by the replay defence.
+  // Sized to stay inside the fixture bot's per-Bot allowance, which is a
+  // separate limit and not what is under test here.
+  for (let i = 0; i < 4; i++) {
+    const out = await call(signedShariah("APTUSDT", "buy", eligible()));
+    assert.equal(out.status, "ok", `entry ${i + 1} was refused`);
+  }
+  assert.equal(orders.length, 4);
+});
+
+test("J: reconciling an already-admitted intent needs no second authorisation", async () => {
+  const { bot, client, orders, call } = await replayFixture();
+  const evidence = signedShariah("APTUSDT", "buy", eligible());
+  const dedupe_key = uniq("W");
+  assert.equal((await call(evidence, { dedupe_key })).status, "ok");
+  assert.equal(orders.length, 1);
+
+  const scope = `${bot.id}:APTUSDT:buy:${dedupe_key}`;
+  const admitted = await prisma.strategyOrderIntent.findUnique({ where: { sourceKey: scope } });
+  assert.ok(admitted);
+  const hash = authorizationNonceHash(String(evidence.shariah_nonce));
+  assert.equal(admitted.authorizationNonceHash, hash);
+
+  /*
+   * 1. QUERY-FIRST. The reconciler re-runs against the same intent. The
+   *    requested->submitted transition is already spent, so it queries the
+   *    exchange for the deterministic client order id instead of submitting.
+   *    Nothing about the replay defence changes that, and nothing about
+   *    recovery re-enters the Shariah gate.
+   */
+  const again = await reconcileStrategyIntent(admitted.id, strategyMarketAdapter(client));
+  assert.equal(again.appliedNow, false);
+  assert.equal(orders.length, 1, "reconciliation must never resubmit");
+
+  /*
+   * 2. THE ADMISSION GATE, re-entered by a redelivery of the same signal after
+   *    the ordinary dedupe receipt has expired.
+   *
+   *    This is the case that is genuinely hard: the authorisation IS spent, by
+   *    the very intent this request is trying to reconcile. Asking only "has
+   *    this been used" would refuse it and strand a legitimate retry. The
+   *    intent identity is what separates the two, and it is derived from the
+   *    sender's own `dedupe_key` — the same signal always derives the same one.
+   */
+  await prisma.webhookReceipt.deleteMany({});
+  const readmitted = await admitSpotEntry({
+    scope: shariahScopeForBot(bot.id), symbol: "APTUSDT",
+    context: readShariahContext(evidence.shariah),
+    auth: { kind: "detached", side: "buy", signature: evidence.shariah_sig,
+      timestamp: evidence.shariah_ts, nonce: evidence.shariah_nonce },
+    intentKey: scope,
+  });
+  assert.equal(readmitted.authorizationNonceHash, hash);
+
+  /*
+   * 3. And the reservation resolves to the intent already on file rather than
+   *    claiming anything a second time. The row it returns IS the claim.
+   */
+  const recovered = await reserveStrategyIntent({
+    // The full monetary identity of the admitted row: `assertReservationMatches`
+    // is a separate guard that a recovery must satisfy on its own terms.
+    sourceKey: scope, bot, clientOrderId: admitted.clientOrderId, symbol: "APTUSDT",
+    side: "BUY", requestedQuoteQty: admitted.requestedQuoteQty ?? undefined,
+    smartTradeId: admitted.smartTradeId ?? undefined,
+    authorizationNonceHash: hash,
+  });
+  assert.equal(recovered.id, admitted.id, "recovery must return the original intent");
+
+  /*
+   * 4. The contrast that makes the above safe rather than a hole: the SAME
+   *    authorisation presented under a DIFFERENT intent identity — which is
+   *    exactly what a fresh `dedupe_key` produces — is still a replay.
+   */
+  await assert.rejects(() => admitSpotEntry({
+    scope: shariahScopeForBot(bot.id), symbol: "APTUSDT",
+    context: readShariahContext(evidence.shariah),
+    auth: { kind: "detached", side: "buy", signature: evidence.shariah_sig,
+      timestamp: evidence.shariah_ts, nonce: evidence.shariah_nonce },
+    intentKey: `${bot.id}:APTUSDT:buy:${uniq("W")}`,
+  }), (e: unknown) => e instanceof ShariahEnforcementError &&
+    e.code === "SHARIAH_EVIDENCE_REPLAYED");
+
+  // Throughout: exactly one intent and one claim for this authorisation.
+  const claims = await prisma.strategyOrderIntent.findMany({
+    where: { authorizationNonceHash: hash } });
+  assert.equal(claims.length, 1);
+  assert.equal(claims[0].id, admitted.id);
+  assert.equal(orders.length, 1);
+});
+
+test("K: REVIEW and EXCLUDED still cannot buy, nonce or no nonce", async () => {
+  const { bot, orders, call } = await replayFixture();
+
+  for (const status of ["REVIEW", "EXCLUDED"] as const) {
+    // Properly signed, properly nonced, entirely legitimate evidence — and
+    // still refused, because the decision does not permit new exposure.
+    const out = await call(signedShariah("APTUSDT", "buy", eligible({ effectiveStatus: status })));
+    assert.equal(out.status, "shariah_blocked");
+    assert.equal((out.detail as { code: string }).code,
+      status === "REVIEW" ? "SHARIAH_REVIEW_BLOCKED" : "SHARIAH_EXCLUDED_BLOCKED");
+  }
+  assert.equal(orders.length, 0);
+
+  /*
+   * A refused decision spends nothing. There is nothing to spend: no entry was
+   * authorised, so no authorisation was used up.
+   */
+  const claimed = await prisma.strategyOrderIntent.count({
+    where: { botId: bot.id, authorizationNonceHash: { not: null } } });
+  assert.equal(claimed, 0);
+});
+
+test("L: a SELL is never blocked by a Shariah authorisation having been spent", async () => {
+  const bot = await createBot({ maxInvestmentUnit: "usdt_bot", maxInvestmentPct: 10_000 });
+  const { client, orders } = recordingClient();
+  await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+  const buyEvidence = signedShariah("APTUSDT", "buy", eligible());
+
+  const buy = await processWebhook(
+    { secret: bot.webhookSecret, action: "buy", symbol: "APTUSDT", quote_order_qty: 100,
+      dedupe_key: uniq("W"), ...buyEvidence },
+    { clientFactory: async () => client as never });
+  assert.equal(buy.status, "ok");
+
+  const exit = (extra: Record<string, unknown>) => processWebhook(
+    { secret: bot.webhookSecret, action: "sell", symbol: "APTUSDT",
+      dedupe_key: uniq("X"), ...extra },
+    { clientFactory: async () => client as never, skipExitCheck: true })
+    .then((r) => r, (e: Error) => ({ status: "threw", detail: e.message }));
+
+  /*
+   * Four exits, every one of which a Shariah-specific rule might have trapped:
+   * an exit carrying the authorisation the BUY already spent, one carrying a
+   * malformed authorisation, one carrying none at all, and one whose decision
+   * says the asset is EXCLUDED. None of them may be refused on Shariah grounds.
+   *
+   * This is the invariant the whole feature is bounded by. A position that
+   * cannot be closed is a worse outcome than any replay.
+   */
+  for (const [name, extra] of [
+    ["a spent authorisation", { ...buyEvidence, shariah: eligible() }],
+    ["a malformed authorisation", { ...buyEvidence, shariah_nonce: "!!short!!" }],
+    ["no authorisation at all", { shariah: eligible() }],
+    ["an EXCLUDED decision", signedShariah("APTUSDT", "sell", eligible({ effectiveStatus: "EXCLUDED" }))],
+  ] as const) {
+    const out = await exit(extra as Record<string, unknown>);
+    assert.notEqual(out.status, "shariah_blocked", `an exit was refused with ${name}`);
+    assert.notEqual((out.detail as { code?: string })?.code, "SHARIAH_EVIDENCE_REPLAYED");
+  }
+
+  // And no exit ever claimed an authorisation, so none could ever exhaust one.
+  const sellClaims = await prisma.strategyOrderIntent.count({
+    where: { botId: bot.id, side: "SELL", authorizationNonceHash: { not: null } } });
+  assert.equal(sellClaims, 0);
+  assert.ok(orders.some((o) => o.side === "SELL"), "an exit must actually have been placed");
+});
+
+test("M: Mode OFF traffic is unchanged and never needs an authorisation", async () => {
+  const bot = await createBot({ maxInvestmentUnit: "usdt_bot", maxInvestmentPct: 10_000 });
+  const { client, orders } = recordingClient();
+  // No installation floor, no latch: an ordinary non-enforcing installation.
+  const call = (extra: Record<string, unknown>) => processWebhook(
+    { secret: bot.webhookSecret, action: "buy", symbol: "APTUSDT", quote_order_qty: 100,
+      dedupe_key: uniq("W"), ...extra },
+    { clientFactory: async () => client as never });
+
+  // A direct TradingView alert: no block, no signature, no nonce. Repeatedly.
+  assert.equal((await call({})).status, "ok");
+  assert.equal((await call({})).status, "ok");
+
+  /*
+   * A signed `mode: "off"` block carries a nonce, because the Platform signs
+   * every delivery the same way — but an `off` decision authorises nothing, so
+   * presenting the SAME one twice is not a replay of an authorisation. Making
+   * Mode OFF single-use would be a behaviour change for traffic this feature is
+   * not about.
+   */
+  const off = signedShariah("APTUSDT", "buy", { mode: "off" });
+  assert.equal((await call(off)).status, "ok");
+  assert.equal((await call(off)).status, "ok");
+
+  assert.equal(orders.length, 4);
+  const claimed = await prisma.strategyOrderIntent.count({
+    where: { botId: bot.id, authorizationNonceHash: { not: null } } });
+  assert.equal(claimed, 0, "nothing under Mode OFF may spend an authorisation");
+});
+
+test("N: a missing or malformed authorisation under enforcement fails CLOSED", async () => {
+  const { orders, call } = await replayFixture();
+  const signed = signedShariah("APTUSDT", "buy", eligible());
+
+  const { shariah_nonce: _dropped, ...withoutNonce } = signed;
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["absent", withoutNonce],
+    ["empty", { ...signed, shariah_nonce: "" }],
+    ["too short", { ...signed, shariah_nonce: "AAAAAAAAAAAAAAAAAAAAA" }],
+    ["too long", { ...signed, shariah_nonce: "A".repeat(129) }],
+    ["wrong alphabet", { ...signed, shariah_nonce: `${"A".repeat(21)}+` }],
+    ["not a string", { ...signed, shariah_nonce: 12345 }],
+    ["an object", { ...signed, shariah_nonce: { toString: () => "A".repeat(32) } }],
+  ];
+  for (const [name, payload] of cases) {
+    const out = await call(payload);
+    assert.equal(out.status, "shariah_blocked", `a ${name} nonce was not refused`);
+    assert.equal((out.detail as { code: string }).code, "SHARIAH_EVIDENCE_UNVERIFIED");
+  }
+  assert.equal(orders.length, 0);
+
+  // The route's own schema turns the malformed shapes away earlier still, so a
+  // BUY carrying one never reaches the service.
+  for (const bad of ["", "short", "A".repeat(129), `${"A".repeat(21)}+`]) {
+    assert.equal(webhookSchema.safeParse({
+      secret: "s".repeat(40), action: "buy", symbol: "APTUSDT", shariah_nonce: bad,
+    }).success, false, `the schema accepted ${JSON.stringify(bad)}`);
+  }
+  assert.equal(webhookSchema.safeParse({
+    secret: "s".repeat(40), action: "buy", symbol: "APTUSDT",
+    shariah_nonce: randomBytes(24).toString("base64url"),
+  }).success, true);
+});
+
+test("the refusal is auditable, and leaks no authorisation material", async () => {
+  const { bot, call } = await replayFixture();
+  const evidence = signedShariah("APTUSDT", "buy", eligible());
+  await call(evidence);
+  const replayed = await call(evidence, { dedupe_key: uniq("W") });
+  assert.equal((replayed.detail as { code: string }).code, "SHARIAH_EVIDENCE_REPLAYED");
+
+  const logs = await prisma.webhookLog.findMany({ where: { botId: bot.id } });
+  const blocked = logs.filter((l) => l.status === "blocked");
+  assert.equal(blocked.length, 1);
+  assert.match(String(blocked[0].message), /^SHARIAH_EVIDENCE_REPLAYED: /);
+
+  /*
+   * A replay is operationally distinguishable, and that is the whole point of
+   * giving it its own code. What it must NOT do is write the credential it is
+   * refusing into the log of the system refusing it.
+   */
+  const everything = JSON.stringify(logs);
+  assert.equal(everything.includes(String(evidence.shariah_nonce)), false,
+    "the nonce must never be logged");
+  assert.equal(everything.includes(String(evidence.shariah_sig)), false,
+    "the signature must never be logged");
+  assert.equal(everything.includes(config.manualTradingHmacSecret), false);
+  assert.equal(everything.includes(bot.webhookSecret), false);
+
+  // Nor into the durable claim: the intent stores a hash, never the nonce.
+  const claim = await prisma.strategyOrderIntent.findFirst({
+    where: { botId: bot.id, authorizationNonceHash: { not: null } } });
+  assert.equal(claim?.authorizationNonceHash,
+    authorizationNonceHash(String(evidence.shariah_nonce)));
+  assert.equal(JSON.stringify(claim).includes(String(evidence.shariah_nonce)), false);
 });

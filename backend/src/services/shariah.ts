@@ -23,9 +23,10 @@
  *     no polling, and no outbound request. The bot reacts only to authenticated
  *     execution intents that arrive on their own.
  */
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import {
-  isShariahSignatureShaped, isShariahTimestampShaped, shariahBlockCodeFor,
+  isShariahNonceShaped, isShariahSignatureShaped, isShariahTimestampShaped,
+  shariahBlockCodeFor,
   shariahEvidenceCanonical, shariahStatusPermitsEntry, SHARIAH_EVIDENCE_MAX_AGE_MS,
   validateShariahContext,
   type ContractAction, type ShariahContext, type ShariahMode, type ShariahRejectionCode,
@@ -333,7 +334,14 @@ function decideEntry(context: ShariahContext, symbol: string): ShariahClearance 
  */
 export type ShariahEvidenceAuth =
   | { kind: "request-signature" }
-  | { kind: "detached"; side: ContractAction; signature?: unknown; timestamp?: unknown };
+  | {
+    kind: "detached";
+    side: ContractAction;
+    signature?: unknown;
+    timestamp?: unknown;
+    /** The one-shot authorisation identity, inside the signed bytes since v5. */
+    nonce?: unknown;
+  };
 
 function constantTimeEquals(a: string, b: string): boolean {
   const left = Buffer.from(a, "utf8");
@@ -356,8 +364,9 @@ export function verifyShariahEvidence(input: {
   context: ShariahContext;
   signature: unknown;
   timestamp: unknown;
+  nonce: unknown;
   now?: number;
-}): { ok: true } | { ok: false; reason: string } {
+}): { ok: true; nonce: string } | { ok: false; reason: string } {
   const secret = config.manualTradingHmacSecret;
   if (!secret) return { ok: false, reason: "this bot holds no Platform signing secret" };
   if (!isShariahSignatureShaped(input.signature)) {
@@ -366,19 +375,54 @@ export function verifyShariahEvidence(input: {
   if (!isShariahTimestampShaped(input.timestamp)) {
     return { ok: false, reason: "the Shariah decision carries no usable timestamp" };
   }
+  /*
+   * Fails CLOSED on a missing or malformed nonce, before the MAC is computed.
+   *
+   * The nonce is inside the signed bytes, so an absent one would produce a
+   * canonical string with an empty line where the authorisation identity
+   * belongs — which no Platform signature covers, so this would fail anyway.
+   * Checking it explicitly turns "your signature does not verify" into a reason
+   * an operator can act on, and makes it impossible to reach the claim below
+   * holding something that is not a usable key.
+   */
+  if (!isShariahNonceShaped(input.nonce)) {
+    return {
+      ok: false,
+      reason: "the Shariah decision carries no usable single-use authorisation identifier",
+    };
+  }
   const age = (input.now ?? Date.now()) - Number(input.timestamp);
   if (!Number.isFinite(age) || Math.abs(age) > SHARIAH_EVIDENCE_MAX_AGE_MS) {
     return { ok: false, reason: "the Shariah decision signature is outside its freshness window" };
   }
   const canonical = shariahEvidenceCanonical({
     symbol: input.symbol, side: input.side,
-    timestamp: input.timestamp, context: input.context,
+    timestamp: input.timestamp, nonce: input.nonce, context: input.context,
   });
   const expected = `v1=${createHmac("sha256", secret).update(canonical).digest("hex")}`;
   if (!constantTimeEquals(expected, input.signature)) {
     return { ok: false, reason: "the Shariah decision signature does not verify" };
   }
-  return { ok: true };
+  return { ok: true, nonce: input.nonce };
+}
+
+/**
+ * The at-rest identity of one authorisation.
+ *
+ * Hashed, and deliberately not reversible to the value on the wire: the claim
+ * record is a permanent row beside an order intent, while the nonce itself is a
+ * live credential for the seconds it remains fresh. Nothing needs the original
+ * — the only questions ever asked of it are "is this the same one" and "has it
+ * been spent" — so the original is never written down. This is the same reason
+ * `WebhookReceipt` stores `keyHash` rather than the key.
+ *
+ * NOT namespaced by bot or by scope. The signing key is shared across the whole
+ * installation, so evidence minted for one bot verifies against another; a
+ * per-bot namespace would let one authorisation buy once per bot. One
+ * authorisation, one entry, installation-wide.
+ */
+export function authorizationNonceHash(nonce: string): string {
+  return createHash("sha256").update(`shariah:v1:${nonce}`).digest("hex");
 }
 
 /**
@@ -394,19 +438,39 @@ function authenticatedDecision(input: {
   symbol: string;
   context: ShariahContext | undefined;
   auth: ShariahEvidenceAuth;
-}): { trusted: boolean; context: ShariahContext | undefined; unverified: string | null } {
-  if (!input.context) return { trusted: true, context: undefined, unverified: null };
+}): {
+  trusted: boolean;
+  context: ShariahContext | undefined;
+  unverified: string | null;
+  /*
+   * The verified single-use identity, present only on the detached path and
+   * only once the signature has proved it. It is never read off the payload:
+   * an unsigned nonce is not an authorisation identity, it is a string an
+   * attacker chose, and claiming one would let a replayer burn identities of
+   * their choosing.
+   */
+  nonce: string | null;
+} {
+  if (!input.context) {
+    return { trusted: true, context: undefined, unverified: null, nonce: null };
+  }
   if (input.auth.kind === "request-signature") {
-    return { trusted: true, context: input.context, unverified: null };
+    // The manual channel's request HMAC already covers the whole body, so the
+    // block is authenticated for free — and that channel carries its own
+    // single-use nonce in `ManualNonce`, so there is nothing to claim here.
+    return { trusted: true, context: input.context, unverified: null, nonce: null };
   }
   const verified = verifyShariahEvidence({
     symbol: input.symbol, side: input.auth.side, context: input.context,
     signature: input.auth.signature, timestamp: input.auth.timestamp,
+    nonce: input.auth.nonce,
   });
   // A signature is what makes the block the Platform's statement rather than
   // the order sender's, so it is checked FIRST — including for `mode: "off"`,
   // which a Platform that is not enforcing legitimately sends.
-  if (verified.ok) return { trusted: true, context: input.context, unverified: null };
+  if (verified.ok) {
+    return { trusted: true, context: input.context, unverified: null, nonce: verified.nonce };
+  }
   /*
    * Unverified, so it is not the Platform speaking. What survives is only what
    * is safe in the strict direction:
@@ -420,7 +484,57 @@ function authenticatedDecision(input: {
     trusted: false,
     context: input.context.mode === "enforce" ? input.context : undefined,
     unverified: verified.reason,
+    nonce: null,
   };
+}
+
+/**
+ * Refuse evidence whose authorisation has already been spent BY A DIFFERENT
+ * ORDER.
+ *
+ * "Spent" means: some durable order intent already records this hash. That row
+ * is the claim — see `reserveStrategyIntent` — so this question is answered
+ * against the same fact the unique index enforces, and it keeps answering the
+ * same way across a restart because the row outlives the process.
+ *
+ * ── Why the intent identity matters here ────────────────────────────────────
+ *
+ * A replay and a redelivery look identical if you only ask "has this
+ * authorisation been used". The sender legitimately re-POSTs the same signed
+ * payload when a delivery times out, and it may arrive after the ordinary
+ * dedupe receipt has expired — at which point the authorisation IS spent, by
+ * the very intent this request is trying to reconcile.
+ *
+ * `intentKey` is what tells the two apart. It is the durable identity the
+ * caller is about to reserve under, derived from the sender's own `dedupe_key`.
+ * The same logical signal always derives the same one; a replay under a fresh
+ * `dedupe_key` never does — which is precisely why the replayer's freedom to
+ * choose that key is what defeated every other control and cannot defeat this
+ * one.
+ *
+ * Matching means recovery: the existing row is returned by
+ * `reserveStrategyIntent`, query-first semantics take over, and nothing is
+ * claimed twice because there is only ever one claim.
+ *
+ * The message carries no nonce, no hash and no signature. An operator needs to
+ * know THAT a signed decision was presented twice, and for which symbol; the
+ * identity of the credential adds nothing they can act on and would put a
+ * replay token into the log of the system whose job is to refuse it.
+ */
+async function assertAuthorizationUnspent(
+  hash: string, symbol: string, intentKey: string | null
+): Promise<void> {
+  const spent = await prisma.strategyOrderIntent.findUnique({
+    where: { authorizationNonceHash: hash },
+    select: { sourceKey: true },
+  });
+  if (!spent) return;
+  if (intentKey && spent.sourceKey === intentKey) return;
+  throw new ShariahEnforcementError(
+    "SHARIAH_EVIDENCE_REPLAYED",
+    `${normalizeSymbol(symbol)}: this Shariah authorisation has already been used for an ` +
+    "entry; a signed decision authorises one entry and cannot be presented again"
+  );
 }
 
 // ── The two gates ───────────────────────────────────────────────────────────
@@ -429,6 +543,21 @@ export interface EntryAdmission {
   clearance: ShariahClearance;
   /** Serialized authenticated decision to persist beside the durable intent. */
   persisted: string | null;
+  /**
+   * The at-rest identity of the single-use authorisation this admission ran on,
+   * for the caller to CLAIM as part of writing the durable intent.
+   *
+   * Non-null only for a trusted, enforcing, detached-evidence BUY — the exact
+   * case where a signed decision is being turned into new exposure. Null
+   * everywhere else, and null is not a weaker claim: it means no authorisation
+   * was spent because none was needed. See `admitSpotEntry`.
+   *
+   * Deliberately NOT consumed here. Consuming it at admission time would spend
+   * a legitimate sender's authorisation on an order the risk gate then refused,
+   * and would leave a window where the nonce is gone but no recoverable intent
+   * exists. The claim belongs in the same write as the intent.
+   */
+  authorizationNonceHash: string | null;
 }
 
 /**
@@ -444,9 +573,19 @@ export function admitSpotEntry(input: {
   context: ShariahContext | undefined;
   /** How this path proves the block came from the Platform. Never optional. */
   auth: ShariahEvidenceAuth;
+  /**
+   * The durable intent identity this admission will be reserved under, when the
+   * caller has one. It is what separates a redelivery of THIS order from a
+   * replay presenting the same authorisation for a different one.
+   *
+   * Omitting it is safe and strictly stricter: without it, any prior claim on
+   * the authorisation reads as a replay. The manual channel omits it because it
+   * mints no detached evidence and so has nothing to claim.
+   */
+  intentKey?: string | null;
 }): Promise<EntryAdmission> {
   return withScopeAdmission(input.scope, async () => {
-    const { trusted, context, unverified } = authenticatedDecision(input);
+    const { trusted, context, unverified, nonce } = authenticatedDecision(input);
     if (context && !trusted) {
       /*
        * An unproven decision may only ever make things stricter.
@@ -468,12 +607,53 @@ export function admitSpotEntry(input: {
             `${normalizeSymbol(input.symbol)}: this installation is enforcing Shariah policy, ` +
             "so a BUY must carry an authenticated Shariah decision");
       }
-      return { clearance: clearance(input.symbol, "off", null), persisted: null };
+      return {
+        clearance: clearance(input.symbol, "off", null),
+        persisted: null,
+        authorizationNonceHash: null,
+      };
     }
     await recordShariahMode(input.scope, context);
+    const decided = decideEntry(context, input.symbol);
+    const claimHash =
+      context.mode === "enforce" && nonce ? authorizationNonceHash(nonce) : null;
+    /*
+     * An early, deliberately NON-AUTHORITATIVE replay check.
+     *
+     * The authority is the unique index on `StrategyOrderIntent`, which is the
+     * only thing that can decide a race. This read cannot: two concurrent
+     * replays both see nothing here and both proceed, and that is fine — the
+     * constraint refuses the second when they try to claim.
+     *
+     * It earns its place by rejecting the ORDINARY replay — the sequential one,
+     * arriving after the original landed — at the same point every other
+     * Shariah refusal happens: before an exchange credential is read, before a
+     * balance is fetched, before a client order id exists, and with a reason
+     * naming what actually went wrong instead of a constraint violation
+     * surfacing from three layers down.
+     */
+    if (claimHash) {
+      await assertAuthorizationUnspent(claimHash, input.symbol, input.intentKey ?? null);
+    }
+    /*
+     * Only an ENFORCING decision that actually authorises this entry spends an
+     * authorisation. Two exclusions, both deliberate:
+     *
+     *   * `mode: "off"` — a signed `off` block still carries a nonce, because
+     *     the nonce is inside the bytes the Platform signs and it signs every
+     *     delivery the same way. But an `off` decision authorises nothing, so
+     *     spending its nonce would make ordinary Mode-OFF traffic single-use
+     *     for no benefit. Mode OFF keeps exactly the behaviour it had.
+     *   * the manual HMAC channel — `nonce` is null there by construction, and
+     *     that channel is already single-use via `ManualNonce`.
+     *
+     * `decideEntry` has already thrown for REVIEW, EXCLUDED and a base-asset
+     * mismatch, so reaching this line means the decision permits the entry.
+     */
     return {
-      clearance: decideEntry(context, input.symbol),
+      clearance: decided,
       persisted: serializeShariahContext(context),
+      authorizationNonceHash: claimHash,
     };
   });
 }

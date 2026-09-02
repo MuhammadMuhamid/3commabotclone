@@ -70,14 +70,23 @@ export const webhookSchema = z.object({
    */
   shariah: shariahContextSchema,
   /*
-   * The detached Platform signature over the decision, and the timestamp it
-   * covers. Shape-checked here (a fixed-width opaque token cannot 400 a SELL
-   * the way a rich object could); whether one is REQUIRED, and whether it
-   * verifies, is the service's decision — only it holds the secret and knows
-   * whether this installation enforces.
+   * The detached Platform signature over the decision, the timestamp it covers,
+   * and the single-use identity of the authorisation it grants. Shape-checked
+   * here (a fixed-width opaque token cannot 400 a SELL the way a rich object
+   * could); whether one is REQUIRED, whether it verifies, and whether the
+   * authorisation is still unspent are all the service's decisions — only it
+   * holds the secret, knows whether this installation enforces, and can consult
+   * durable storage.
+   *
+   * Note there is no all-three-or-none refinement here, on purpose. That rule
+   * lives in the shared contract's validator, and enforcing it at this layer
+   * would let an incomplete set 400 a SELL — the exact failure mode the block
+   * above is shaped to avoid. An incomplete set simply fails to verify, which
+   * refuses a BUY and leaves an exit alone.
    */
   shariah_sig: z.string().regex(/^v1=[0-9a-f]{64}$/).optional(),
   shariah_ts: z.string().regex(/^[0-9]{10,17}$/).optional(),
+  shariah_nonce: z.string().regex(/^[A-Za-z0-9_-]{22,128}$/).optional(),
 }).strict()
   .refine((b) => Boolean(b.symbol || b.tv_instrument), {
     message: "symbol or tv_instrument required",

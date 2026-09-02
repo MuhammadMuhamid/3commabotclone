@@ -256,6 +256,15 @@ model StrategyOrderIntent {
   /// or null when none was attached. For a SELL this is evidence only: an exit
   /// is never gated on it.
   shariahContext    String?
+  /// The single-use Platform authorisation this entry was admitted under, stored
+  /// as a hash so a live authorisation identifier is never at rest here. UNIQUE
+  /// is the whole replay defence: one signed Shariah decision can claim at most
+  /// one intent, whatever `dedupe_key`, request id or client order id
+  /// accompanies it. Null for every path that carries no detached evidence —
+  /// SELLs, the manual HMAC channel, and everything admitted while Shariah
+  /// enforcement is off — and SQLite, like Postgres, treats those nulls as
+  /// distinct, so they never collide with each other.
+  authorizationNonceHash String? @unique
   skipExitCheck     Boolean  @default(false)
   smartTradeId      String?
   status            String   @default("requested")

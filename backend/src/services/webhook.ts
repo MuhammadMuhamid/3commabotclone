@@ -18,7 +18,7 @@ import {
   shouldLatchHalt,
 } from "./riskControls.js";
 import {
-  SHARIAH_SIGNATURE_FIELD, SHARIAH_TIMESTAMP_FIELD,
+  SHARIAH_NONCE_FIELD, SHARIAH_SIGNATURE_FIELD, SHARIAH_TIMESTAMP_FIELD,
   type ReceiverOutcome,
 } from "../contract/webhookContract.js";
 import { calcOrderQuoteUsdt, isPerBotUnit } from "../lib/investment.js";
@@ -27,6 +27,7 @@ import crypto from "crypto";
 import { Prisma } from "@prisma/client";
 import { sendExecutionNotification } from "./push.js";
 import {
+  AuthorizationNonceReplayError,
   hasUnresolvedStrategySell, reconcileStrategyIntent, reserveStrategyIntent,
   strategyMarketAdapter, type StrategyCrashHooks,
 } from "./strategyOrderIntent.js";
@@ -100,12 +101,14 @@ export type WebhookBody = {
    */
   shariah?: unknown;
   /**
-   * The detached Platform signature over that decision, and the timestamp it
-   * covers. Also `unknown`: caller-supplied, and only the enforcement service
-   * may decide whether either is usable.
+   * The detached Platform signature over that decision, the timestamp it
+   * covers, and the single-use identity of the authorisation it grants. All
+   * `unknown`: caller-supplied, and only the enforcement service may decide
+   * whether any of them is usable.
    */
   shariah_sig?: unknown;
   shariah_ts?: unknown;
+  shariah_nonce?: unknown;
 };
 
 export function resolveAction(action: string): "buy" | "sell" {
@@ -236,9 +239,29 @@ export async function processWebhook(
     reservedDedupeKeys.push(tradeKey);
   }
 
-  // CRIT-03: Redact the webhook secret before storing the log payload.
-  // The secret is a live credential — it must never be written to the database.
-  const { secret: _redacted, ...safeBody } = body;
+  /*
+   * CRIT-03: Redact the webhook secret before storing the log payload.
+   * The secret is a live credential — it must never be written to the database.
+   *
+   * The detached Shariah credentials go with it, for the same reason and on the
+   * same rule. `shariah_nonce` is a single-use authorisation and `shariah_sig`
+   * is what makes it usable; together they are a bearer token for one entry,
+   * and a request that was REFUSED — by the risk gate, by the halt, by a
+   * balance — leaves its authorisation unspent for the remainder of its
+   * freshness window. This log is retained for thirty days, so persisting them
+   * would keep a live credential long past the moment it mattered.
+   *
+   * The DECISION itself (`shariah`) is deliberately kept: it is the auditable
+   * evidence of what was asserted, and it authorises nothing on its own. And
+   * nothing is lost for forensics — an admitted entry records the hash of its
+   * authorisation on the intent, which is what links the two.
+   */
+  const {
+    secret: _redacted,
+    [SHARIAH_SIGNATURE_FIELD]: _sig,
+    [SHARIAH_NONCE_FIELD]: _nonce,
+    ...safeBody
+  } = body;
   const log = await prisma.webhookLog.create({
     data: {
       botId: bot.id,
@@ -296,14 +319,40 @@ export async function processWebhook(
       side,
       signature: body[SHARIAH_SIGNATURE_FIELD],
       timestamp: body[SHARIAH_TIMESTAMP_FIELD],
+      nonce: body[SHARIAH_NONCE_FIELD],
     };
     let shariahEvidence: string | null = null;
+    /*
+     * The single-use authorisation this BUY is spending, carried from the gate
+     * to the durable reservation below and claimed there — not here. Between
+     * the two, several things can still legitimately refuse the order
+     * (`entryEnabled`, the trade caps, the balance, the account risk gate), and
+     * none of them should cost the sender its authorisation.
+     */
+    let authorizationNonceHash: string | null = null;
+    /*
+     * The durable identity this BUY will be reserved under, computed ONCE here
+     * and reused verbatim below.
+     *
+     * Two reasons it is hoisted. The gate needs it to tell a redelivery of this
+     * order apart from a replay presenting its authorisation for a different
+     * one. And computing it twice would risk the two disagreeing: without a
+     * caller `dedupe_key` it falls back to a wall-clock minute bucket, so two
+     * calls either side of a minute boundary derive different scopes. A BUY
+     * without a `dedupe_key` is refused below regardless, but the value must
+     * not be able to drift between the check and the claim.
+     */
+    const buyIntentKey = side === "buy"
+      ? idempotencyScope(bot.id, symbol, "buy", body.dedupe_key)
+      : null;
     if (side === "buy") {
       try {
-        shariahEvidence = (await admitSpotEntry({
+        const admission = await admitSpotEntry({
           scope: shariahScope, symbol, context: readShariahContext(body.shariah),
-          auth: shariahAuth,
-        })).persisted;
+          auth: shariahAuth, intentKey: buyIntentKey,
+        });
+        shariahEvidence = admission.persisted;
+        authorizationNonceHash = admission.authorizationNonceHash;
       } catch (error) {
         if (!(error instanceof ShariahEnforcementError)) throw error;
         await prisma.webhookLog.update({ where: { id: log.id },
@@ -399,17 +448,51 @@ export async function processWebhook(
         // Persist the complete monetary identity before crossing the exchange
         // boundary. The durable requested->submitted transition below is the
         // sole authority that may perform the initial submission.
-        const scope = idempotencyScope(bot.id, symbol, "buy", body.dedupe_key);
-        const intent = await reserveStrategyIntent({
-          sourceKey: scope,
-          webhookLogId: log.id,
-          bot,
-          clientOrderId: clientOrderId(scope),
-          symbol,
-          side: "BUY",
-          requestedQuoteQty: quote,
-          shariahContext: shariahEvidence,
-        }, strategyCrashHooks);
+        /*
+         * Non-null throughout this branch by construction — it is computed
+         * exactly when `side` is "buy". Checked rather than cast so a future
+         * refactor that moves either one cannot silently reserve under a key
+         * the gate never saw.
+         */
+        if (!buyIntentKey) throw new Error(`${symbol}: BUY reached reservation with no intent key`);
+        const scope = buyIntentKey;
+        let intent;
+        try {
+          intent = await reserveStrategyIntent({
+            sourceKey: scope,
+            webhookLogId: log.id,
+            bot,
+            clientOrderId: clientOrderId(scope),
+            symbol,
+            side: "BUY",
+            requestedQuoteQty: quote,
+            shariahContext: shariahEvidence,
+            authorizationNonceHash,
+          }, strategyCrashHooks);
+        } catch (error) {
+          /*
+           * The authoritative replay refusal.
+           *
+           * `admitSpotEntry` already turns away the sequential replay, but only
+           * the unique index can decide a race, and this is where it speaks. It
+           * is reached when two requests carrying the same signed authorisation
+           * are in flight together: both passed the gate's read, one won the
+           * insert, and this is the other one.
+           *
+           * Nothing has reached the exchange on this path — the reservation is
+           * what licenses a submission, and it did not happen — so this is
+           * reported exactly as the gate's own refusal is, and the sender is
+           * told it is still flat.
+           */
+          if (!(error instanceof AuthorizationNonceReplayError)) throw error;
+          await prisma.webhookLog.update({ where: { id: log.id },
+            data: { status: "blocked", message: `SHARIAH_EVIDENCE_REPLAYED: ${error.message}` } });
+          await releasePersistentDedupe(reservedDedupeKeys);
+          return {
+            status: "shariah_blocked",
+            detail: { code: "SHARIAH_EVIDENCE_REPLAYED", reason: error.message },
+          };
+        }
         strategyIntentId = intent.id;
         const execution = await reconcileStrategyIntent(
           intent.id,

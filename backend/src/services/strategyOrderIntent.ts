@@ -42,6 +42,36 @@ export interface StrategyIntentReservation {
    * how every pre-Shariah intent reads.
    */
   shariahContext?: string | null;
+  /**
+   * The at-rest identity of the single-use Platform authorisation this entry is
+   * spending, from `admitSpotEntry`. Writing it IS the claim: the column is
+   * unique, so the first intent to reach the database owns the authorisation
+   * and every later one is refused.
+   *
+   * Null for a SELL, for the manual channel, and for anything admitted while
+   * enforcement is off — none of those spend an authorisation, and nulls do not
+   * collide.
+   */
+  authorizationNonceHash?: string | null;
+}
+
+/**
+ * A durable authorisation was presented twice.
+ *
+ * Deliberately a plain error class in this module rather than a Shariah one:
+ * what the database refused is the reuse of a single-use authorisation
+ * identity, which is an admission-boundary fact. The webhook path translates it
+ * into the Shariah vocabulary its caller understands, because that path is the
+ * only one that mints these today.
+ */
+export class AuthorizationNonceReplayError extends Error {
+  constructor(readonly symbol: string) {
+    super(
+      `${symbol}: the single-use authorisation for this order has already been claimed ` +
+      "by an earlier intent"
+    );
+    this.name = "AuthorizationNonceReplayError";
+  }
 }
 
 export interface StrategyMarketAdapter {
@@ -123,6 +153,7 @@ export async function reserveStrategyIntent(
       skipExitCheck: input.skipExitCheck ?? false,
       smartTradeId: input.smartTradeId,
       shariahContext: input.shariahContext ?? null,
+      authorizationNonceHash: input.authorizationNonceHash ?? null,
     }});
   } catch (error) {
     if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") {
@@ -131,7 +162,32 @@ export async function reserveStrategyIntent(
     const existing = await prisma.strategyOrderIntent.findFirst({ where: {
       OR: [{ sourceKey: input.sourceKey }, { clientOrderId: input.clientOrderId }],
     }});
-    if (!existing) throw error;
+    /*
+     * The order of these two branches is the whole recovery/replay distinction.
+     *
+     * A row matching `sourceKey` or `clientOrderId` means THIS logical order is
+     * already on file: a retry, a reconnect, a reconciliation sweep. That is
+     * recovery, it returns the existing intent, and it does NOT re-claim the
+     * authorisation — the row it just found is the claim. This is why a
+     * legitimate delivery retry inside the freshness window still works, and
+     * why an already-admitted intent never needs a second nonce.
+     *
+     * No such row, but the authorisation is already spent, means a DIFFERENT
+     * order is presenting an authorisation that has been used. That is the
+     * replay: a fresh `dedupe_key` produced a fresh `sourceKey` and a fresh
+     * `clientOrderId`, so every ordinary idempotency control saw a new order —
+     * and the unique index is what saw through it.
+     */
+    if (!existing) {
+      if (input.authorizationNonceHash) {
+        const claimed = await prisma.strategyOrderIntent.findUnique({
+          where: { authorizationNonceHash: input.authorizationNonceHash },
+          select: { id: true },
+        });
+        if (claimed) throw new AuthorizationNonceReplayError(input.symbol);
+      }
+      throw error;
+    }
     assertReservationMatches(existing, input);
     intent = existing;
   }
