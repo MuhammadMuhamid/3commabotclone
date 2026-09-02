@@ -1,6 +1,7 @@
 import { prisma } from "../lib/prisma.js";
 import type { BinanceClient } from "./binance.js";
 import { getTickerPrice, marketSellBase, clientFromAccount, clientFromEnv } from "./binance.js";
+import { getBotRiskLimits } from "./riskControls.js";
 import { recordPairClose } from "../lib/tradeCloseTracker.js";
 import {
   acquireTradeClose,
@@ -160,7 +161,10 @@ const CLIENT_CACHE_KEY = (accountId: string | null | undefined) => accountId ?? 
  * not a latency problem worth solving: it is how two closes on one account
  * interleave.
  */
-export async function checkTakeProfitStopLoss(): Promise<void> {
+export async function checkTakeProfitStopLoss(
+  /** Test-only override; production always resolves via the account/env clients below. */
+  options: { resolveClient?: (accountId: string | null | undefined) => Promise<BinanceClient | undefined> } = {}
+): Promise<void> {
   const trades = await prisma.smartTrade.findMany({
     where: { status: "active" },
     include: { bot: true },
@@ -172,11 +176,15 @@ export async function checkTakeProfitStopLoss(): Promise<void> {
     const key = CLIENT_CACHE_KEY(accountId);
     if (clients.has(key)) return clients.get(key);
     let client: BinanceClient | undefined;
-    if (accountId) {
-      const acc = await prisma.exchangeAccount.findUnique({ where: { id: accountId } });
-      if (acc) client = clientFromAccount(acc);
+    if (options.resolveClient) {
+      client = await options.resolveClient(accountId);
+    } else {
+      if (accountId) {
+        const acc = await prisma.exchangeAccount.findUnique({ where: { id: accountId } });
+        if (acc) client = clientFromAccount(acc);
+      }
+      if (!client) client = clientFromEnv() ?? undefined;
     }
-    if (!client) client = clientFromEnv() ?? undefined;
     clients.set(key, client);
     return client;
   };
@@ -248,6 +256,16 @@ export async function checkTakeProfitStopLoss(): Promise<void> {
     try {
       const fresh = await prisma.smartTrade.findUnique({ where: { id: trade.id } });
       if (!fresh || fresh.status !== "active") continue;
+
+      /*
+       * F-AUTO-01: the global halt is a hard stop on every real submission —
+       * webhook execution and manual protective TP/SL both check it immediately
+       * before their exchange call, and this monitor must not be the one path
+       * that doesn't. Read fresh (not once per cycle) so a halt engaged mid-cycle
+       * still takes effect before THIS trade's sell, and leave the trade active
+       * — it is re-evaluated next cycle, not closed or faked.
+       */
+      if ((await getBotRiskLimits()).tradingHalted) continue;
 
       // Fetch prior partial closes so their P&L is included in the final total
       const partials = await prisma.partialClose.findMany({ where: { tradeId: trade.id } });
