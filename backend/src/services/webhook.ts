@@ -122,16 +122,6 @@ function botPairs(bot: SignalBot): string[] {
   return JSON.parse(bot.pairs) as string[];
 }
 
-/**
- * F-AUTO-02: true when this bot's configuration permits more than one
- * concurrently-active entry on the same pair. `maxEntryOrders` is a
- * per-pair ceiling (`assertCanOpenTrade`); null means unlimited, which is
- * the most permissive case.
- */
-function allowsMultipleEntriesPerPair(bot: SignalBot): boolean {
-  return bot.maxEntryOrders == null || bot.maxEntryOrders > 1;
-}
-
 async function assertCanOpenTrade(bot: SignalBot, symbol: string): Promise<void> {
   if (bot.maxActiveSmartTradesEnabled && bot.maxActiveSmartTrades != null) {
     const activeCount = await prisma.smartTrade.count({
@@ -265,19 +255,22 @@ export async function processWebhook(
 
       /*
        * F-AUTO-02: without a caller `dedupe_key`, `idempotencyScope` falls back
-       * to a per-minute bucket. That bucket cannot tell a genuine second entry
-       * within the same minute apart from a retry of the first — for a bot
-       * whose `maxEntryOrders` permits more than one concurrent position on
-       * this pair, the second signal would silently receive the first's
-       * already-reconciled intent instead of opening its own position. Reject
-       * explicitly before any intent is reserved rather than coalesce them.
+       * to a per-minute bucket. `maxEntryOrders` bounds concurrently ACTIVE
+       * SmartTrade rows, not lifetime or per-minute entries — once an entry's
+       * SmartTrade closes, another is immediately eligible, including a
+       * `maxEntryOrders === 1` bot. A legitimate close-then-re-enter inside the
+       * same wall-clock minute derives the same fallback bucket as the closed
+       * entry's original signal, so it would silently collide with that stale
+       * identity instead of opening its own position. Every BUY therefore
+       * requires a stable caller-provided key; reject explicitly before any
+       * intent is reserved rather than fall back to the minute bucket.
        */
-      if (!body.dedupe_key && allowsMultipleEntriesPerPair(bot)) {
+      if (!body.dedupe_key) {
         throw new Error(
-          `${symbol}: dedupe_key is required for this bot's entry signals — ` +
-          "maxEntryOrders permits more than one concurrent entry on this pair, " +
-          "and without a stable key a second entry in the same minute cannot be " +
-          "told apart from a retry of the first"
+          `${symbol}: dedupe_key is required for entry signals — a stable, ` +
+          "caller-provided identity for the logical signal, reused on retries. " +
+          "The per-minute fallback cannot tell a genuine re-entry apart from a " +
+          "retry of a prior entry."
         );
       }
 

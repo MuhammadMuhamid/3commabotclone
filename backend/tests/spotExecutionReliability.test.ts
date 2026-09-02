@@ -1059,16 +1059,71 @@ test("F-AUTO-02 C: an exact retry with the same dedupe_key on a multi-entry bot 
   assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id } }), 1);
 });
 
-test("F-AUTO-02 D: a single-entry bot's no-key fallback still opens its one allowed entry unchanged", async () => {
+test("F-AUTO-02 D: a single-entry (maxEntryOrders === 1) bot also rejects an entry signal missing dedupe_key", async () => {
   const bot = await prisma.signalBot.create({ data: {
     name: "Single-entry strategy", webhookSecret: "single-entry-no-key-secret",
     pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true, maxEntryOrders: 1,
   } });
   const calls = { count: 0 };
   const client = buyFillClient(calls);
-  const result = await processWebhook({ secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
-    quote_order_qty: 50 }, { clientFactory: async () => client as never });
-  assert.equal(result.status, "ok", "a single-entry bot is not required to supply dedupe_key");
-  assert.equal(calls.count, 1);
+  await assert.rejects(processWebhook({
+    secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT", quote_order_qty: 50,
+  }, { clientFactory: async () => client as never }), /dedupe_key/);
+  assert.equal(calls.count, 0, "no exchange BUY was submitted");
+  assert.equal(await prisma.strategyOrderIntent.count(), 0, "no intent was reserved");
+  assert.equal(await prisma.smartTrade.count(), 0);
+});
+
+test("F-AUTO-02 E: maxEntryOrders == null also rejects an entry signal missing dedupe_key", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Unlimited-entry strategy", webhookSecret: "unlimited-entry-no-key-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true, maxEntryOrders: null,
+  } });
+  const calls = { count: 0 };
+  const client = buyFillClient(calls);
+  await assert.rejects(processWebhook({
+    secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT", quote_order_qty: 50,
+  }, { clientFactory: async () => client as never }), /dedupe_key/);
+  assert.equal(calls.count, 0, "no exchange BUY was submitted");
+  assert.equal(await prisma.strategyOrderIntent.count(), 0, "no intent was reserved");
+  assert.equal(await prisma.smartTrade.count(), 0);
+});
+
+test("F-AUTO-02 F: a single-entry bot's close-then-re-enter in the same minute is not blocked by the old minute identity", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Single-entry reentry strategy", webhookSecret: "single-entry-reentry-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true, exitEnabled: true, maxEntryOrders: 1,
+  } });
+  const calls = { count: 0 };
+  const client = buyFillClient(calls);
+
+  const first = await processWebhook({ secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50, dedupe_key: "A" }, { clientFactory: async () => client as never });
+  assert.equal(first.status, "ok");
   assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id, status: "active" } }), 1);
+
+  const sellClient = {
+    ...client,
+    order: async (payload: Record<string, unknown>) => {
+      calls.count++;
+      return { orderId: calls.count, side: "SELL", status: "FILLED", executedQty: "0.5",
+        cummulativeQuoteQty: "51", fills: [], clientOrderId: payload.newClientOrderId };
+    },
+  };
+  const close = await processWebhook({ secret: bot.webhookSecret, action: "sell", symbol: "BTCUSDT" },
+    { clientFactory: async () => sellClient as never });
+  assert.equal(close.status, "ok");
+  assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id, status: "active" } }), 0);
+
+  // Same wall-clock minute as the first BUY, but a distinct caller-provided
+  // dedupe_key — a legitimate second entry, not a retry of the first.
+  const second = await processWebhook({ secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50, dedupe_key: "B" }, { clientFactory: async () => client as never });
+  assert.equal(second.status, "ok", "the re-entry gets its own StrategyOrderIntent, not the closed entry's");
+  assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id, status: "active" } }), 1);
+  assert.equal(
+    await prisma.strategyOrderIntent.count({ where: { botId: bot.id, side: "BUY" } }),
+    2,
+    "the re-entry reserved a distinct intent from dedupe_key B, not A's"
+  );
 });

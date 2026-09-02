@@ -487,7 +487,7 @@ or risk/halt mutation is reachable from them.
 7. **Log** `WebhookLog` with `status: "processing"` and run the global halt/risk preflight before exchange access.
 8. **Buy branch** (`resolveAction` → buy):
    - Requires `entryEnabled`
-   - Requires `dedupe_key` when `maxEntryOrders` permits more than one concurrent entry on the pair (null or > 1): without one, the per-minute fallback identity cannot tell a genuine second entry from a retry of the first, so it is rejected outright rather than silently collapsed. A `maxEntryOrders` of exactly 1 is unaffected — only one entry can ever be open, so the fallback stays safe there.
+   - Requires `dedupe_key` unconditionally: `maxEntryOrders` bounds concurrently *active* SmartTrade rows, not lifetime or per-minute entries, so a legitimate close-then-re-enter inside the same minute (including on a `maxEntryOrders === 1` bot) would otherwise derive the same per-minute fallback identity as the closed entry and collide with it. Missing the key is rejected outright, before any intent is reserved, rather than silently collapsed.
    - `assertCanOpenTrade` (max active SmartTrades, max per-pair entry orders)
    - `getClient(bot)` → account or env
    - `calcOrderQuoteUsdt(bot, usdtBalance, quote_order_qty)`
@@ -1049,7 +1049,7 @@ Dashboard → SmartTrades → **Close** on active row → `POST /api/trades/:id/
 | **Signal Bot** | Configuration entity: pairs, sizing, secrets, TP/SL. Maps to `SignalBot` model. |
 | **SmartTrade** | One open or closed position lifecycle (buy → track PnL → sell). Not Binance OCO — app-level tracking. |
 | **webhookSecret** | Per-bot token sent in JSON `secret` field; UUID-derived hex string. |
-| **dedupe_key** | Client-provided id; duplicate within 120s → ignored. Required on a BUY signal for any bot whose `maxEntryOrders` permits more than one concurrent entry on a pair — otherwise the per-minute fallback identity cannot tell a genuine second entry from a retry. |
+| **dedupe_key** | Client-provided id; duplicate within 120s → ignored. Required on every BUY signal, regardless of `maxEntryOrders` — it identifies the logical signal and must be reused on retries; without it the per-minute fallback cannot tell a genuine re-entry from a retry. |
 | **Trade dedupe** | Server-side `trade:{secret}:{symbol}:{side}` 45s window. |
 | **dry run** | Simulated fills at market price without `client.order()`. |
 | **pct_bot** | Position size as % of total USDT balance. |
