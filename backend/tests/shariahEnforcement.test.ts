@@ -53,9 +53,10 @@ const {
   validateShariahContext,
 } = await import("../src/contract/webhookContract.js");
 const {
-  readInstallationShariahMode, readShariahMode, setInstallationShariahMode,
-  shariahScopeForManualAccount, verifyShariahEvidence,
+  clearanceForFirstSubmission, readInstallationShariahMode, readShariahMode,
+  setInstallationShariahMode, shariahScopeForManualAccount, verifyShariahEvidence,
 } = await import("../src/services/shariah.js");
+const { reconcileOneManualOrder } = await import("../src/services/manualTrading.js");
 const { createHmac } = await import("node:crypto");
 const { webhookSchema } = await import("../src/routes/webhookSchema.js");
 
@@ -638,6 +639,137 @@ test("verifyShariahEvidence refuses when this bot holds no Platform signing secr
   } finally {
     config.manualTradingHmacSecret = original;
   }
+});
+
+// ── A queued BUY may not land after enforcement begins ─────────────────────
+
+/*
+ * The gap these cover:
+ *
+ *   a BUY is admitted while nothing is enforcing, so it is persisted with NO
+ *   decision at all. Before it reaches the exchange the process dies, leaving
+ *   the intent in `requested`. The operator then turns Shariah mode ON. Thirty
+ *   seconds later the reconciler picks the intent up, reads its null decision
+ *   as "admitted before this feature existed", and places the order.
+ *
+ * The exposure would be created AFTER enforcement began, which is the one
+ * thing enforcement exists to prevent. Recovery must still refuse to re-judge a
+ * decision it was admitted under — but an intent with no decision was never
+ * admitted under one.
+ */
+
+test("a never-submitted BUY carrying no decision cannot first reach the wire under enforcement",
+  async () => {
+    const bot = await createBot();
+    const scope = shariahScopeForBot(bot.id);
+    // Admitted while nothing was enforcing: no decision was ever rendered.
+    assert.equal(
+      (await admitSpotEntry({ scope, symbol: "APTUSDT", context: undefined,
+        auth: { kind: "request-signature" } })).persisted, null);
+
+    await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+
+    await assert.rejects(
+      () => clearanceForFirstSubmission({ scope, symbol: "APTUSDT", persisted: null }),
+      (error: unknown) => error instanceof ShariahEnforcementError &&
+        error.code === "SHARIAH_CONTEXT_REQUIRED");
+  });
+
+test("the same intent still submits freely while nothing is enforcing", async () => {
+  const bot = await createBot();
+  const clearance = await clearanceForFirstSubmission({
+    scope: shariahScopeForBot(bot.id), symbol: "APTUSDT", persisted: null });
+  assert.equal(clearance.mode, "off");
+});
+
+test("a never-submitted BUY that DOES carry a decision keeps it, and is never re-judged",
+  async () => {
+    const bot = await createBot();
+    const scope = shariahScopeForBot(bot.id);
+    const persisted = JSON.stringify(eligible());
+    await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+    const clearance = await clearanceForFirstSubmission({ scope, symbol: "APTUSDT", persisted });
+    assert.equal(clearance.mode, "enforce");
+    assert.equal(clearance.effectiveStatus, "ELIGIBLE");
+
+    // And a stored decision that does not permit entry still refuses, exactly
+    // as it did before the floor existed.
+    await assert.rejects(
+      () => clearanceForFirstSubmission({ scope, symbol: "APTUSDT",
+        persisted: JSON.stringify(eligible({ effectiveStatus: "EXCLUDED" })) }),
+      (error: unknown) => error instanceof ShariahEnforcementError &&
+        error.code === "SHARIAH_EXCLUDED_BLOCKED");
+  });
+
+test("the strategy reconciler refuses to first-submit a decision-less BUY under enforcement",
+  async () => {
+    const bot = await createBot();
+    const { client, orders } = recordingClient();
+    // Admitted while nothing was enforcing, so it carries no decision, and
+    // stranded in `requested` — nothing was ever sent.
+    const intent = await prisma.strategyOrderIntent.create({ data: {
+      sourceKey: uniq("scope"), botId: bot.id, botName: bot.name,
+      clientOrderId: uniq("client"), symbol: "APTUSDT", side: "BUY", requestedQuoteQty: 100,
+      status: "requested", shariahContext: null,
+    } });
+
+    // While nothing enforces, that recovery still works exactly as before.
+    const recovered = await reconcileStrategyIntent(
+      intent.id, strategyMarketAdapter(client as never, false));
+    assert.equal(recovered.intent.status, "reconciled");
+    assert.equal(orders.length, 1);
+
+    // The same situation, now with the operator enforcing.
+    const stranded = await prisma.strategyOrderIntent.create({ data: {
+      sourceKey: uniq("scope"), botId: bot.id, botName: bot.name,
+      clientOrderId: uniq("client"), symbol: "APTUSDT", side: "BUY", requestedQuoteQty: 100,
+      status: "requested", shariahContext: null,
+    } });
+    await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+    await assert.rejects(
+      () => reconcileStrategyIntent(stranded.id, strategyMarketAdapter(client as never, false)),
+      (error: unknown) => error instanceof ShariahEnforcementError &&
+        error.code === "SHARIAH_CONTEXT_REQUIRED");
+    assert.equal(orders.length, 1, "no further order may reach the exchange");
+  });
+
+test("the manual reconciler refuses to first-submit a decision-less BUY under enforcement",
+  async () => {
+    const account = await createAccount();
+    const { submits, adapter } = recordingManualAdapter();
+    const order = await prisma.manualOrder.create({ data: {
+      requestId: uniq("mo"), exchangeAccountId: account.id, symbol: "APTUSDT", side: "BUY",
+      orderType: "MARKET", quantityType: "quote", requestedQuoteQty: 100,
+      status: "requested", clientOrderId: uniq("bot-"), shariahContext: null } });
+
+    // While nothing enforces, the stalled order is resubmitted as before.
+    const before = await reconcileOneManualOrder(
+      { ...order, exchangeAccount: account } as never, adapter as never);
+    assert.ok(before, "a stalled order must still recover when nothing is enforcing");
+    assert.equal(submits.length, 1);
+
+    await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+    await assert.rejects(
+      () => reconcileOneManualOrder({ ...order, exchangeAccount: account } as never,
+        adapter as never),
+      (error: unknown) => error instanceof ShariahEnforcementError &&
+        error.code === "SHARIAH_CONTEXT_REQUIRED");
+    assert.equal(submits.length, 1, "no further submission may reach the exchange");
+  });
+
+test("an interrupted SELL always completes, enforcing or not", async () => {
+  const account = await createAccount();
+  const { submits, adapter } = recordingManualAdapter();
+  const order = await prisma.manualOrder.create({ data: {
+    requestId: uniq("mo"), exchangeAccountId: account.id, symbol: "APTUSDT", side: "SELL",
+    orderType: "MARKET", quantityType: "base", requestedBaseQty: 1,
+    status: "requested", clientOrderId: uniq("bot-"), shariahContext: null } });
+  await setInstallationShariahMode("enforce", SHARIAH_POLICY_VERSION);
+  const snapshot = await reconcileOneManualOrder(
+    { ...order, exchangeAccount: account } as never, adapter as never);
+  assert.ok(snapshot, "an exit interrupted mid-flight must always be able to finish");
+  assert.equal(submits.length, 1);
+  assert.equal(submits[0]!.side, "SELL");
 });
 
 // ── SELL is never refused ───────────────────────────────────────────────────

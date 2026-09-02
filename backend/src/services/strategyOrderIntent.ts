@@ -7,7 +7,10 @@ import {
   marketSellBase, MinNotionalError, queryFilledMarketOrder,
 } from "./binance.js";
 import { calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
-import { clearanceForPersistedEntry, ShariahEnforcementError } from "./shariah.js";
+import {
+  clearanceForFirstSubmission, clearanceForPersistedEntry, shariahScopeForBot,
+  ShariahEnforcementError,
+} from "./shariah.js";
 import { persistStrategyRealization } from "./realizationEvents.js";
 import {
   evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
@@ -335,7 +338,19 @@ async function assertNeverAttemptedMaySubmit(intent: StrategyOrderIntent): Promi
    * moved to REVIEW or EXCLUDED after entry cannot trap a position.
    */
   if (intent.side === "BUY") {
-    clearanceForPersistedEntry(intent.shariahContext, intent.symbol);
+    /*
+     * Measured against the mode in force NOW, not only against the stored
+     * decision. This intent has not reached the wire — `submitted` would mean
+     * it had — so placing it is creating exposure, and creating exposure while
+     * this installation enforces requires a decision. An intent that carries
+     * one keeps it and is still never re-judged; an intent that carries none
+     * was admitted while nothing was enforcing and may not proceed now.
+     */
+    await clearanceForFirstSubmission({
+      scope: shariahScopeForBot(bot.id),
+      symbol: intent.symbol,
+      persisted: intent.shariahContext,
+    });
 
     const [activeCount, pairCount] = await Promise.all([
       prisma.smartTrade.count({ where: { botId: bot.id, status: "active" } }),

@@ -121,11 +121,15 @@ test("lifecycle maps partial fills and reconciliation queries before resubmittin
   const order = { status: "requested", symbol: "BTCUSDT", clientOrderId: "c",
     side: "BUY", orderType: "LIMIT", requestedQuoteQty: 20, requestedBaseQty: null,
     limitPrice: 100 } as ManualOrder;
-  assert.equal(await reconcileOneManualOrder(order, adapter), snapshot);
+  // The Shariah first-submission gate is exercised against a real database in
+  // shariahEnforcement.test.ts; here it is stubbed so this stays what it is —
+  // a check of the lifecycle mapping, with no database at all.
+  const ungated = async () => undefined;
+  assert.equal(await reconcileOneManualOrder(order, adapter, ungated), snapshot);
   assert.equal(submits, 1);
-  assert.equal(await reconcileOneManualOrder({ ...order, status: "submitted" }, adapter), null);
+  assert.equal(await reconcileOneManualOrder({ ...order, status: "submitted" }, adapter, ungated), null);
   assert.equal(submits, 1);
-  assert.equal(await reconcileOneManualOrder({ ...order, status: "open" }, adapter), null);
+  assert.equal(await reconcileOneManualOrder({ ...order, status: "open" }, adapter, ungated), null);
   assert.equal(submits, 1);
 });
 

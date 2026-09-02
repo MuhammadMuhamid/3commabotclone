@@ -202,18 +202,26 @@ async function writeShariahMode(
 }
 
 /**
- * Latch a per-sender scope from an AUTHENTICATED order body.
+ * Latch a per-sender scope from an AUTHENTICATED decision.
  *
- * Monotone on purpose: a request body may raise a scope to `enforce`, never
- * lower it back to `off`. The scope latch is a side effect of an order, and an
- * order is not where policy is decided — lowering is reserved for the control
- * channel, which is the only caller that can prove it speaks for the operator.
- * The module comment has always claimed this property; before v4 the webhook
- * path did not actually have it.
+ * It records whatever the decision says, including `off` — but only a decision
+ * that PROVED it came from the Platform ever reaches here. That is the change
+ * v4 makes, and it is where the anti-downgrade guarantee now lives:
+ *
+ *   * an unproven block is dropped before this point (`authenticatedDecision`),
+ *     so the holder of a webhook secret can no longer switch a scope off by
+ *     asserting `mode: "off"` in the body of an order;
+ *   * and the installation floor, which no order body can write at all, wins
+ *     over this row whenever it is stricter.
+ *
+ * Making this function itself refuse to lower would be redundant against those
+ * two, and worse than redundant: it would leave a scope latched to `enforce`
+ * after the Platform had authentically said it is not enforcing, so an order
+ * admitted under `mode: "off"` would then be refused at submission.
  */
 async function recordShariahMode(scope: string, context: ShariahContext): Promise<void> {
-  if (context.mode !== "enforce") return;
-  await writeShariahMode(scope, "enforce", context.policyVersion ?? null);
+  await writeShariahMode(scope, context.mode,
+    context.mode === "enforce" ? context.policyVersion ?? null : null);
 }
 
 /**
@@ -529,6 +537,50 @@ export async function noteSpotExit(scope: string, raw: unknown, opts: {
  * A null context is a pre-Shariah intent, which keeps its original ungated
  * semantics.
  */
+/**
+ * Clearance for a BUY that has NOT yet reached the wire.
+ *
+ * ── The distinction this draws, and why it is the important one ─────────────
+ *
+ * `clearanceForPersistedEntry` re-reads the original decision and deliberately
+ * refuses to re-judge it. That is right for reconciling an order that was
+ * already SENT: the exposure exists, and a status that moved afterwards must
+ * not retroactively invalidate it.
+ *
+ * It is wrong for an intent that never got there. A BUY admitted while nothing
+ * was enforcing carries no decision at all — its stored context is null, which
+ * `clearanceForPersistedEntry` reads as "admitted before this feature existed"
+ * and clears unconditionally. So an intent left in `requested` by a crash could
+ * sit in the reconciliation queue, the operator could then turn Shariah mode
+ * ON, and the 30-second reconciler would place that BUY anyway. The exposure
+ * would be created AFTER enforcement began, which is exactly what enforcement
+ * exists to prevent.
+ *
+ * So a FIRST submission is measured against the mode in force now. An intent
+ * that carries a real `enforce` decision keeps it — that decision is what it
+ * was admitted under, and re-judging it is still refused. An intent that
+ * carries no decision may only reach the wire while nothing is enforcing.
+ *
+ * There is no SELL counterpart, and there must not be: an exit that was
+ * interrupted must always be able to complete.
+ */
+export async function clearanceForFirstSubmission(input: {
+  scope: string;
+  symbol: string;
+  persisted: string | null | undefined;
+}): Promise<ShariahClearance> {
+  const proof = clearanceForPersistedEntry(input.persisted, input.symbol);
+  if (proof.mode === "enforce") return proof;
+  if (await readShariahMode(input.scope) === "enforce") {
+    throw new ShariahEnforcementError(
+      "SHARIAH_CONTEXT_REQUIRED",
+      `${normalizeSymbol(input.symbol)}: this BUY was admitted before this installation ` +
+      "began enforcing Shariah policy and never reached the exchange, so it carries no " +
+      "decision and may not create exposure now");
+  }
+  return proof;
+}
+
 export function clearanceForPersistedEntry(
   persisted: string | null | undefined, symbol: string
 ): ShariahClearance {

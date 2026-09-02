@@ -13,7 +13,8 @@ import {
 } from "./riskControls.js";
 import { calcRealizedPnl } from "./smartTrade.js";
 import {
-  admitSpotEntry, noteSpotExit, readShariahContext, ShariahEnforcementError,
+  admitSpotEntry, clearanceForFirstSubmission, noteSpotExit, readShariahContext,
+  ShariahEnforcementError,
   shariahScopeForManualAccount,
 } from "./shariah.js";
 
@@ -354,8 +355,26 @@ export async function reconcilePendingManualOrders(
   }
 }
 
+const defaultFirstSubmitGate = async (order: ManualOrder): Promise<unknown> => {
+  // BUY only, and the asymmetry is the point: an exit interrupted between its
+  // reservation and the exchange must always be able to finish, whatever this
+  // installation has since decided about the asset.
+  if (order.side !== "BUY") return undefined;
+  return clearanceForFirstSubmission({
+    scope: shariahScopeForManualAccount(order.exchangeAccountId),
+    symbol: order.symbol,
+    persisted: order.shariahContext,
+  });
+};
+
 export async function reconcileOneManualOrder(
-  order: ManualOrder, adapter: ManualExchangeAdapter
+  order: ManualOrder, adapter: ManualExchangeAdapter,
+  /**
+   * The first-submission Shariah check, injectable so a pure lifecycle test
+   * needs no database. It defaults to the real one — a caller that wants no
+   * gate has to ask for it in writing, in this file, where it is visible.
+   */
+  assertMayFirstSubmit: (o: ManualOrder) => Promise<unknown> = defaultFirstSubmitGate
 ): Promise<ManualOrderSnapshot | null> {
   const found = await adapter.query(order.symbol, order.clientOrderId);
   /*
@@ -366,7 +385,16 @@ export async function reconcileOneManualOrder(
    * instead. Only `requested` proves this process has not crossed the shared
    * submission boundary yet.
    */
-  return found ?? (order.status === "requested" ? adapter.submit(intentFromOrder(order)) : null);
+  if (found) return found;
+  if (order.status !== "requested") return null;
+  /*
+   * Same rule as the strategy path: this order has not crossed the submission
+   * boundary, so placing it now is creating exposure now. An order admitted
+   * while nothing was enforcing carries no decision, and an installation that
+   * has since begun enforcing must not have that order land anyway.
+   */
+  await assertMayFirstSubmit(order);
+  return adapter.submit(intentFromOrder(order));
 }
 
 export async function listManualState(symbol?: string): Promise<unknown> {
