@@ -122,6 +122,16 @@ function botPairs(bot: SignalBot): string[] {
   return JSON.parse(bot.pairs) as string[];
 }
 
+/**
+ * F-AUTO-02: true when this bot's configuration permits more than one
+ * concurrently-active entry on the same pair. `maxEntryOrders` is a
+ * per-pair ceiling (`assertCanOpenTrade`); null means unlimited, which is
+ * the most permissive case.
+ */
+function allowsMultipleEntriesPerPair(bot: SignalBot): boolean {
+  return bot.maxEntryOrders == null || bot.maxEntryOrders > 1;
+}
+
 async function assertCanOpenTrade(bot: SignalBot, symbol: string): Promise<void> {
   if (bot.maxActiveSmartTradesEnabled && bot.maxActiveSmartTrades != null) {
     const activeCount = await prisma.smartTrade.count({
@@ -252,6 +262,24 @@ export async function processWebhook(
 
     if (side === "buy") {
       if (!bot.entryEnabled) throw new Error("Entry orders disabled on this bot");
+
+      /*
+       * F-AUTO-02: without a caller `dedupe_key`, `idempotencyScope` falls back
+       * to a per-minute bucket. That bucket cannot tell a genuine second entry
+       * within the same minute apart from a retry of the first — for a bot
+       * whose `maxEntryOrders` permits more than one concurrent position on
+       * this pair, the second signal would silently receive the first's
+       * already-reconciled intent instead of opening its own position. Reject
+       * explicitly before any intent is reserved rather than coalesce them.
+       */
+      if (!body.dedupe_key && allowsMultipleEntriesPerPair(bot)) {
+        throw new Error(
+          `${symbol}: dedupe_key is required for this bot's entry signals — ` +
+          "maxEntryOrders permits more than one concurrent entry on this pair, " +
+          "and without a stable key a second entry in the same minute cannot be " +
+          "told apart from a retry of the first"
+        );
+      }
 
       // BUG-04: Serialize concurrent buys per bot to prevent exceeding maxActiveSmartTrades
       if (botBuyLocks.has(bot.id)) {

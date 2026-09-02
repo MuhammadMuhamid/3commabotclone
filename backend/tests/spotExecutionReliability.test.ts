@@ -230,6 +230,68 @@ test("strategy MARKET wrappers recover an accepted-then-thrown FILLED order by c
   assert.ok(calls.every((call) => typeof call.newClientOrderId === "string"));
 });
 
+// ── F-AUTO-03: a crash between a real TP/SL fill and the local close write ──
+// must not surface as an unrecoverable failure that leaves the trade open and
+// retrying forever against an already-filled order.
+
+test("F-AUTO-03 A: a SELL retried after the wallet is already drained recovers the earlier FILLED order by client id", async () => {
+  const stableId = clientOrderId("tpsl:trade-x:tp");
+  const filled = { orderId: "tpsl-1", clientOrderId: stableId, side: "SELL", status: "FILLED",
+    executedQty: "1", cummulativeQuoteQty: "110" };
+  let orderCalls = 0;
+  const client = {
+    // The wallet already reflects the earlier real fill: free balance is 0,
+    // exactly what a crash-then-retry sees before the local close write ran.
+    accountInfo: async () => ({ balances: [{ asset: "BTC", free: "0", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "LOT_SIZE", stepSize: "0.001", minQty: "0.001" },
+    ] }] }),
+    order: async () => { orderCalls++; throw new Error("must not resubmit"); },
+    getOrder: async ({ origClientOrderId }: { origClientOrderId: string }) =>
+      origClientOrderId === stableId ? filled : undefined,
+  };
+  const recovered = await marketSellBase(client as never, "BTCUSDT", 1,
+    { idempotencyScope: "tpsl:trade-x:tp", dryRun: false });
+  assert.equal(recovered.executedQty, 1);
+  assert.equal(recovered.cummulativeQuoteQty, 110);
+  assert.equal(orderCalls, 0, "the already-drained balance was resolved by query, not a new order");
+});
+
+test("F-AUTO-03 B: a coded duplicate-order rejection recovers the earlier FILLED order instead of failing", async () => {
+  const stableId = clientOrderId("tpsl:trade-y:sl");
+  const filled = { orderId: "tpsl-2", clientOrderId: stableId, side: "SELL", status: "FILLED",
+    executedQty: "1", cummulativeQuoteQty: "108" };
+  const client = {
+    accountInfo: async () => ({ balances: [{ asset: "BTC", free: "1", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "LOT_SIZE", stepSize: "0.001", minQty: "0.001" },
+    ] }] }),
+    order: async () => { throw Object.assign(new Error("Duplicate order sent."), { code: -2010 }); },
+    getOrder: async ({ origClientOrderId }: { origClientOrderId: string }) =>
+      origClientOrderId === stableId ? filled : undefined,
+  };
+  const recovered = await marketSellBase(client as never, "BTCUSDT", 1,
+    { idempotencyScope: "tpsl:trade-y:sl", dryRun: false });
+  assert.equal(recovered.executedQty, 1);
+  assert.equal(recovered.cummulativeQuoteQty, 108);
+});
+
+test("F-AUTO-03 C: a genuine coded rejection that is not a duplicate still fails rather than being papered over", async () => {
+  const client = {
+    accountInfo: async () => ({ balances: [{ asset: "BTC", free: "1", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "LOT_SIZE", stepSize: "0.001", minQty: "0.001" },
+    ] }] }),
+    order: async () => {
+      throw Object.assign(new Error("Account has insufficient balance for requested action."),
+        { code: -2010 });
+    },
+    getOrder: async () => undefined,
+  };
+  await assert.rejects(marketSellBase(client as never, "BTCUSDT", 1,
+    { idempotencyScope: "tpsl:trade-z:tp", dryRun: false }), /insufficient balance/i);
+});
+
 test("durable webhook identity suppresses a successful replay after reconnect", async () => {
   const bot = await prisma.signalBot.create({ data: {
     name: "Dedupe strategy", webhookSecret: "strategy-dedupe-secret",
@@ -926,4 +988,87 @@ test("the global halt blocks both BUY and SELL at the strategy webhook submissio
   assert.equal(await prisma.webhookLog.count({ where: { botId: bot.id, status: "blocked" } }), 3);
   assert.equal(await prisma.webhookReceipt.count(), 0);
   assert.equal((await prisma.smartTrade.findFirstOrThrow({ where: { botId: bot.id } })).status, "active");
+});
+
+// ── F-AUTO-02: multi-entry-capable bots require a stable dedupe_key ─────────
+
+function buyFillClient(calls: { count: number }) {
+  return {
+    accountInfo: async () => ({ balances: [{ asset: "USDT", free: "1000", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "MIN_NOTIONAL", minNotional: "10" },
+    ] }] }),
+    order: async (payload: Record<string, unknown>) => {
+      calls.count++;
+      return { orderId: calls.count, side: "BUY", status: "FILLED", executedQty: "0.5",
+        cummulativeQuoteQty: "50", clientOrderId: payload.newClientOrderId, fills: [] };
+    },
+    prices: async ({ symbol }: { symbol: string }) => ({ [symbol]: "100" }),
+  };
+}
+
+test("F-AUTO-02 A: a multi-entry-capable bot rejects an entry signal missing dedupe_key before any intent exists", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Multi-entry strategy", webhookSecret: "multi-entry-missing-key-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true, maxEntryOrders: 2,
+  } });
+  const calls = { count: 0 };
+  const client = buyFillClient(calls);
+  await assert.rejects(processWebhook({
+    secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT", quote_order_qty: 50,
+  }, { clientFactory: async () => client as never }), /dedupe_key/);
+  assert.equal(calls.count, 0, "no exchange BUY was submitted");
+  assert.equal(await prisma.strategyOrderIntent.count(), 0, "no intent was reserved");
+  assert.equal(await prisma.smartTrade.count(), 0);
+});
+
+test("F-AUTO-02 B: distinct dedupe_key values on a multi-entry bot open distinct entries", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Multi-entry distinct strategy", webhookSecret: "multi-entry-distinct-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true, maxEntryOrders: 2,
+    // per-trade unit: each entry gets its own allowance rather than sharing
+    // one per-Bot ceiling, so two legitimate entries both fit.
+    maxInvestmentUnit: "usdt_trade", maxInvestmentPct: 100,
+  } });
+  const calls = { count: 0 };
+  const client = buyFillClient(calls);
+  const first = await processWebhook({ secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50, dedupe_key: "entry-1" }, { clientFactory: async () => client as never });
+  const second = await processWebhook({ secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50, dedupe_key: "entry-2" }, { clientFactory: async () => client as never });
+  assert.equal(first.status, "ok");
+  assert.equal(second.status, "ok");
+  assert.equal(calls.count, 2, "each distinct entry reached the exchange once");
+  assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id, status: "active" } }), 2);
+});
+
+test("F-AUTO-02 C: an exact retry with the same dedupe_key on a multi-entry bot stays idempotent", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Multi-entry retry strategy", webhookSecret: "multi-entry-retry-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true, maxEntryOrders: 2,
+  } });
+  const calls = { count: 0 };
+  const client = buyFillClient(calls);
+  const body = { secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50, dedupe_key: "same-entry" };
+  const first = await processWebhook(body, { clientFactory: async () => client as never });
+  const retry = await processWebhook(body, { clientFactory: async () => client as never });
+  assert.equal(first.status, "ok");
+  assert.equal(retry.status, "ignored_duplicate");
+  assert.equal(calls.count, 1, "the retry never reached the exchange a second time");
+  assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id } }), 1);
+});
+
+test("F-AUTO-02 D: a single-entry bot's no-key fallback still opens its one allowed entry unchanged", async () => {
+  const bot = await prisma.signalBot.create({ data: {
+    name: "Single-entry strategy", webhookSecret: "single-entry-no-key-secret",
+    pairs: JSON.stringify(["BTCUSDT"]), entryEnabled: true, maxEntryOrders: 1,
+  } });
+  const calls = { count: 0 };
+  const client = buyFillClient(calls);
+  const result = await processWebhook({ secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT",
+    quote_order_qty: 50 }, { clientFactory: async () => client as never });
+  assert.equal(result.status, "ok", "a single-entry bot is not required to supply dedupe_key");
+  assert.equal(calls.count, 1);
+  assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id, status: "active" } }), 1);
 });

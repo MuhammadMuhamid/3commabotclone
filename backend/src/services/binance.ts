@@ -367,10 +367,30 @@ export async function marketSellBase(
     };
   }
 
-  const qty = await resolveSellQuantity(client, sym, quantity);
-
   const stableClientOrderId = opts.explicitClientOrderId ??
     (opts.idempotencyScope ? clientOrderId(opts.idempotencyScope) : undefined);
+
+  /*
+   * F-AUTO-03: a crash between this call returning FILLED and the caller's
+   * local close write leaves the position looking still-open here. A retry
+   * under the SAME stable client id then finds the wallet already drained by
+   * the real fill — `resolveSellQuantity` reads live balance, not local state
+   * — and would normally throw "below minimum" before ever reaching the
+   * exchange. That is exactly the ambiguity a query by the deterministic
+   * client id resolves: if Binance already filled this exact order, use that
+   * authoritative result instead of a local balance check that cannot see it.
+   */
+  let qty: number;
+  try {
+    qty = await resolveSellQuantity(client, sym, quantity);
+  } catch (err) {
+    if (stableClientOrderId) {
+      const recovered = await queryFilledMarketOrder(client, sym, "SELL", stableClientOrderId);
+      if (recovered) return recovered;
+    }
+    throw err;
+  }
+
   let order;
   try {
     order = await client.order({
@@ -381,7 +401,16 @@ export async function marketSellBase(
       ...(stableClientOrderId ? { newClientOrderId: stableClientOrderId } : {}),
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
-    if ((err as { code?: unknown }).code === undefined && stableClientOrderId) {
+    // The uncoded case is a transport failure of unknown outcome. A coded
+    // "duplicate order" rejection is just as ambiguous in the way that
+    // matters here: Binance already has an order under this exact client id,
+    // which is precisely the already-filled-elsewhere case this recovers.
+    // Any OTHER coded rejection (bad balance, filter failure, ...) is a real,
+    // first-attempt rejection, and a query for it will correctly find nothing.
+    const e = err as { code?: unknown; message?: unknown };
+    const ambiguous = e.code === undefined ||
+      (typeof e.message === "string" && /duplicate/i.test(e.message));
+    if (ambiguous && stableClientOrderId) {
       const recovered = await queryFilledMarketOrder(client, sym, "SELL", stableClientOrderId);
       if (recovered) return recovered;
     }
