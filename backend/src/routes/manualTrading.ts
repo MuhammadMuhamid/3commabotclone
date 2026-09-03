@@ -1,7 +1,7 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import { asyncHandler } from "../middleware/errors.js";
-import { requireManualAuth } from "../services/manualAuth.js";
+import { requireManualAuth, requireManualTradingFeature } from "../services/manualAuth.js";
 import {
   cancelManualOrder, listManualState, ManualTradingError,
   runIdempotentManualCommand, submitManualOrder, updateManualProtection,
@@ -15,6 +15,19 @@ import {
 import { SHARIAH_POLICY_VERSION } from "../contract/webhookContract.js";
 
 export const manualTradingRouter = Router();
+/*
+ * Two separate questions, asked in this order:
+ *
+ *   1. is the manual-ORDER feature available?  — everything except the Shariah
+ *      floor control plane, 404 when MANUAL_TRADING_ENABLED is false, exactly
+ *      as before;
+ *   2. did the Platform prove it sent this?    — everything, without exception,
+ *      including the control plane.
+ *
+ * Conflating them is BOT-P1-4: the enforcement floor is policy, not a manual
+ * order, and disabling manual trading must not disarm it. See `manualAuth.ts`.
+ */
+manualTradingRouter.use(requireManualTradingFeature);
 manualTradingRouter.use(requireManualAuth);
 
 const positive = z.number().finite().positive();
@@ -115,6 +128,14 @@ manualTradingRouter.post("/execution-evidence/manual-orders/lookup", asyncHandle
  * policy may only be set by a caller that can prove it speaks for the operator
  * — the same HMAC that already authorises a real order. A webhook body cannot
  * reach this route, and cannot lower the floor by any other means.
+ *
+ * It is deliberately NOT behind `requireManualTradingFeature`. Whether this
+ * installation submits manual orders says nothing about whether it enforces
+ * Shariah screening, and the operators most likely to run with manual trading
+ * off are exactly the ones running purely on direct webhooks — the traffic the
+ * floor governs. Reaching this route still requires the signature; it does not
+ * make a single order endpoint available, and `assertManualAccountGate` refuses
+ * every order path independently anyway.
  *
  * It carries no asset, no symbol and no classification: this receiver holds no
  * registry, and nothing here screens anything.

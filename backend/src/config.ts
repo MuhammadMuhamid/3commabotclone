@@ -33,6 +33,18 @@ export function isPublishedPlaceholder(value: string): boolean {
 }
 
 /**
+ * Whether the Platform -> Bot control key is real enough to authenticate with.
+ *
+ * Deliberately independent of `manualTradingEnabled`: the Shariah
+ * installation-floor control plane runs on this key, and it must never fall
+ * back to computing an HMAC with `""` — that would make the enforcement floor
+ * settable by anyone who guessed the key is unset.
+ */
+export function isUsableManualControlSecret(value: string): boolean {
+  return value.length >= 32 && !isPublishedPlaceholder(value);
+}
+
+/**
  * The REQUIRED salt form: exactly 32 hex characters, i.e. `openssl rand -hex 16`.
  */
 export const SCRYPT_SALT_RE = /^[0-9a-fA-F]{32}$/;
@@ -146,10 +158,28 @@ export function collectConfigErrors(): string[] {
     errors.push("SETUP_TOKEN is a value published in this repository — generate a real one");
   }
 
-  if (config.manualTradingEnabled && config.manualTradingHmacSecret.length < 32) {
-    errors.push("MANUAL_TRADING_HMAC_SECRET must be at least 32 characters when manual trading is enabled");
-  } else if (config.manualTradingEnabled && isPublishedPlaceholder(config.manualTradingHmacSecret)) {
+  /*
+   * MANUAL_TRADING_HMAC_SECRET is the Platform -> Bot CONTROL-PLANE key, not a
+   * manual-trading key. It authenticates two independent things: manual order
+   * submission, and the Shariah installation floor (`PUT
+   * /api/manual-trading/shariah-enforcement`, plus the detached evidence on the
+   * direct webhook path). The floor is armed whether or not manual trading is
+   * enabled, so a MALFORMED key is a startup failure regardless of
+   * MANUAL_TRADING_ENABLED — it used to be checked only when manual trading was
+   * on, which left the control plane holding an unvalidated key.
+   *
+   * Presence stays required only for manual trading. An installation that
+   * neither trades manually nor arms the floor does not need a key, and the
+   * control route refuses the operation outright rather than authenticating
+   * with a missing one — see `requireManualAuth`.
+   */
+  if (config.manualTradingHmacSecret.length > 0 && config.manualTradingHmacSecret.length < 32) {
+    errors.push("MANUAL_TRADING_HMAC_SECRET must be at least 32 characters  ->  openssl rand -hex 32");
+  } else if (config.manualTradingHmacSecret.length >= 32
+             && isPublishedPlaceholder(config.manualTradingHmacSecret)) {
     errors.push("MANUAL_TRADING_HMAC_SECRET is a published placeholder value — generate a real one");
+  } else if (config.manualTradingEnabled && config.manualTradingHmacSecret.length === 0) {
+    errors.push("MANUAL_TRADING_HMAC_SECRET must be set when manual trading is enabled");
   }
 
   if (config.realizationDeliveryEnabled && config.realizationHmacSecret.length < 32) {

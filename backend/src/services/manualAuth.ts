@@ -1,6 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
-import { config } from "../config.js";
+import { config, isUsableManualControlSecret } from "../config.js";
 import { prisma } from "../lib/prisma.js";
 
 export const MANUAL_AUTH_FRESHNESS_MS = 60_000;
@@ -99,10 +99,57 @@ export async function reserveManualNonce(
   }
 }
 
+/**
+ * Paths on this router that are CONTROL PLANE, not manual trading.
+ *
+ * The Shariah installation floor is set by the Platform over this same
+ * authenticated channel, and arming it is not a manual order. Before BOT-P1-4
+ * the whole router was gated on MANUAL_TRADING_ENABLED, so an operator who had
+ * deliberately disabled manual trading — the safe, recommended posture — could
+ * not arm the floor at all: the Platform's push 404'd, the floor stayed `off`,
+ * and every DIRECT webhook BUY kept being admitted with no Shariah evidence.
+ * Manual trading being off must not disarm Shariah enforcement.
+ *
+ * These paths are exempt from the manual-ORDER feature flag, and from that
+ * flag only. They are authenticated by exactly the same HMAC, over exactly the
+ * same canonical request, with the same freshness window and the same
+ * single-use nonce as a real order.
+ */
+const CONTROL_PLANE_PATHS = new Set(["/shariah-enforcement"]);
+
+export function isManualControlPlanePath(path: string): boolean {
+  return CONTROL_PLANE_PATHS.has(path.replace(/\/+$/, "") || "/");
+}
+
+/**
+ * The manual-ORDER feature flag.
+ *
+ * Applies to order submission, cancellation, protection edits and the readings
+ * that serve them — never to the control plane above. Registered BEFORE
+ * `requireManualAuth` so a disabled installation answers exactly as it always
+ * did (404, before any signature is examined) for everything that is genuinely
+ * manual trading.
+ */
+export function requireManualTradingFeature(req: Request, res: Response, next: NextFunction): void {
+  if (!config.manualTradingEnabled && !isManualControlPlanePath(req.path)) {
+    res.status(404).json({ error: "manual trading is disabled" });
+    return;
+  }
+  next();
+}
+
 /** Distinct HMAC auth for the platform service; browser sessions are not accepted here. */
 export async function requireManualAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
-  if (!config.manualTradingEnabled) {
-    res.status(404).json({ error: "manual trading is disabled" });
+  /*
+   * Never authenticate against a key that is absent or is one of this
+   * repository's published placeholders. `createHmac("sha256", "")` is a
+   * perfectly valid MAC that anyone who guessed the key is unset can compute,
+   * so falling through to it would make the enforcement floor settable by the
+   * internet. Refusing outright is also what makes the Platform report a
+   * failure instead of believing the floor was armed.
+   */
+  if (!isUsableManualControlSecret(config.manualTradingHmacSecret)) {
+    res.status(503).json({ error: "manual control secret is not configured" });
     return;
   }
   const result = verifyManualRequest({
