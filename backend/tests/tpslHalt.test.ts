@@ -62,15 +62,19 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
   // the attempt settles in the same transaction that books the fill.
   const attempts = delegate(prisma.exchangeOrderAttempt);
   const client = prisma as unknown as { $transaction: unknown };
+  // BOT-P1-5: the row now also carries who owns the attempt, so close admission
+  // and restart recovery can find it by position rather than by parsing a key.
   const attemptRows: { id: string; intentKey: string; attempt: number;
-    clientOrderId: string; status: string }[] = [];
+    clientOrderId: string; status: string; side?: string; smartTradeId?: string | null;
+    origin?: string | null; closedReason?: string | null; submittedAt?: Date | null;
+    exchangeStatus?: string | null; requestedBaseQty?: number | null }[] = [];
   const originals = {
     findMany: smartTrade.findMany, findUnique: smartTrade.findUnique, update: smartTrade.update,
     riskFindUnique: riskControl.findUnique,
     partialFindMany: partialClose.findMany,
     pairUpsert: pairCloseMark.upsert,
     attemptFindFirst: attempts.findFirst, attemptCreate: attempts.create,
-    attemptUpdateMany: attempts.updateMany,
+    attemptUpdateMany: attempts.updateMany, attemptFindMany: attempts.findMany,
     transaction: client.$transaction,
   };
 
@@ -105,18 +109,34 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
       (!where?.status || row.status === where.status));
     return matches.sort((a, b) => b.attempt - a.attempt)[0] ?? null;
   };
+  // BOT-P1-5: close admission looks an attempt up by the position that owns it.
+  attempts.findMany = async (arg: unknown) => {
+    const { where } = (arg ?? {}) as
+      { where?: { smartTradeId?: string; side?: string; status?: string } };
+    return attemptRows.filter((row) =>
+      (!where?.smartTradeId || row.smartTradeId === where.smartTradeId) &&
+      (!where?.side || row.side === where.side) &&
+      (!where?.status || row.status === where.status));
+  };
   attempts.create = async (arg: unknown) => {
     const { data } = arg as { data: { intentKey: string; attempt: number; clientOrderId: string } };
-    const row = { id: `attempt-${attemptRows.length + 1}`, status: "open", ...data };
+    const row = { id: `attempt-${attemptRows.length + 1}`, status: "open",
+      submittedAt: null, exchangeStatus: null, ...data };
     attemptRows.push(row);
     return row;
   };
   attempts.updateMany = async (arg: unknown) => {
-    const { where, data } = arg as
-      { where: { id: string; status: string }; data: { status: string } };
-    const row = attemptRows.find((r) => r.id === where.id && r.status === where.status);
+    // Two shapes reach this: the settle/abandon compare-and-set on `status`, and
+    // the pre-submission mark, which is a compare-and-set on a null `submittedAt`.
+    const { where, data } = arg as {
+      where: { id: string; status?: string; submittedAt?: null };
+      data: Record<string, unknown>;
+    };
+    const row = attemptRows.find((r) => r.id === where.id
+      && (where.status === undefined || r.status === where.status)
+      && (where.submittedAt === undefined || r.submittedAt == null));
     if (!row) return { count: 0 };
-    row.status = data.status;
+    Object.assign(row, data);
     return { count: 1 };
   };
   client.$transaction = async (fn: (tx: unknown) => Promise<unknown>) => fn(prisma);
@@ -135,6 +155,7 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
       attempts.findFirst = originals.attemptFindFirst;
       attempts.create = originals.attemptCreate;
       attempts.updateMany = originals.attemptUpdateMany;
+      attempts.findMany = originals.attemptFindMany;
       client.$transaction = originals.transaction;
     },
   };

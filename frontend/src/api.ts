@@ -308,8 +308,15 @@ export const api = {
     close:  (id: string) => request(`/api/trades/${id}/close`, { method: "POST" }),
     remove: (id: string) => request<void>(`/api/trades/${id}`, { method: "DELETE" }),
     // F4: sell a percentage of an active trade
+    // BOT-P1-6: `executedQty` is what actually sold and `requestedQty` what was
+    // asked for. They differ on a partial or zero fill, and `partial` is null
+    // when nothing executed — there is no PartialClose row for a sale that did
+    // not happen.
     partialClose: (id: string, pct: number) =>
-      request<{ partial: PartialClose; trade: SmartTrade }>(
+      request<{
+        partial: PartialClose | null; trade: SmartTrade;
+        requestedQty: number; executedQty: number; detail?: string;
+      }>(
         `/api/trades/${id}/partial-close`,
         { method: "POST", body: JSON.stringify({ pct }) }
       ),

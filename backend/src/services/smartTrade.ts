@@ -1,15 +1,16 @@
+import { config } from "../config.js";
 import { prisma } from "../lib/prisma.js";
 import type { BinanceClient } from "./binance.js";
 import { getTickerPrice, marketSellBase, clientFromAccount, clientFromEnv } from "./binance.js";
 import { getBotRiskLimits } from "./riskControls.js";
-import { recordPairClose } from "../lib/tradeCloseTracker.js";
 import {
   acquireTradeClose,
   isTradeClosing as isTradeClosingNow,
   releaseTradeClose,
 } from "../lib/tradeCloseLock.js";
 import { sendExecutionNotification } from "./push.js";
-import { openOrderAttempt, settleOrderAttempt } from "./orderAttempt.js";
+import { markOrderAttemptSubmitted, openOrderAttempt } from "./orderAttempt.js";
+import { applyExitFill, exitAttemptProbe, resolveUnresolvedExitAttempts } from "./exitSettlement.js";
 import { mapWithConcurrency } from "../lib/scheduler.js";
 
 /**
@@ -268,8 +269,30 @@ export async function checkTakeProfitStopLoss(
        */
       if ((await getBotRiskLimits()).tradingHalted) continue;
 
-      // Fetch prior partial closes so their P&L is included in the final total
-      const partials = await prisma.partialClose.findMany({ where: { tradeId: trade.id } });
+      /*
+       * BOT-P1-5: a durable attempt from an earlier cycle that never settled
+       * locally may already be live at Binance. The in-process close lock says
+       * nothing about it after a restart, so ask the exchange about that exact
+       * client order id BEFORE opening a new attempt: a fill is booked through
+       * the shared settlement authority, an order proved dead or never sent is
+       * released so this cycle can re-arm, and anything still live or unreadable
+       * keeps this position untouched for now.
+       */
+      const resolution = await resolveUnresolvedExitAttempts(
+        trade.id, exitAttemptProbe(client, config.dryRun));
+      if (resolution.blocked) {
+        console.error(`[tpsl] ${trade.pair}: ${trade.id} left alone — ${resolution.reason}`);
+        continue;
+      }
+      if (resolution.reconciled > 0) {
+        // The recovered fill moved the ledger. Re-evaluate on the next cycle's
+        // fresh P&L rather than selling against a trigger computed before it.
+        console.error(
+          `[tpsl] ${trade.pair}: ${trade.id} had an unsettled exit that the exchange had ` +
+          "already filled; it has been reconciled and no second SELL was sent"
+        );
+        continue;
+      }
 
       /*
        * BOT-018: sell what the trade holds NOW.
@@ -302,69 +325,49 @@ export async function checkTakeProfitStopLoss(
         intentKey: `tpsl:${trade.id}:${hitTp ? "tp" : "sl"}`,
         symbol: trade.pair,
         side: "SELL",
+        smartTradeId: trade.id,
+        origin: "tpsl",
+        requestedBaseQty: fresh.quantity,
+        closedReason: hitTp ? "take_profit" : "stop_loss",
       });
+      // Before the wire call, never after.
+      await markOrderAttemptSubmitted(attempt.id, fresh.quantity);
 
       const sellResult = await marketSellBase(client, trade.pair, fresh.quantity, {
         explicitClientOrderId: attempt.clientOrderId,
       });
-      const { pnlUsdt, pnlPct } = calcFinalClosePnl(
-        sellResult.cummulativeQuoteQty,
-        fresh.quoteSpent,
-        partials
-      );
 
-      // BOT-006: a close that did not cover the position leaves the trade OPEN
-      // rather than marking it closed with the remainder stranded.
-      if (sellResult.executedQty < fresh.quantity * 0.999) {
-        const remaining = fresh.quantity - sellResult.executedQty;
-        // Settling in the same transaction that books the shortfall is what
-        // makes this fill count exactly once — and is what frees the slot so
-        // the next cycle's sell is a NEW attempt with its own client order id.
-        const applied = await prisma.$transaction(async (tx) => {
-          if (!(await settleOrderAttempt(tx, attempt.id, String(sellResult.orderId)))) return false;
-          await tx.smartTrade.update({
-            where: { id: trade.id },
-            data: {
-              quantity: Math.max(0, remaining),
-              quoteSpent: Math.max(0, fresh.quoteSpent * (remaining / fresh.quantity)),
-              currentPrice: sellResult.avgPrice,
-            },
-          });
-          return true;
-        });
-        if (applied) {
+      /*
+       * BOT-P1-6: one settlement authority, shared with the dashboard partial
+       * close and with restart recovery, and it accounts for the quantity that
+       * ACTUALLY executed. A close that did not cover the position leaves the
+       * trade OPEN with the unsold remainder intact (BOT-006), a zero fill
+       * changes nothing at all, and the compare-and-set inside the transaction
+       * is what makes each fill count exactly once — which is also what frees
+       * the slot so the next cycle's sell is a NEW attempt with its own id.
+       */
+      const applied = await applyExitFill(attempt, sellResult);
+      // A fill already booked by another recovery of this same attempt must not
+      // close the trade, record a pair close or notify a second time.
+      if (!applied) continue;
+      if (!applied.closed) {
+        if (applied.executedQty > 0) {
           console.error(
-            `[tpsl] ${trade.pair}: close filled ${sellResult.executedQty} of ${fresh.quantity}; ` +
-            `trade ${trade.id} remains OPEN with ${remaining} outstanding`
+            `[tpsl] ${trade.pair}: close filled ${applied.executedQty} of ${fresh.quantity}; ` +
+            `trade ${trade.id} remains OPEN with ${applied.trade.quantity} outstanding`
+          );
+        } else {
+          console.error(
+            `[tpsl] ${trade.pair}: close filled nothing of ${fresh.quantity} ` +
+            `(${sellResult.exchangeStatus ?? "no fill"}); trade ${trade.id} is unchanged`
           );
         }
         continue;
       }
-
-      const applied = await prisma.$transaction(async (tx) => {
-        if (!(await settleOrderAttempt(tx, attempt.id, String(sellResult.orderId)))) return false;
-        await tx.smartTrade.update({
-          where: { id: trade.id },
-          data: {
-            status: "closed",
-            closedAt: new Date(),
-            closedReason: hitTp ? "take_profit" : "stop_loss",
-            currentPrice: sellResult.avgPrice,
-            pnlUsdt,
-            pnlPct,
-          },
-        });
-        return true;
-      });
-      // A fill already booked by another recovery of this same attempt must not
-      // close the trade, record a pair close or notify a second time.
-      if (!applied) continue;
-      // Record close so stale SELL webhooks don't close the next trade on this pair
-      if (trade.botId) await recordPairClose(trade.botId, trade.pair);
       void sendExecutionNotification({
-        side: "sell", symbol: trade.pair, quantity: sellResult.executedQty,
+        side: "sell", symbol: trade.pair, quantity: applied.executedQty,
         quoteAmount: sellResult.cummulativeQuoteQty, price: sellResult.avgPrice,
-        orderId: sellResult.orderId, pnlPct,
+        orderId: sellResult.orderId, pnlPct: applied.pnlPct,
       }).catch((e) => console.error("TP/SL notification failed", e));
     } catch (e) {
       console.error("TP/SL close failed", trade.id, e);

@@ -246,8 +246,17 @@ function PartialCloseModal({
     if (!confirm(`Sell ${pct}% of your ${pair} position at market price?`)) return;
     setBusy(true);
     try {
-      await api.trades.partialClose(trade.id, pct);
-      toast(`Partial close (${pct}%) executed`, "success");
+      const result = await api.trades.partialClose(trade.id, pct);
+      // BOT-P1-6: report what the exchange actually filled, not what was asked
+      // for. A zero fill sold nothing and must never be announced as executed.
+      if (result.executedQty > 0) {
+        toast(
+          `Partial close (${pct}%): sold ${result.executedQty} of ${result.requestedQty} ${base}`,
+          result.executedQty >= result.requestedQty ? "success" : "info"
+        );
+      } else {
+        toast(result.detail ?? `Partial close (${pct}%) filled nothing; position unchanged`, "error");
+      }
       onDone();
     } catch (e) {
       toast(e instanceof Error ? e.message : "Partial close failed", "error");

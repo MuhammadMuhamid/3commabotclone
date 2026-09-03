@@ -1,7 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { calcRealizedPnl, calcFinalClosePnl } from "../services/smartTrade.js";
 import { acquireTradeClose, isTradeClosing, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import {
   marketSellBase, resolveSellQuantity, clientFromAccount, clientFromEnv,
@@ -9,9 +8,22 @@ import {
 } from "../services/binance.js";
 import type { ExchangeAccount } from "@prisma/client";
 import { sendExecutionNotification } from "../services/push.js";
-import { openOrderAttempt, settleOrderAttempt } from "../services/orderAttempt.js";
+import { markOrderAttemptSubmitted, openOrderAttempt } from "../services/orderAttempt.js";
+import { applyExitFill, exitAttemptProbe, resolveUnresolvedExitAttempts } from "../services/exitSettlement.js";
+import { config } from "../config.js";
 
 export const tradesRouter = Router();
+
+/** The shape the dashboard expects a trade in, after a close changed it. */
+function tradeWithDetail(tradeId: string) {
+  return prisma.smartTrade.findUnique({
+    where: { id: tradeId },
+    include: {
+      bot: { select: { id: true, name: true, exchangeAccount: { select: { name: true } } } },
+      partialCloses: { orderBy: { createdAt: "asc" } },
+    },
+  });
+}
 
 /**
  * How this router obtains an exchange client.
@@ -155,8 +167,34 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
       return res.status(503).json({ error: "No Binance credentials configured." });
     }
 
+    /*
+     * BOT-P1-5: a durable exit attempt left unresolved by a crash is the only
+     * surviving evidence that a SELL may already be live at Binance — the
+     * in-process close lock does not survive a restart. Resolving it here, from
+     * current exchange evidence, is what stops this scale-out landing on top of
+     * a TP, SL or earlier partial that was never settled locally.
+     */
+    const resolution = await resolveUnresolvedExitAttempts(
+      trade.id, exitAttemptProbe(client, config.dryRun));
+    if (resolution.blocked) {
+      return res.status(409).json({
+        error: `${trade.pair}: a prior exit has unresolved exchange state — ${resolution.reason}`,
+      });
+    }
+    // A recovered fill has already moved the ledger, so this exit has to be
+    // sized off the position as it stands NOW, never off the stale read above.
+    const current = resolution.reconciled > 0
+      ? await prisma.smartTrade.findUnique({ where: { id: trade.id } })
+      : trade;
+    if (!current || current.status !== "active") {
+      return res.status(409).json({
+        error: "A prior exit was already filled at the exchange and has now been reconciled; " +
+          "it closed this position. No second order was placed.",
+      });
+    }
+
     // Calculate the precise quantity for this percentage
-    const requestedQty = trade.quantity * (pct / 100);
+    const requestedQty = current.quantity * (pct / 100);
     const sellQty = await resolveSellQuantity(client, trade.pair, requestedQty);
 
     /*
@@ -173,97 +211,70 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
      * THIS exit finds the same open attempt and keeps its id, so query-first
      * recovery still works; a genuinely new exit can only be opened once this
      * one has settled, and therefore carries a different id.
+     *
+     * BOT-P1-5: it now also carries WHOSE exit it is, so close admission and
+     * restart recovery can find it at all.
      */
     const attempt = await openOrderAttempt({
       intentKey: `partial:${trade.id}:${pct}`, symbol: trade.pair, side: "SELL",
+      smartTradeId: trade.id, origin: "partial", sellPercent: pct,
+      requestedBaseQty: sellQty, closedReason: "partial_close",
     });
+    // Before the wire call, never after: a null `submittedAt` is what proves to
+    // a later recovery that no order was ever sent under this id.
+    await markOrderAttemptSubmitted(attempt.id, sellQty);
 
     const orderResult = await marketSellBase(client, trade.pair, sellQty, {
       explicitClientOrderId: attempt.clientOrderId,
     });
 
-    // Proportional cost of the slice being sold
-    const proportionalCost = trade.quoteSpent * (sellQty / trade.quantity);
-    const { pnlUsdt, pnlPct } = calcRealizedPnl(
-      orderResult.cummulativeQuoteQty,
-      proportionalCost
-    );
-
-    const newQuantity   = trade.quantity   - sellQty;
-    const newQuoteSpent = trade.quoteSpent - proportionalCost;
-
-    // If this partial wipes out the position, compute the true total P&L
-    // by summing all prior partial close P&Ls with this final leg.
-    let closePnl = { pnlUsdt, pnlPct };
-    if (newQuantity <= 0.000001) {
-      const prevPartials = await prisma.partialClose.findMany({ where: { tradeId: trade.id } });
-      closePnl = calcFinalClosePnl(
-        orderResult.cummulativeQuoteQty,
-        trade.quoteSpent,   // quoteSpent before this partial (proportional remaining cost)
-        prevPartials
-      );
-    }
-
     /*
-     * Record the partial close and update the parent trade atomically — and
-     * settle the attempt in the SAME transaction.
+     * BOT-P1-6: the ACTUAL executed quantity is the accounting authority.
      *
-     * BOT-P1-1: that compare-and-set is the exactly-once key. A crash between
-     * the exchange fill and this write leaves the attempt open, so the next
-     * request reuses its client order id and recovers the SAME fill; settling
-     * here is what guarantees that fill reduces the position and books P&L
-     * once, no matter how many callers recover it.
+     * This used to spend `sellQty` — the REQUESTED slice — on the proportional
+     * cost basis, on the reduced position quantity and on `PartialClose.quantity`,
+     * while taking revenue from the real fill. A partial fill therefore removed
+     * base asset from the local position that was never sold, and a zero fill
+     * wrote a `PartialClose` row for a sale that did not happen. The remaining
+     * exposure was wrong from that moment on.
+     *
+     * `applyExitFill` is the single settlement authority shared with the TP/SL
+     * monitor and with restart recovery, so the same fill produces the same
+     * final state whichever path discovers it — and the compare-and-set that
+     * settles the attempt inside its transaction is what makes it exactly once.
      */
-    const applied = await prisma.$transaction(async (tx) => {
-      if (!(await settleOrderAttempt(tx, attempt.id, String(orderResult.orderId)))) return null;
-      const partial = await tx.partialClose.create({
-        data: {
-          tradeId: trade.id,
-          pct,
-          quantity: sellQty,
-          revenue: orderResult.cummulativeQuoteQty,
-          pnlUsdt,
-          avgPrice: orderResult.avgPrice,
-          exchangeOrderId: String(orderResult.orderId),
-        },
-      });
-      const updatedTrade = await tx.smartTrade.update({
-        where: { id: trade.id },
-        data: {
-          quantity:   newQuantity,
-          quoteSpent: newQuoteSpent,
-          // If the remaining quantity is negligible, mark the trade as closed
-          ...(newQuantity <= 0.000001
-            ? {
-                status: "closed",
-                closedAt: new Date(),
-                closedReason: "partial_close",
-                pnlUsdt: closePnl.pnlUsdt,
-                pnlPct:  closePnl.pnlPct,
-              }
-            : {}),
-        },
-        include: {
-          bot: { select: { id: true, name: true, exchangeAccount: { select: { name: true } } } },
-          partialCloses: { orderBy: { createdAt: "asc" } },
-        },
-      });
-      return { partial, updatedTrade };
-    });
+    const applied = await applyExitFill(attempt, orderResult);
     if (!applied) {
       return res.status(409).json({
         error: "This partial exit has already been recorded; no second sale was made.",
       });
     }
-    const { partial, updatedTrade } = applied;
+    if (applied.executedQty <= 0) {
+      // Nothing was sold, so nothing was booked. Truthful beats tidy.
+      return res.status(200).json({
+        partial: null,
+        trade: await tradeWithDetail(trade.id),
+        requestedQty: sellQty,
+        executedQty: 0,
+        detail: `${trade.pair}: the exchange filled none of the requested ${sellQty}; ` +
+          `the position is unchanged (${orderResult.exchangeStatus ?? "no fill"}).`,
+      });
+    }
+    const partial = applied.partial;
+    const updatedTrade = await tradeWithDetail(trade.id);
 
     void sendExecutionNotification({
       side: "sell", symbol: trade.pair, quantity: orderResult.executedQty,
       quoteAmount: orderResult.cummulativeQuoteQty, price: orderResult.avgPrice,
-      orderId: orderResult.orderId, pnlPct,
+      orderId: orderResult.orderId, pnlPct: applied.pnlPct,
     }).catch((e) => console.error("Partial-close notification failed", e));
 
-    res.json({ partial, trade: updatedTrade });
+    // Requested and executed stay distinguishable on the wire: `partial.quantity`
+    // is what actually sold, `requestedQty` is what was asked for.
+    res.json({
+      partial, trade: updatedTrade,
+      requestedQty: sellQty, executedQty: applied.executedQty,
+    });
     } finally {
       // A leaked lock makes the trade permanently uncloseable, which is worse
       // than the double sell it prevents.

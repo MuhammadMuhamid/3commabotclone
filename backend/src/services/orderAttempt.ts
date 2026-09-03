@@ -32,7 +32,34 @@ export interface OpenAttemptInput {
   intentKey: string;
   symbol: string;
   side: "BUY" | "SELL";
+  /**
+   * BOT-P1-5: the position this exit belongs to, and which authority owns it.
+   *
+   * `intentKey` names the trade, but only inside a string — it is not a query.
+   * Close admission had no way to ask "does this position hold an exit that may
+   * already have reached the exchange?", so after a restart, with the
+   * in-process close lock gone, a durable TP/SL/partial-close attempt was
+   * invisible to it and a second overlapping SELL could be sent.
+   */
+  smartTradeId?: string;
+  origin?: ExitAttemptOrigin;
+  /** Requested base quantity. Intent only — it is never accounting evidence. */
+  requestedBaseQty?: number;
+  /** Partial-close percentage, so a recovery can write the `PartialClose` row. */
+  sellPercent?: number;
+  /** What to stamp on the trade if this exit ends up covering the position. */
+  closedReason?: string;
 }
+
+/**
+ * Which exit authority owns an attempt.
+ *
+ * Recovery dispatches on this: `tpsl` and `partial` settle through the shared
+ * position-accounting authority in `exitSettlement.ts`, while
+ * `manual-protection` is booked by the manual `ManualOrder` lifecycle and must
+ * never be applied twice by a second resolver.
+ */
+export type ExitAttemptOrigin = "tpsl" | "partial" | "manual-protection";
 
 /**
  * The attempt that currently owns `intentKey`, creating the next one when the
@@ -62,6 +89,11 @@ export async function openOrderAttempt(input: OpenAttemptInput): Promise<Exchang
         clientOrderId: clientOrderId(`${input.intentKey}#${attempt}`),
         symbol: input.symbol,
         side: input.side,
+        smartTradeId: input.smartTradeId,
+        origin: input.origin,
+        requestedBaseQty: input.requestedBaseQty,
+        sellPercent: input.sellPercent,
+        closedReason: input.closedReason,
       }});
     } catch (error) {
       if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") {
@@ -110,4 +142,60 @@ export async function settleOrderAttempt(
     data: { status: "settled", settledAt: new Date(), ...(exchangeOrderId ? { exchangeOrderId } : {}) },
   });
   return settled.count === 1;
+}
+
+/**
+ * Record that this attempt is about to cross the submission boundary.
+ *
+ * Called immediately BEFORE the exchange request, never after. That ordering is
+ * the whole value: an attempt still carrying a null `submittedAt` durably
+ * proves no order was ever sent under its client order id, which is what lets
+ * recovery read `-2013` as real absence without waiting out the uncertainty
+ * window. It is the same distinction `StrategyOrderIntent` draws between
+ * `requested` and `submitted`.
+ *
+ * Idempotent: a retry of the SAME logical order keeps the first submission's
+ * timestamp, because the uncertainty window belongs to the earliest moment an
+ * order could have reached the exchange, not the latest.
+ */
+export async function markOrderAttemptSubmitted(
+  attemptId: string,
+  requestedBaseQty?: number
+): Promise<void> {
+  await prisma.exchangeOrderAttempt.updateMany({
+    where: { id: attemptId, submittedAt: null },
+    data: { submittedAt: new Date(), ...(requestedBaseQty != null ? { requestedBaseQty } : {}) },
+  });
+}
+
+/**
+ * End an attempt that the exchange proved moved no base asset.
+ *
+ * Distinct from `settleOrderAttempt` on purpose: `settled` means "this fill was
+ * applied", and nothing was applied here. Both free the slot — `openOrderAttempt`
+ * only ever adopts a row whose status is `open` — so a later legitimate exit can
+ * still be placed for whatever exposure remains.
+ */
+export async function abandonOrderAttempt(
+  attemptId: string,
+  exchangeStatus: string
+): Promise<boolean> {
+  const closed = await prisma.exchangeOrderAttempt.updateMany({
+    // Compare-and-set on `open`, so a concurrent resolver that already applied a
+    // fill always wins and this call abandons nothing.
+    where: { id: attemptId, status: "open" },
+    data: { status: "abandoned", settledAt: new Date(), exchangeStatus },
+  });
+  return closed.count === 1;
+}
+
+/** Record what the exchange last said about an attempt. Evidence, not a decision. */
+export async function recordOrderAttemptObservation(
+  attemptId: string,
+  exchangeStatus: string
+): Promise<void> {
+  await prisma.exchangeOrderAttempt.updateMany({
+    where: { id: attemptId, status: "open" },
+    data: { exchangeStatus },
+  });
 }

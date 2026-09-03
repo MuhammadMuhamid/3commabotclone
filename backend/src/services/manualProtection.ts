@@ -6,7 +6,7 @@ import { BinanceManualExchange, type ManualExchangeAdapter } from "./manualExcha
 import {
   applyManualSnapshot, PENDING_STATUSES, reconcilePendingManualOrders,
 } from "./manualTrading.js";
-import { openOrderAttempt, settleOrderAttempt } from "./orderAttempt.js";
+import { markOrderAttemptSubmitted, openOrderAttempt, settleOrderAttempt } from "./orderAttempt.js";
 import { getBotRiskLimits } from "./riskControls.js";
 
 /** Bounded startup/reconnect reconciliation entrypoint. */
@@ -84,6 +84,13 @@ export async function checkManualProtection(
       const level = reason === "tp" ? fresh.manualTpPrice : fresh.manualSlPrice;
       const attempt = await openOrderAttempt({
         intentKey: `manual-${reason}-${fresh.id}-${level}`, symbol: fresh.pair, side: "SELL",
+        // BOT-P1-5: owner and domain, so an unresolved manual exit is visible to
+        // anything reasoning about this position. `manual-protection` is not an
+        // origin `exitSettlement` books — the `ManualOrder` lifecycle owns that
+        // accounting — so a resolver finding one reports it, and applies nothing.
+        smartTradeId: fresh.id, origin: "manual-protection",
+        requestedBaseQty: fresh.quantity,
+        closedReason: reason === "tp" ? "manual_take_profit" : "manual_stop_loss",
       });
       const requestId = `manual-${reason}-${fresh.id}-${level}#${attempt.attempt}`;
       let exit = await prisma.manualOrder.findUnique({ where: { requestId } });
@@ -108,6 +115,8 @@ export async function checkManualProtection(
         }
       }
       if (["requested", "submitted"].includes(exit.status)) {
+        // Before the wire call, never after.
+        await markOrderAttemptSubmitted(attempt.id, fresh.quantity);
         const snapshot = await exchange.submit({ symbol: fresh.pair, side: "SELL", orderType: "MARKET",
           baseQuantity: fresh.quantity, clientOrderId: exit.clientOrderId });
         exit = await applyManualSnapshot(exit.id, snapshot);

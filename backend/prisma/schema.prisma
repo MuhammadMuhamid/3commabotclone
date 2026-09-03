@@ -442,13 +442,46 @@ model ExchangeOrderAttempt {
   clientOrderId   String    @unique
   symbol          String
   side            String
-  /// `open` while this attempt owns the slot; `settled` once its result applied.
+  /// `open` while this attempt owns the slot; `settled` once its result was
+  /// applied; `abandoned` once the exchange proved it moved nothing.
   status          String    @default("open")
   exchangeOrderId String?
   settledAt       DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
+  /**
+   * BOT-P1-5: the owning position.
+   *
+   * The attempt row already carried the durable identity of a non-intent exit;
+   * what it did not carry was any way to ASK "does this position have an exit
+   * that may have reached the exchange?". `intentKey` embeds the trade id in a
+   * string, which is not a query, so close admission — which reasons about
+   * `StrategyOrderIntent` — could not see a TP, SL or partial-close attempt at
+   * all. After a restart the in-process close lock is gone and the attempt is
+   * the only surviving evidence, so this column is what lets the same
+   * query-first recovery cover it.
+   */
+  smartTradeId    String?
+  /// Which exit authority owns this attempt: `tpsl`, `partial`, `manual-protection`.
+  origin          String?
+  /// Requested base quantity. INTENT ONLY — never accounting (BOT-P1-6).
+  requestedBaseQty Float?
+  /// Partial-close percentage, for the `PartialClose` row a recovery must write.
+  sellPercent     Float?
+  /// `closedReason` to stamp on the trade when this exit covers the position.
+  closedReason    String?
+  /**
+   * Set immediately BEFORE the exchange call, so a null value durably proves
+   * the order never crossed the submission boundary — the same distinction
+   * `StrategyOrderIntent` draws between `requested` and `submitted`, and what
+   * lets `-2013` be read as real absence without the settle window.
+   */
+  submittedAt     DateTime?
+  /// Last exchange status observed for this attempt. Evidence, never a decision.
+  exchangeStatus  String?
+
   @@unique([intentKey, attempt])
   @@index([intentKey, status])
+  @@index([smartTradeId, status])
 }

@@ -1,4 +1,5 @@
 import type { SignalBot } from "@prisma/client";
+import { config } from "../config.js";
 import { prisma } from "../lib/prisma.js";
 import { normalizeSymbol } from "../lib/symbols.js";
 import {
@@ -23,6 +24,7 @@ import {
 } from "../contract/webhookContract.js";
 import { calcOrderQuoteUsdt, isPerBotUnit } from "../lib/investment.js";
 import { getLastCloseTs } from "../lib/tradeCloseTracker.js";
+import { exitAttemptProbe, resolveUnresolvedExitAttempts } from "./exitSettlement.js";
 import crypto from "crypto";
 import { Prisma } from "@prisma/client";
 import { sendExecutionNotification } from "./push.js";
@@ -628,6 +630,41 @@ export async function processWebhook(
               status: "ignored_duplicate",
               detail: `${symbol}: the prior SELL was already filled at the exchange and has now ` +
                 "been reconciled; it closed this position. No second order was placed.",
+            };
+          }
+          active = refreshed;
+        }
+      }
+
+      /*
+       * BOT-P1-5: the same admission gate, for the exits that reserve a durable
+       * `ExchangeOrderAttempt` and no `StrategyOrderIntent` — TP, SL and the
+       * dashboard partial close. Before this, a crash between one of those
+       * exchange submissions and its local settlement left an order that may
+       * already be live at Binance completely invisible here: the in-process
+       * close lock is gone after a restart and this path reasons about intents,
+       * so a webhook or dashboard Close could send a second, overlapping SELL.
+       *
+       * Deliberately NOT exempted by `skipExitCheck`, for the same reason the
+       * intent resolution above is not: an operator close must go through the
+       * resolution, never around it.
+       */
+      if (active) {
+        const attemptResolution = await resolveUnresolvedExitAttempts(
+          active.id, exitAttemptProbe(client, config.dryRun));
+        if (attemptResolution.blocked) {
+          throw new Error(
+            `${symbol}: a prior exit order has unresolved exchange state — ${attemptResolution.reason}`
+          );
+        }
+        if (attemptResolution.reconciled > 0) {
+          const refreshed = await prisma.smartTrade.findUnique({ where: { id: active.id } });
+          if (!refreshed || refreshed.status !== "active") {
+            await prisma.webhookLog.update({ where: { id: log.id }, data: { status: "ok" } });
+            return {
+              status: "ignored_duplicate",
+              detail: `${symbol}: a prior TP/SL/partial exit was already filled at the exchange ` +
+                "and has now been reconciled; it closed this position. No second order was placed.",
             };
           }
           active = refreshed;
