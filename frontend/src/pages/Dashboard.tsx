@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import {
   TrendingUp, TrendingDown, Layers, DollarSign, BarChart3,
   Bot, ChevronRight, ArrowUpRight, ArrowDownRight, Clock,
-  Zap, X, Play, Square, Pencil, RefreshCw, Wallet, Scissors, Trash2,
+  Zap, X, Play, Square, Pencil, RefreshCw, Wallet, Scissors, Trash2, ShieldAlert,
 } from "lucide-react";
 import {
   api, formatPair, type BotListItem, type SmartTrade, type Stats, type ExchangeAccount,
@@ -858,6 +858,19 @@ export default function Dashboard() {
     mixed: boolean;
     note: string;
   } | null>(null);
+  /*
+   * V1-UX-2: what a stop loss actually IS on this installation. The backend
+   * has always computed the honest sentence — with `EXCHANGE_STOPS_ENABLED`
+   * off there is no resting order at Binance, so protection is a 30-second
+   * in-process poll and stops entirely while this process is down — and the
+   * frontend has always TYPED it. Nothing rendered it, while the bot form
+   * requires a stop for any position at or above half the balance.
+   */
+  const [protectiveOrders, setProtectiveOrders] = useState<{
+    enabled: boolean;
+    status: string;
+    note: string;
+  } | null>(null);
   const [haltBusy, setHaltBusy]     = useState(false);
   const [loadError, setLoadError]   = useState<string | null>(null);
   const [loading, setLoading]       = useState(true);
@@ -922,6 +935,7 @@ export default function Dashboard() {
       setOpsMode(ops ? ops.mode : "UNKNOWN");
       setHaltReason(ops?.risk.haltedReason ?? null);
       setExchange(ops?.exchange ?? null);
+      setProtectiveOrders(ops?.protectiveOrders ?? null);
       setLoadError(null);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : "Failed to load data");
@@ -999,6 +1013,17 @@ export default function Dashboard() {
         <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-[var(--color-danger-dim)] border border-[var(--color-danger)]/30 text-[var(--color-danger)] text-sm">
           <X size={15} className="flex-shrink-0" />
           {loadError}
+        </div>
+      )}
+
+      {/* What protects an open position, stated rather than implied (V1-UX-2) */}
+      {protectiveOrders && (
+        <div className="flex items-start gap-3 px-4 py-3 rounded-xl bg-[var(--color-panel-2)] border border-[var(--color-border)] text-xs text-[var(--color-muted)]">
+          <ShieldAlert size={14} className="flex-shrink-0 mt-0.5" aria-hidden="true" />
+          <span>
+            <span className="text-white font-medium">Stop loss and take profit: </span>
+            {protectiveOrders.note}
+          </span>
         </div>
       )}
 

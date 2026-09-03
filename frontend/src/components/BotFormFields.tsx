@@ -418,7 +418,18 @@ export function BotFormFields({
         <div className="border-t border-[var(--color-border)] pt-4 mt-2">
           <Toggle
             label="Stop loss"
-            desc="Automatically close to limit losses at this percentage."
+            /*
+             * V1-UX-2: say what this control actually is. There is no resting
+             * stop order at Binance unless EXCHANGE_STOPS_ENABLED is on, and it
+             * is off by default — so this is a 30-second poll inside the bot
+             * process, and it protects nothing while that process is down.
+             */
+            desc={
+              "Automatically close to limit losses at this percentage. This is a " +
+              "30-second check inside this bot's own process, not a resting stop " +
+              "order at Binance: it cannot act while the server is down, and a " +
+              "price gap is closed at the next check rather than at your level."
+            }
             on={form.stopLossEnabled}
             onChange={(v) => setForm((f) => ({ ...f, stopLossEnabled: v }))}
           />
