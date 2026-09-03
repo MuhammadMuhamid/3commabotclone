@@ -10,6 +10,7 @@ import type { ExchangeAccount } from "@prisma/client";
 import { sendExecutionNotification } from "../services/push.js";
 import { markOrderAttemptSubmitted, openOrderAttempt } from "../services/orderAttempt.js";
 import { applyExitFill, exitAttemptProbe, resolveUnresolvedExitAttempts } from "../services/exitSettlement.js";
+import { getBotRiskLimits } from "../services/riskControls.js";
 import { config } from "../config.js";
 
 export const tradesRouter = Router();
@@ -161,6 +162,25 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
       return res.status(409).json({ error: "Trade is being closed. Please wait." });
     }
     try {
+    /*
+     * BOT-P1-2: the halt is a hard stop on every real submission, and this was
+     * the one exchange-submitting path that did not check it — a scale-out of
+     * up to 99% of a live position reached Binance while the installation
+     * reported HALTED and every sibling refused: `guardOrder` on the webhook
+     * path (which the dashboard's full Close delegates to), the TP/SL monitor,
+     * manual protection and manual trading. Read fresh here, immediately
+     * inside the lock, so a halt engaged while this request was queued still
+     * takes effect before the sell.
+     */
+    const limits = await getBotRiskLimits();
+    if (limits.tradingHalted) {
+      return res.status(409).json({
+        error: limits.haltedReason
+          ? `Trading is halted: ${limits.haltedReason}`
+          : "Trading is halted",
+      });
+    }
+
     // Resolve client
     const client = tradeExchangeClient.resolve(trade.bot);
     if (!client) {

@@ -43,6 +43,7 @@ const {
   applyExitFill, exitAttemptProbe, resolveUnresolvedExitAttempts,
 } = await import("../src/services/exitSettlement.js");
 const { SUBMITTED_ABSENCE_SETTLE_MS } = await import("../src/services/strategyOrderIntent.js");
+const { setBotTradingHalted } = await import("../src/services/riskControls.js");
 const { heldLockCount } = await import("../src/lib/tradeCloseLock.js");
 const { __clearCloseMarkCache } = await import("../src/lib/tradeCloseTracker.js");
 
@@ -492,6 +493,28 @@ test("P1-5: the dashboard partial close respects an unresolved partial attempt",
   assert.equal(exchange.submissions.length, 0, "no overlapping scale-out reached the exchange");
   assert.equal(heldLockCount(), 0, "the close lock is never leaked");
 });
+
+test("BOT-P1-2: a scale-out is refused while trading is halted, like every sibling path",
+  async () => {
+    const account = await createAccount();
+    const bot = await createBot({ exchangeAccountId: account.id });
+    const trade = await createTrade(bot, { quantity: 1, quoteSpent: 100 });
+    const exchange = fakeExchange({ price: "110", freeBase: "10",
+      fills: [{ status: "FILLED", executedQty: "0.25", quote: "27.5" }] });
+    tradeExchangeClient.resolve = () => exchange.client;
+    await setBotTradingHalted(true, { reason: "operator halted everything", by: "operator" });
+
+    const response = await callTradesRoute(
+      "post", "/:id/partial-close", { id: trade.id }, { pct: 25 });
+    assert.equal(response.status, 409);
+    assert.match(String((response.body as { error: string }).error), /operator halted everything/);
+    assert.equal(exchange.submissions.length, 0,
+      "no MARKET SELL reached the exchange while the installation reports HALTED");
+    assert.equal(
+      await prisma.exchangeOrderAttempt.count({ where: { smartTradeId: trade.id } }), 0,
+      "and nothing durable was reserved for an order that was never permitted");
+    assert.equal(heldLockCount(), 0, "the close lock is never leaked");
+  });
 
 test("P1-5: the TP/SL monitor reconciles its own crashed attempt instead of re-selling", async () => {
   const account = await createAccount();
