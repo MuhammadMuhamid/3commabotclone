@@ -372,6 +372,132 @@ test("strategy crash A/G: a never-attempted intent survives and submits once onl
     "reconciled");
 });
 
+/**
+ * BOT-P1-3 — a never-submitted BUY expires; a never-submitted SELL does not.
+ *
+ * The reconciler runs every 30 seconds with no age predicate, so before this
+ * repair an entry blocked at creation was placed at the then-current price
+ * whenever the block cleared, however many hours later.
+ */
+async function requestedIntentAfterCrash(opts: {
+  botName: string; secret: string; action: "buy" | "sell"; dedupeKey: string;
+  client: unknown; exitEnabled?: boolean; withTrade?: boolean;
+}) {
+  const bot = await prisma.signalBot.create({ data: {
+    name: opts.botName, webhookSecret: opts.secret, pairs: JSON.stringify(["BTCUSDT"]),
+    entryEnabled: true, exitEnabled: opts.exitEnabled ?? true,
+  } });
+  if (opts.withTrade) {
+    await prisma.smartTrade.create({ data: {
+      botId: bot.id, botName: bot.name, pair: "BTCUSDT", status: "active",
+      direction: "long", quantity: 0.5, quoteSpent: 50,
+    } });
+  }
+  const body: Record<string, unknown> = { secret: bot.webhookSecret, action: opts.action,
+    symbol: "BTCUSDT", dedupe_key: opts.dedupeKey };
+  if (opts.action === "buy") body.quote_order_qty = 50;
+  await assert.rejects(processWebhook(body, {
+    clientFactory: async () => opts.client as never,
+    strategyCrashHooks: { afterIntentPersisted: () => { throw new Error("crash before submit"); } },
+  }), /crash before submit/);
+  const intent = await prisma.strategyOrderIntent.findFirstOrThrow();
+  assert.equal(intent.status, "requested");
+  return { bot, intent };
+}
+
+/** Move an intent back in time, exactly as a long block would leave it. */
+async function ageIntent(id: string, ms: number): Promise<void> {
+  await prisma.strategyOrderIntent.update({
+    where: { id }, data: { createdAt: new Date(Date.now() - ms) } });
+}
+
+function fakeBuyClient(counter: { wireOrders: number }) {
+  return {
+    accountInfo: async () => ({ balances: [{ asset: "USDT", free: "1000", locked: "0" }] }),
+    exchangeInfo: async () => ({ symbols: [{ filters: [
+      { filterType: "MIN_NOTIONAL", minNotional: "10" },
+    ] }] }),
+    order: async (payload: Record<string, unknown>) => {
+      counter.wireOrders++;
+      return { orderId: "aged-buy-1", clientOrderId: payload.newClientOrderId, side: "BUY",
+        status: "FILLED", executedQty: "0.5", cummulativeQuoteQty: "50", fills: [] };
+    },
+    prices: async ({ symbol }: { symbol: string }) => ({ [symbol]: "100" }),
+  };
+}
+
+test("BOT-P1-3: a two-hour-old never-submitted BUY is closed off as stale instead of being placed",
+  async () => {
+    const counter = { wireOrders: 0 };
+    const client = fakeBuyClient(counter);
+    const { bot, intent } = await requestedIntentAfterCrash({
+      botName: "Stale entry strategy", secret: "stale-entry-strategy-secret",
+      action: "buy", dedupeKey: "stale-entry", client,
+    });
+    await ageIntent(intent.id, 2 * 60 * 60_000);
+
+    await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+
+    assert.equal(counter.wireOrders, 0, "the original MARKET BUY was never placed");
+    const settled = await prisma.strategyOrderIntent.findUniqueOrThrow({ where: { id: intent.id } });
+    assert.equal(settled.status, "rejected");
+    assert.match(String(settled.error), /Stale entry signal/);
+    assert.equal(settled.exchangeStatus, "ABSENT", "it provably never crossed the wire");
+    assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id } }), 0);
+
+    // Terminal: a later sweep neither retries it nor changes the answer.
+    await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+    assert.equal(counter.wireOrders, 0);
+    assert.equal((await prisma.strategyOrderIntent.findUniqueOrThrow({
+      where: { id: intent.id } })).status, "rejected");
+  });
+
+test("BOT-P1-3: the same BUY thirty seconds old still submits, so crash recovery is unaffected",
+  async () => {
+    const counter = { wireOrders: 0 };
+    const client = fakeBuyClient(counter);
+    const { bot, intent } = await requestedIntentAfterCrash({
+      botName: "Fresh entry strategy", secret: "fresh-entry-strategy-secret",
+      action: "buy", dedupeKey: "fresh-entry", client,
+    });
+    await ageIntent(intent.id, 30_000);
+
+    await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+
+    assert.equal(counter.wireOrders, 1, "an interrupted entry still completes");
+    assert.equal((await prisma.strategyOrderIntent.findUniqueOrThrow({
+      where: { id: intent.id } })).status, "reconciled");
+    assert.equal(await prisma.smartTrade.count({ where: { botId: bot.id } }), 1);
+  });
+
+test("BOT-P1-3: a never-submitted SELL of any age still reconciles — an exit never expires",
+  async () => {
+    let wireOrders = 0;
+    const client = {
+      accountInfo: async () => ({ balances: [{ asset: "BTC", free: "0.5", locked: "0" }] }),
+      exchangeInfo: async () => ({ symbols: [{ filters: [
+        { filterType: "LOT_SIZE", stepSize: "0.001", minQty: "0.001" },
+      ] }] }),
+      order: async (payload: Record<string, unknown>) => {
+        wireOrders++;
+        return { orderId: "aged-sell-1", clientOrderId: payload.newClientOrderId, side: "SELL",
+          status: "FILLED", executedQty: "0.5", cummulativeQuoteQty: "60" };
+      },
+    };
+    const { intent } = await requestedIntentAfterCrash({
+      botName: "Aged exit strategy", secret: "aged-exit-strategy-secret",
+      action: "sell", dedupeKey: "aged-exit", client, withTrade: true,
+    });
+    await ageIntent(intent.id, 2 * 60 * 60_000);
+
+    await reconcilePendingStrategyIntents(async () => strategyMarketAdapter(client as never, false));
+
+    assert.equal(wireOrders, 1, "an interrupted exit must always be able to complete");
+    assert.equal((await prisma.strategyOrderIntent.findUniqueOrThrow({
+      where: { id: intent.id } })).status, "reconciled");
+    assert.equal((await prisma.smartTrade.findFirstOrThrow()).status, "closed");
+  });
+
 test("the durable submission marker is written before the wire call and a crash there never resubmits", async () => {
   const bot = await prisma.signalBot.create({ data: {
     name: "Submission marker strategy", webhookSecret: "submission-marker-strategy-secret",

@@ -224,6 +224,35 @@ export async function hasUnresolvedStrategySell(smartTradeId: string): Promise<b
  */
 export const SUBMITTED_ABSENCE_SETTLE_MS = 60_000;
 
+/**
+ * How old a never-submitted BUY may be before the reconciler stops trying to
+ * place it, and closes it off as a stale signal instead.
+ *
+ * BOT-P1-3: `reconcilePendingStrategyIntents` selects every `requested` and
+ * `submitted` intent with no age predicate, and runs every 30 seconds. An
+ * entry blocked at creation — the operator paused the bot or turned
+ * `entryEnabled` off in that window, the halt latched, or the process was
+ * killed between `create` and the requested->submitted compare-and-set — sits
+ * `requested` for as long as the block lasts. When it clears, hours or days
+ * later, the sweep places the ORIGINAL MARKET BUY at the then-current price,
+ * within 30 seconds and with no operator-visible warning that an old order was
+ * queued. Nothing else bounds this: the `WebhookReceipt` dedupe TTL is 120
+ * seconds and long gone, `clearanceForFirstSubmission` decides who may buy and
+ * never when, and `SUBMITTED_ABSENCE_SETTLE_MS` bounds only the ABSENCE
+ * interpretation of an already-submitted order.
+ *
+ * Fifteen minutes is chosen as comfortably longer than every legitimate delay
+ * — a process restart and its boot reconciliation, a database reconnect, a
+ * transient block an operator clears at once — and far shorter than the
+ * horizon over which a MARKET entry price still has anything to do with the
+ * signal that asked for it. An entry signal older than this is stale on any
+ * reading, and re-deciding it is the strategy's job, not the reconciler's.
+ *
+ * BUY ONLY. An interrupted exit must always be able to complete, at any age:
+ * refusing a SELL because it is old traps the position it was meant to close.
+ */
+export const REQUESTED_INTENT_MAX_AGE_MS = 15 * 60_000;
+
 export interface UnresolvedSellResolution {
   /** True when a prior SELL still holds unknown or live exchange state. */
   blocked: boolean;
@@ -537,6 +566,24 @@ async function applyAuthoritativeResult(
 }
 
 async function assertNeverAttemptedMaySubmit(intent: StrategyOrderIntent): Promise<void> {
+  /*
+   * BOT-P1-3: an entry that never crossed the wire expires; an exit never
+   * does. Rejecting is safe by construction here and nowhere else — a row
+   * still saying `requested` provably never reached the exchange, which is the
+   * same invariant `SUBMITTED_ABSENCE_SETTLE_MS` and the ABSENT close-off both
+   * already rely on — so nothing is being abandoned at Binance, and this is a
+   * terminal answer rather than another 30-second retry.
+   */
+  const ageMs = Date.now() - intent.createdAt.getTime();
+  if (intent.side === "BUY" && ageMs > REQUESTED_INTENT_MAX_AGE_MS) {
+    const reason =
+      `Stale entry signal: this BUY was still \`requested\` after ${Math.round(ageMs / 60_000)} ` +
+      `minutes (maximum ${REQUESTED_INTENT_MAX_AGE_MS / 60_000}), so it never reached the ` +
+      "exchange and will not be placed now at an unrelated price";
+    await closeOffUnresolvedIntent(intent, "ABSENT", reason);
+    throw new Error(reason);
+  }
+
   const bot = await prisma.signalBot.findUnique({ where: { id: intent.botId } });
   if (!bot || bot.status !== "active") throw new Error("Strategy bot is not active");
   if (intent.side === "BUY" && !bot.entryEnabled) throw new Error("Entry orders disabled on this bot");
