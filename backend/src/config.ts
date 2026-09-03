@@ -204,6 +204,44 @@ export function collectConfigErrors(): string[] {
     errors.push("VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY must be configured together");
   }
 
+  /*
+   * BOT-P1-1: a boolean flag whose value the parse expression does not
+   * recognise is silently the default, and for two of these the default is
+   * REAL MONEY ON MAINNET.
+   *
+   * `DRY_RUN` is read as `=== "true"`, so `DRY_RUN=1`, `DRY_RUN=yes`,
+   * `DRY_RUN=on` or a trailing space all yield `dryRun === false`: the process
+   * starts LIVE and every accepted webhook places a real Binance Spot order,
+   * while the operator's `.env` reads as though it were simulating.
+   * `BINANCE_TESTNET` fails the same way into `api.binance.com`. The point of
+   * this clause is to make a typo LOUD, not to accept more spellings, so only
+   * the forms the parse expression itself understands are allowed and the
+   * parse expressions are left exactly as they are.
+   *
+   * Unset stays legal: each flag then keeps its documented default.
+   *
+   * `DRY_RUN` and `BINANCE_TESTNET` lowercase before comparing, so `TRUE` and
+   * `False` are genuinely understood there. `SECURE_COOKIES` is compared with
+   * a case-SENSITIVE `!== "false"`, so `SECURE_COOKIES=FALSE` would leave
+   * secure cookies on while reading as though they were off — it is therefore
+   * held to the exact lowercase forms it actually honours.
+   */
+  const booleanFlags: Array<[string, RegExp]> = [
+    ["DRY_RUN", /^(true|false)$/i],
+    ["BINANCE_TESTNET", /^(true|false)$/i],
+    ["SECURE_COOKIES", /^(true|false)$/],
+  ];
+  for (const [name, accepted] of booleanFlags) {
+    const raw = process.env[name];
+    if (raw !== undefined && !accepted.test(raw)) {
+      errors.push(
+        `${name} must be exactly true or false when set, not ` +
+        `${JSON.stringify(raw)} — it is compared as a string, so any other ` +
+        "value is silently ignored and the default is used instead"
+      );
+    }
+  }
+
   if (!Number.isInteger(config.port) || config.port <= 0 || config.port > 65535) {
     errors.push(`PORT is not a valid port number: ${JSON.stringify(process.env.PORT)}`);
   }

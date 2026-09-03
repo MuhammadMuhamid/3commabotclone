@@ -63,6 +63,38 @@ test("a fully-configured environment starts, in dry run and in live mode", () =>
   assert.equal(bootConfig({ ...baseEnv, DRY_RUN: "false" }).ok, true);
 });
 
+test("KNOWN DEFECT BOT-P1-1 fixed: a boolean flag whose typo state is live mainnet is refused", () => {
+  // `DRY_RUN` is parsed as `=== "true"`, so every one of these used to start a
+  // LIVE process placing real Binance Spot orders while the operator's `.env`
+  // read as though it were simulating. `BINANCE_TESTNET` failed the same way
+  // into api.binance.com. A typo must be loud.
+  for (const value of ["1", "yes", "on", "true "]) {
+    const r = bootConfig({ ...baseEnv, DRY_RUN: value });
+    assert.equal(r.ok, false, `DRY_RUN=${JSON.stringify(value)} must be refused`);
+    assert.match(r.message, /DRY_RUN must be exactly true or false/);
+  }
+  const testnet = bootConfig({ ...baseEnv, BINANCE_TESTNET: "yes" });
+  assert.equal(testnet.ok, false);
+  assert.match(testnet.message, /BINANCE_TESTNET must be exactly true or false/);
+
+  const cookies = bootConfig({ ...baseEnv, SECURE_COOKIES: "0" });
+  assert.equal(cookies.ok, false);
+  assert.match(cookies.message, /SECURE_COOKIES must be exactly true or false/);
+});
+
+test("the spellings each flag's own parse expression understands are still accepted", () => {
+  // Only those: widening to 1/yes/on would defeat the check above. DRY_RUN and
+  // BINANCE_TESTNET lowercase before comparing, so any case is genuinely
+  // understood; SECURE_COOKIES compares case-sensitively and is held to the
+  // exact lowercase forms it honours.
+  assert.equal(bootConfig({ ...baseEnv, DRY_RUN: "TRUE" }).ok, true);
+  assert.equal(bootConfig({ ...baseEnv, DRY_RUN: "False" }).ok, true);
+  assert.equal(bootConfig({ ...baseEnv, BINANCE_TESTNET: "TRUE" }).ok, true);
+  assert.equal(bootConfig({ ...baseEnv, SECURE_COOKIES: "false" }).ok, true);
+  // Unset stays legal — each flag keeps its documented default.
+  assert.equal(bootConfig({ ...baseEnv }).ok, true);
+});
+
 test("KNOWN DEFECT BOT-004 fixed: a missing secret is fatal even in DRY_RUN", () => {
   // The old behaviour warned in dry run and failed only in live mode, and
   // DRY_RUN defaults to true — so `cp .env.example .env` produced a running
