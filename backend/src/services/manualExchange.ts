@@ -98,6 +98,39 @@ async function symbolRules(client: BinanceClient, symbol: string): Promise<Symbo
   return { lotStep, minQty, priceTick, minNotional };
 }
 
+/**
+ * The lifecycle a MARKET submission actually reached.
+ *
+ * BOT-P1-3: this branch used to be the literal `status: "FILLED"`. A MARKET
+ * order that Binance accepted and then EXPIRED against an empty book — the
+ * normal shape of a fast move, and exactly when a stop-loss fires — was
+ * recorded as a completed exit. `applyManualSnapshot` then made the row
+ * terminal while its position-close branch (which needs a real fill) did
+ * nothing, so the position stayed active with `protectionState: "active"` and
+ * the protection poller, which only re-attempts a `requested`/`submitted` exit,
+ * skipped it on every later cycle. Protection ceased to exist at precisely the
+ * moment it mattered, and the operator surface still reported it as armed.
+ *
+ * Binance always reports a status on a MARKET response, and `probeOrderByClientId`
+ * carries one through recovery, so the first branch is the real path. The
+ * fallback exists for an adapter that reports none: it may promote to FILLED
+ * only on evidence of a covering fill, and an unexplained zero fill stays
+ * NEW — non-terminal, hence reconcilable — rather than being guessed either way.
+ */
+export function marketSubmissionStatus(
+  result: { exchangeStatus?: string; executedQty: number; cummulativeQuoteQty: number },
+  requested: { baseQuantity?: number; quoteQuantity?: number }
+): ManualExchangeStatus {
+  if (result.exchangeStatus) return mapStatus(result.exchangeStatus);
+  const requestedBase = requested.baseQuantity ?? 0;
+  const requestedQuote = requested.quoteQuantity ?? 0;
+  const covered = requestedBase > 0
+    ? result.executedQty >= requestedBase * 0.999
+    : requestedQuote > 0 && result.cummulativeQuoteQty >= requestedQuote * 0.999;
+  if (covered) return "FILLED";
+  return result.executedQty > 0 ? "PARTIALLY_FILLED" : "NEW";
+}
+
 function mapStatus(status: string): ManualExchangeStatus {
   if (["NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED", "EXPIRED"].includes(status)) {
     return status as ManualExchangeStatus;
@@ -185,10 +218,14 @@ export class BinanceManualExchange implements ManualExchangeAdapter {
       return {
         exchangeOrderId: result.orderId,
         clientOrderId: intent.clientOrderId,
-        status: "FILLED",
+        // BOT-P1-3: derived from what came back, never from the fact that the
+        // submission itself returned without throwing.
+        status: marketSubmissionStatus(result, intent),
         executedBaseQuantity: result.executedQty,
         executedQuoteQuantity: result.cummulativeQuoteQty,
-        averagePrice: result.avgPrice,
+        // No fill, no price. A synthetic 0 would be recorded as this order's
+        // average fill price and read back as one.
+        averagePrice: result.executedQty > 0 ? result.avgPrice : null,
         simulated: result.simulated,
       };
     }

@@ -18,7 +18,8 @@ import {
   shariahScopeForManualAccount,
 } from "./shariah.js";
 
-const PENDING_STATUSES = ["requested", "submitted", "open", "partially_filled"];
+/** Every manual-order lifecycle status that is NOT terminal. */
+export const PENDING_STATUSES = ["requested", "submitted", "open", "partially_filled"];
 export const MAINNET_MANUAL_CONFIRMATION = "PLACE_MAINNET_ORDER";
 const accountSubmitLocks = new Set<string>();
 

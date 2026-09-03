@@ -114,6 +114,17 @@ export interface OrderResult {
   avgPrice: number;
   /** True when nothing was sent to the exchange. */
   simulated: boolean;
+  /**
+   * The order status Binance actually reported (`FILLED`, `PARTIALLY_FILLED`,
+   * `EXPIRED`, ...).
+   *
+   * BOT-P1-3: a successful MARKET submission is not a fill. `manualExchange`
+   * recorded every MARKET order as `FILLED` because this was the only thing an
+   * `OrderResult` did not carry, so a zero-fill or partial-fill response became
+   * terminal locally while the position stayed open. Carrying the real status
+   * is what lets the manual lifecycle tell those apart.
+   */
+  exchangeStatus?: string;
 }
 
 /** Binance rejects an order below the symbol's NOTIONAL filter. */
@@ -145,6 +156,113 @@ function wrapExchangeError(err: unknown, symbol: string): never {
 }
 
 /**
+ * What the exchange currently says about ONE client order id.
+ *
+ * BOT-P1-2: `queryFilledMarketOrder` collapsed five very different answers into
+ * `null` — "Binance has never heard of this id", "it is still working", "it
+ * ended without filling", "the lookup itself failed", and "it filled but not in
+ * a usable shape". A stuck `submitted` SELL intent could therefore never be
+ * resolved: absence of a fill was indistinguishable from absence of evidence,
+ * so the safe answer was always "stay blocked", forever.
+ *
+ * These states are that answer, told apart:
+ *
+ *   `filled`  — an authoritative, usable fill.
+ *   `open`    — the order exists and may still fill. Nothing may replace it.
+ *   `dead`    — the order exists, is terminal, and moved no base asset. It is
+ *               resolved, and it changed nothing.
+ *   `absent`  — Binance answered `-2013`: no order exists under this id.
+ *   `unknown` — no evidence at all (transport failure), or evidence this model
+ *               must not simplify (a terminal order carrying a partial fill).
+ *               Always fail safe on this one.
+ */
+export type OrderProbe =
+  | { state: "filled"; result: OrderResult }
+  | { state: "open"; exchangeStatus: string }
+  | { state: "dead"; exchangeStatus: string }
+  | { state: "absent" }
+  | { state: "unknown"; reason: string };
+
+/** Binance's "Order does not exist" for a lookup by client order id. */
+const ORDER_DOES_NOT_EXIST = -2013;
+
+const TERMINAL_EXCHANGE_STATUSES = ["CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"];
+
+/**
+ * Ask the exchange what became of one deterministic client order id.
+ *
+ * The only source of truth about an ambiguous submission, and deliberately the
+ * only place that interprets a Binance order status.
+ */
+export async function probeOrderByClientId(
+  client: BinanceClient,
+  symbol: string,
+  side: "BUY" | "SELL",
+  stableClientOrderId: string
+): Promise<OrderProbe> {
+  const sym = toBinanceSymbol(symbol);
+  let order;
+  try {
+    order = await client.getOrder({
+      symbol: sym, origClientOrderId: stableClientOrderId,
+    } as Parameters<BinanceClient["getOrder"]>[0]);
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === ORDER_DOES_NOT_EXIST) return { state: "absent" };
+    const message = (error as { message?: unknown }).message;
+    return { state: "unknown", reason: typeof message === "string" ? message : "order lookup failed" };
+  }
+
+  const status = String(order.status ?? "");
+  // An id that resolves to the opposite side is not this order. Refusing to
+  // interpret it is the fail-safe answer: it must never be read as absence.
+  if (String(order.side) !== side) {
+    return { state: "unknown", reason: `client order id resolves to a ${String(order.side)} order` };
+  }
+  const grossQty = Number(order.executedQty ?? 0);
+  const quote = Number(order.cummulativeQuoteQty ?? 0);
+
+  if (status === "FILLED") {
+    if (!(grossQty > 0) || !(quote >= 0)) {
+      return { state: "unknown", reason: "FILLED order reported no usable quantity" };
+    }
+    let executedQty = grossQty;
+    if (side === "BUY") {
+      try {
+        const trades = await client.myTrades({
+          symbol: sym, orderId: Number(order.orderId),
+        } as Parameters<BinanceClient["myTrades"]>[0]);
+        executedQty = netBaseQty(grossQty, trades, parsePair(sym).base);
+      } catch (error) {
+        // A gross BUY quantity would overstate what the wallet received, and
+        // that overstatement is exactly what BOT-006 fixed. No evidence is
+        // better than wrong evidence.
+        const message = (error as { message?: unknown }).message;
+        return {
+          state: "unknown",
+          reason: typeof message === "string" ? message : "could not net BUY commission",
+        };
+      }
+    }
+    return { state: "filled", result: {
+      orderId: String(order.orderId), executedQty, cummulativeQuoteQty: quote,
+      avgPrice: quote / grossQty, simulated: false, exchangeStatus: status,
+    }};
+  }
+
+  if (TERMINAL_EXCHANGE_STATUSES.includes(status)) {
+    // A terminal order that nevertheless moved base asset is real exposure the
+    // caller has to reconcile deliberately; this model must not call it "dead".
+    if (grossQty > 0) {
+      return { state: "unknown", reason: `${status} order carries a partial fill of ${grossQty}` };
+    }
+    return { state: "dead", exchangeStatus: status };
+  }
+
+  return { state: "open", exchangeStatus: status || "NEW" };
+}
+
+/**
  * Resolve an ambiguous MARKET submission by its deterministic client order id.
  * Only FILLED is usable by the current SmartTrade lifecycle; NEW or partial
  * results remain uncertain rather than being recorded as a completed entry or
@@ -156,29 +274,8 @@ export async function queryFilledMarketOrder(
   side: "BUY" | "SELL",
   stableClientOrderId: string
 ): Promise<OrderResult | null> {
-  const sym = toBinanceSymbol(symbol);
-  try {
-    const order = await client.getOrder({
-      symbol: sym, origClientOrderId: stableClientOrderId,
-    } as Parameters<BinanceClient["getOrder"]>[0]);
-    if (String(order.status) !== "FILLED" || String(order.side) !== side) return null;
-    const grossQty = Number(order.executedQty ?? 0);
-    const quote = Number(order.cummulativeQuoteQty ?? 0);
-    if (!(grossQty > 0) || !(quote >= 0)) return null;
-    let executedQty = grossQty;
-    if (side === "BUY") {
-      const trades = await client.myTrades({
-        symbol: sym, orderId: Number(order.orderId),
-      } as Parameters<BinanceClient["myTrades"]>[0]);
-      executedQty = netBaseQty(grossQty, trades, parsePair(sym).base);
-    }
-    return {
-      orderId: String(order.orderId), executedQty, cummulativeQuoteQty: quote,
-      avgPrice: quote / grossQty, simulated: false,
-    };
-  } catch {
-    return null;
-  }
+  const probe = await probeOrderByClientId(client, symbol, side, stableClientOrderId);
+  return probe.state === "filled" ? probe.result : null;
 }
 
 /** The symbol's minimum order notional, or 0 when the filter is absent. */
@@ -245,6 +342,7 @@ export async function marketBuyQuote(
       cummulativeQuoteQty: quote,
       avgPrice: price,
       simulated: true,
+      exchangeStatus: qty > 0 ? "FILLED" : "EXPIRED",
     };
   }
 
@@ -293,6 +391,7 @@ export async function marketBuyQuote(
     // quantity: netting the fee out of the divisor would inflate it.
     avgPrice: grossQty > 0 ? quoteFilled / grossQty : 0,
     simulated: false,
+    exchangeStatus: String(order.status ?? ""),
   };
 }
 
@@ -386,6 +485,7 @@ export async function marketSellBase(
       cummulativeQuoteQty: qty * price,
       avgPrice: price,
       simulated: true,
+      exchangeStatus: qty > 0 ? "FILLED" : "EXPIRED",
     };
   }
 
@@ -450,6 +550,7 @@ export async function marketSellBase(
     cummulativeQuoteQty: quote,
     avgPrice: executedQty > 0 ? quote / executedQty : 0,
     simulated: false,
+    exchangeStatus: String(order.status ?? ""),
   };
 }
 

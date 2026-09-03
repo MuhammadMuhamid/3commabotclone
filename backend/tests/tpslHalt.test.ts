@@ -57,11 +57,21 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
   const riskControl = delegate(prisma.riskControl);
   const partialClose = delegate(prisma.partialClose);
   const pairCloseMark = delegate(prisma.pairCloseMark);
+  // BOT-P1-1: the monitor now reserves a durable order attempt before it sells,
+  // so the in-memory prisma needs that delegate — and `$transaction`, because
+  // the attempt settles in the same transaction that books the fill.
+  const attempts = delegate(prisma.exchangeOrderAttempt);
+  const client = prisma as unknown as { $transaction: unknown };
+  const attemptRows: { id: string; intentKey: string; attempt: number;
+    clientOrderId: string; status: string }[] = [];
   const originals = {
     findMany: smartTrade.findMany, findUnique: smartTrade.findUnique, update: smartTrade.update,
     riskFindUnique: riskControl.findUnique,
     partialFindMany: partialClose.findMany,
     pairUpsert: pairCloseMark.upsert,
+    attemptFindFirst: attempts.findFirst, attemptCreate: attempts.create,
+    attemptUpdateMany: attempts.updateMany,
+    transaction: client.$transaction,
   };
 
   const withBot = (t: FakeTrade) => ({ ...t, bot: { ...bot } });
@@ -88,9 +98,32 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
     : null);
   partialClose.findMany = async () => [];
   pairCloseMark.upsert = async () => ({});
+  attempts.findFirst = async (arg: unknown) => {
+    const { where } = (arg ?? {}) as { where?: { intentKey?: string; status?: string } };
+    const matches = attemptRows.filter((row) =>
+      (!where?.intentKey || row.intentKey === where.intentKey) &&
+      (!where?.status || row.status === where.status));
+    return matches.sort((a, b) => b.attempt - a.attempt)[0] ?? null;
+  };
+  attempts.create = async (arg: unknown) => {
+    const { data } = arg as { data: { intentKey: string; attempt: number; clientOrderId: string } };
+    const row = { id: `attempt-${attemptRows.length + 1}`, status: "open", ...data };
+    attemptRows.push(row);
+    return row;
+  };
+  attempts.updateMany = async (arg: unknown) => {
+    const { where, data } = arg as
+      { where: { id: string; status: string }; data: { status: string } };
+    const row = attemptRows.find((r) => r.id === where.id && r.status === where.status);
+    if (!row) return { count: 0 };
+    row.status = data.status;
+    return { count: 1 };
+  };
+  client.$transaction = async (fn: (tx: unknown) => Promise<unknown>) => fn(prisma);
 
   return {
     trades,
+    attempts: attemptRows,
     setHalted: (v: boolean) => { halted = v; },
     restore: () => {
       smartTrade.findMany = originals.findMany;
@@ -99,6 +132,10 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
       riskControl.findUnique = originals.riskFindUnique;
       partialClose.findMany = originals.partialFindMany;
       pairCloseMark.upsert = originals.pairUpsert;
+      attempts.findFirst = originals.attemptFindFirst;
+      attempts.create = originals.attemptCreate;
+      attempts.updateMany = originals.attemptUpdateMany;
+      client.$transaction = originals.transaction;
     },
   };
 }

@@ -1,10 +1,10 @@
 import { Prisma, type SignalBot, type StrategyOrderIntent } from "@prisma/client";
 import { config } from "../config.js";
 import { prisma } from "../lib/prisma.js";
-import type { OrderResult, BinanceClient } from "./binance.js";
+import type { OrderProbe, OrderResult, BinanceClient } from "./binance.js";
 import {
   clientFromAccount, clientFromEnv, ExchangeError, marketBuyQuote,
-  marketSellBase, MinNotionalError, queryFilledMarketOrder,
+  marketSellBase, MinNotionalError, probeOrderByClientId, queryFilledMarketOrder,
 } from "./binance.js";
 import { calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
 import {
@@ -77,6 +77,16 @@ export class AuthorizationNonceReplayError extends Error {
 export interface StrategyMarketAdapter {
   submit(intent: StrategyOrderIntent): Promise<OrderResult>;
   query(intent: StrategyOrderIntent): Promise<OrderResult | null>;
+  /**
+   * The same lookup as `query`, but reporting WHY there is no usable fill.
+   *
+   * BOT-P1-2: `query` answers `null` for "the exchange never heard of this
+   * order" and for "the lookup failed" alike, and no amount of retrying can
+   * turn the first into a resolution. Optional so an existing adapter keeps
+   * working — one that cannot probe is treated as no evidence, which is the
+   * fail-safe reading.
+   */
+  probe?(intent: StrategyOrderIntent): Promise<OrderProbe>;
 }
 
 export type StrategyAdapterFactory =
@@ -199,6 +209,163 @@ export async function hasUnresolvedStrategySell(smartTradeId: string): Promise<b
   return (await prisma.strategyOrderIntent.count({ where: {
     smartTradeId, side: "SELL", status: { in: UNRESOLVED_STATUSES },
   }})) > 0;
+}
+
+/**
+ * How long a `submitted` intent must have been submitted before the exchange
+ * answering "no such order" is accepted as proof that none was ever placed.
+ *
+ * The one way `-2013` can lie is the moment between our request leaving and the
+ * order being registered, and that window is bounded by the HTTP call itself.
+ * Below the threshold the answer is reported as the not-yet-settled state it
+ * is; it is never used to license a replacement sell. A `requested` intent
+ * needs no such wait — the compare-and-set to `submitted` happens BEFORE the
+ * wire call, so a row still saying `requested` provably never crossed it.
+ */
+export const SUBMITTED_ABSENCE_SETTLE_MS = 60_000;
+
+export interface UnresolvedSellResolution {
+  /** True when a prior SELL still holds unknown or live exchange state. */
+  blocked: boolean;
+  reason?: string;
+  /** Intents this call reconciled from an authoritative exchange fill. */
+  reconciled: number;
+  /** Intents this call proved never reached the exchange, and closed off. */
+  discarded: number;
+}
+
+/**
+ * Resolve every unresolved SELL intent on one trade against current exchange
+ * evidence — the repair for BOT-P1-2.
+ *
+ * The guard this serves is correct in intent: never place a second exit while
+ * a first one's fate is unknown. What it lacked was any way to LEARN that fate,
+ * so a SELL intent left `submitted` by a crash between the compare-and-set and
+ * the HTTP request wedged both full-close paths for that trade permanently, and
+ * `skipExitCheck` — the dashboard Close button — did not exempt it. The
+ * documented remedy was editing the database by hand.
+ *
+ * This asks the exchange first and acts only on what it answers:
+ *
+ *   filled  → reconcile it through the ordinary authoritative path. The exit
+ *             already happened; no duplicate SELL is placed, and the local
+ *             ledger catches up exactly once.
+ *   open    → still live. Stay blocked, and say so: a replacement here is how
+ *             a position gets sold twice.
+ *   absent  → the exchange has no such order. `requested` proves it never
+ *             crossed the submission boundary; `submitted` needs the settle
+ *             window above. Then, and only then, the intent is closed off as
+ *             `rejected` and a new close may proceed.
+ *   dead    → terminal at the exchange and moved no base asset. Same treatment
+ *             as absent: resolved, and it changed nothing.
+ *   unknown → no evidence. Stay blocked with the truthful reason.
+ *
+ * Every transition is a compare-and-set on the status this call observed, so a
+ * concurrent reconciliation that moves the row first always wins and this call
+ * reports blocked rather than overwriting it.
+ */
+export async function resolveUnresolvedStrategySells(
+  smartTradeId: string,
+  adapterFactory: StrategyAdapterFactory = defaultAdapterFactory,
+  now: number = Date.now()
+): Promise<UnresolvedSellResolution> {
+  const intents = await prisma.strategyOrderIntent.findMany({
+    where: { smartTradeId, side: "SELL", status: { in: UNRESOLVED_STATUSES } },
+    orderBy: { createdAt: "asc" },
+  });
+  const outcome: UnresolvedSellResolution = { blocked: false, reconciled: 0, discarded: 0 };
+  const reasons: string[] = [];
+  for (const intent of intents) {
+    const reason = await resolveOneUnresolvedSell(intent, adapterFactory, now, outcome);
+    if (reason) reasons.push(reason);
+  }
+  if (reasons.length > 0) {
+    outcome.blocked = true;
+    outcome.reason = reasons.join("; ");
+  }
+  return outcome;
+}
+
+async function closeOffUnresolvedIntent(
+  intent: StrategyOrderIntent,
+  exchangeStatus: string,
+  error: string
+): Promise<boolean> {
+  const closed = await prisma.strategyOrderIntent.updateMany({
+    // The observed status, not merely "unresolved": if a concurrent submission
+    // moved this row from `requested` to `submitted` since the probe, that
+    // submission owns it and this call must not overwrite its outcome.
+    where: { id: intent.id, status: intent.status },
+    data: { status: "rejected", exchangeStatus, error, reconciledAt: new Date() },
+  });
+  return closed.count === 1;
+}
+
+async function resolveOneUnresolvedSell(
+  intent: StrategyOrderIntent,
+  adapterFactory: StrategyAdapterFactory,
+  now: number,
+  outcome: UnresolvedSellResolution
+): Promise<string | null> {
+  const label = `a prior SELL (${intent.clientOrderId})`;
+  let probe: OrderProbe;
+  try {
+    const adapter = await adapterFactory(intent);
+    probe = adapter.probe
+      ? await adapter.probe(intent)
+      : { state: "unknown", reason: "this adapter cannot query the exchange" };
+  } catch (error) {
+    return `${label} could not be checked at the exchange (${
+      error instanceof Error ? error.message : "lookup failed"})`;
+  }
+
+  if (probe.state === "filled") {
+    // The ordinary authoritative path, so the recovered fill closes or reduces
+    // the position through exactly the same accounting — and exactly once.
+    try {
+      await applyAuthoritativeResult(intent.id, probe.result);
+    } catch (error) {
+      // The fill is real but could not be booked (a ledger conflict, say). The
+      // intent is therefore still unresolved, and the only safe answer is to
+      // stay blocked and say what happened — never to place another exit.
+      return `${label} filled at the exchange but could not be reconciled (${
+        error instanceof Error ? error.message : "reconciliation failed"})`;
+    }
+    outcome.reconciled += 1;
+    return null;
+  }
+  if (probe.state === "open") {
+    return `${label} is still live at the exchange (${probe.exchangeStatus}); ` +
+      "it must settle before another close";
+  }
+  if (probe.state === "unknown") {
+    return `${label} has unknown exchange state (${probe.reason})`;
+  }
+
+  if (intent.status === "submitted" && probe.state === "absent") {
+    const submittedAt = (intent.submittedAt ?? intent.createdAt).getTime();
+    if (now - submittedAt < SUBMITTED_ABSENCE_SETTLE_MS) {
+      await prisma.strategyOrderIntent.updateMany({
+        where: { id: intent.id, status: "submitted" },
+        data: { exchangeStatus: "ABSENT" },
+      });
+      return `${label} was submitted moments ago and the exchange has no record of it yet; ` +
+        "retry once it settles";
+    }
+  }
+
+  const closed = probe.state === "absent"
+    ? await closeOffUnresolvedIntent(intent, "ABSENT",
+      intent.status === "requested"
+        ? "Never reached the exchange: the intent was still `requested`, so no order was sent"
+        : "The exchange has no order under this client order id; no exit was placed")
+    : await closeOffUnresolvedIntent(intent, probe.exchangeStatus,
+      `The exchange order ended ${probe.exchangeStatus} with no fill; no exit was placed`);
+  if (!closed) {
+    return `${label} changed state while it was being resolved; retry`;
+  }
+  outcome.discarded += 1;
+  return null;
 }
 
 function resultFromIntent(intent: StrategyOrderIntent): OrderResult | undefined {
@@ -467,6 +634,13 @@ export function strategyMarketAdapter(
     query: (intent) => dryRun
       ? Promise.resolve(null)
       : queryFilledMarketOrder(
+        client, intent.symbol, intent.side as "BUY" | "SELL", intent.clientOrderId),
+    // In dry run there is no exchange to consult, so there is no evidence — not
+    // evidence of absence. Anything else would let a simulated run authorise a
+    // resolution it cannot possibly have proved.
+    probe: (intent) => dryRun
+      ? Promise.resolve<OrderProbe>({ state: "unknown", reason: "dry run: no exchange to consult" })
+      : probeOrderByClientId(
         client, intent.symbol, intent.side as "BUY" | "SELL", intent.clientOrderId),
   };
 }

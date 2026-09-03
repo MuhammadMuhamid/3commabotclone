@@ -28,7 +28,7 @@ import { Prisma } from "@prisma/client";
 import { sendExecutionNotification } from "./push.js";
 import {
   AuthorizationNonceReplayError,
-  hasUnresolvedStrategySell, reconcileStrategyIntent, reserveStrategyIntent,
+  reconcileStrategyIntent, reserveStrategyIntent, resolveUnresolvedStrategySells,
   strategyMarketAdapter, type StrategyCrashHooks,
 } from "./strategyOrderIntent.js";
 import { platformWebhookIdentity } from "../contract/realizationEventContract.js";
@@ -527,39 +527,34 @@ export async function processWebhook(
       }
 
       const client = await clientFactory(bot);
-      let qty = body.quantity;
-      const active = await prisma.smartTrade.findFirst({
+      let active = await prisma.smartTrade.findFirst({
         where: { botId: bot.id, pair: symbol, status: "active" },
         orderBy: { createdAt: "desc" },
       });
       if (!active && !skipExitCheck) {
         throw new Error(`No active SmartTrade for ${symbol}`);
       }
+
       /*
        * X-01: a `sell_percent` of exactly 100 is a FULL CLOSE, not an invalid
        * partial. It used to be rejected outright — a terminal 400 — so the
        * take-profit never reached the exchange while the sender marked the tier
        * done. It is now treated as the full close it is.
+       *
+       * This is the PURE validation of the payload, and it stays ahead of the
+       * close lock and of any exchange call: a malformed request must be
+       * refused before anything is claimed. The sizing it feeds happens below,
+       * after a prior unresolved SELL has been resolved, because that can
+       * legitimately change what the position holds.
        */
       let partialPct = body.sell_percent;
       if (partialPct != null && (!Number.isFinite(partialPct) || partialPct <= 0 || partialPct > 100)) {
         throw new Error("sell_percent must be greater than 0 and at most 100; omit it for a full close");
       }
       if (partialPct != null && partialPct >= 100) partialPct = null;
-      if (partialPct != null) {
-        if (!active) throw new Error(`No active SmartTrade for ${symbol}`);
-        if (body.quantity != null && body.quantity > 0) {
-          throw new Error("Use either sell_percent or quantity, not both");
-        }
-        qty = active.quantity * partialPct / 100;
+      if (partialPct != null && body.quantity != null && body.quantity > 0) {
+        throw new Error("Use either sell_percent or quantity, not both");
       }
-      // Treat 0 the same as null/undefined — indicator sends 0.000000 to mean "auto-detect"
-      if (qty == null || qty <= 0) {
-        qty = active?.quantity ?? (await getBaseFreeBalance(client, symbol));
-      }
-      // A webhook sell may reduce the tracked position, never unrelated wallet holdings.
-      if (active) qty = Math.min(qty, active.quantity);
-      if (!qty || qty <= 0) throw new Error("No quantity to sell");
 
       /*
        * BOT-005: TAKE the lock, do not merely read it.
@@ -570,6 +565,11 @@ export async function processWebhook(
        * coinciding with a SELL webhook issued two market sells for one
        * position, and because a sell is capped against the shared WALLET
        * balance, the second could eat another bot's position in the same asset.
+       *
+       * BOT-P1-2 moved this ahead of the quantity arithmetic: resolving a prior
+       * unresolved SELL below can legitimately reduce or close the position, so
+       * the quantity has to be computed from what the trade holds AFTER that,
+       * and the lock has to be held across the whole read-resolve-read sequence.
        *
        * Released in the `finally` at the end of the sell branch.
        */
@@ -595,11 +595,59 @@ export async function processWebhook(
         }
       }
 
-      if (active && await hasUnresolvedStrategySell(active.id)) {
-        throw new Error(
-          `${symbol}: a prior strategy SELL has unresolved exchange state; reconcile it before another close`
-        );
+      /*
+       * BOT-P1-2: a prior SELL intent stuck in `submitted` used to wedge this
+       * path forever, and `skipExitCheck` did not exempt it, so the dashboard
+       * Close button was dead too and the remedy was editing the database.
+       *
+       * The guard is right — never place a second exit while a first one's fate
+       * is unknown — it just had no way to LEARN that fate. It does now, and it
+       * is the same query-first authority the reconciler uses: the exact
+       * exchange order belonging to that exact intent is looked up, a fill is
+       * reconciled through the ordinary accounting path, an order proven never
+       * to have been placed is closed off, and anything still live or genuinely
+       * unknowable keeps this call blocked with a truthful reason. Deliberately
+       * NOT exempted by `skipExitCheck`: an operator close must go through the
+       * same resolution, never around it.
+       */
+      if (active) {
+        const resolution = await resolveUnresolvedStrategySells(
+          active.id, async () => strategyMarketAdapter(client));
+        if (resolution.blocked) {
+          throw new Error(
+            `${symbol}: a prior strategy SELL has unresolved exchange state — ${resolution.reason}`
+          );
+        }
+        if (resolution.reconciled > 0) {
+          // The recovered fill has already moved the ledger. Re-read before
+          // sizing anything, so this close cannot be sized off a stale quantity.
+          const refreshed = await prisma.smartTrade.findUnique({ where: { id: active.id } });
+          if (!refreshed || refreshed.status !== "active") {
+            await prisma.webhookLog.update({ where: { id: log.id }, data: { status: "ok" } });
+            return {
+              status: "ignored_duplicate",
+              detail: `${symbol}: the prior SELL was already filled at the exchange and has now ` +
+                "been reconciled; it closed this position. No second order was placed.",
+            };
+          }
+          active = refreshed;
+        }
       }
+
+      let qty = body.quantity;
+      if (partialPct != null) {
+        if (!active) throw new Error(`No active SmartTrade for ${symbol}`);
+        // Sized off the position as it stands NOW, after any prior unresolved
+        // SELL was reconciled — never off the quantity read before that.
+        qty = active.quantity * partialPct / 100;
+      }
+      // Treat 0 the same as null/undefined — indicator sends 0.000000 to mean "auto-detect"
+      if (qty == null || qty <= 0) {
+        qty = active?.quantity ?? (await getBaseFreeBalance(client, symbol));
+      }
+      // A webhook sell may reduce the tracked position, never unrelated wallet holdings.
+      if (active) qty = Math.min(qty, active.quantity);
+      if (!qty || qty <= 0) throw new Error("No quantity to sell");
 
       const scope = idempotencyScope(bot.id, symbol, "sell", body.dedupe_key);
       const intent = await reserveStrategyIntent({

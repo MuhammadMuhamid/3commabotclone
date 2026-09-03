@@ -411,3 +411,44 @@ model RiskControl {
   dailyLossWindowHours  Int       @default(24)
   updatedAt             DateTime  @updatedAt
 }
+
+/**
+ * Durable per-attempt identity for the exchange orders that are placed OUTSIDE
+ * `StrategyOrderIntent` — the dashboard partial close, the TP/SL monitor and
+ * the manual protection poller.
+ *
+ * BOT-P1-1: those three sites derived their client order id from a scope that
+ * named only the position and a non-unique discriminator (`partial:<id>:<pct>`,
+ * `tpsl:<id>:tp`). Two genuinely distinct orders therefore reused one exchange
+ * client order id, and `marketSellBase`'s duplicate-rejection branch — which is
+ * correct for a true retry — resolved the SECOND order to the FIRST one's fill.
+ *
+ * The row is the missing authority. `intentKey` names the logical order slot;
+ * `attempt` is a durable counter within it, never a clock. Exactly one attempt
+ * per slot is `open` at a time: a retry or a crash recovery of the same logical
+ * order finds that row and reuses its id, and a genuinely new order can only be
+ * opened once the previous attempt has been SETTLED — which happens in the same
+ * transaction that applies its fill locally. That makes the settle transition
+ * the exactly-once key as well: a recovered fill can be applied by whoever wins
+ * it, and by nobody twice.
+ */
+model ExchangeOrderAttempt {
+  id              String    @id @default(uuid())
+  /// Stable identity of the logical order slot this attempt belongs to.
+  intentKey       String
+  /// Monotonic attempt number within `intentKey`. A counter, never a timestamp.
+  attempt         Int
+  /// The exchange-facing client order id derived from (intentKey, attempt).
+  clientOrderId   String    @unique
+  symbol          String
+  side            String
+  /// `open` while this attempt owns the slot; `settled` once its result applied.
+  status          String    @default("open")
+  exchangeOrderId String?
+  settledAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([intentKey, attempt])
+  @@index([intentKey, status])
+}

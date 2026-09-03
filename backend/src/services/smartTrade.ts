@@ -9,6 +9,7 @@ import {
   releaseTradeClose,
 } from "../lib/tradeCloseLock.js";
 import { sendExecutionNotification } from "./push.js";
+import { openOrderAttempt, settleOrderAttempt } from "./orderAttempt.js";
 import { mapWithConcurrency } from "../lib/scheduler.js";
 
 /**
@@ -281,8 +282,30 @@ export async function checkTakeProfitStopLoss(
        * the wrong cost basis. The re-fetch was already there; it just was not
        * used.
        */
+      /*
+       * BOT-P1-1: the scope used to be `tpsl:${trade.id}:${tp|sl}`, which names
+       * the position and the leg but nothing that separates one attempt from
+       * the next. When a TP sell filled only partially the branch below
+       * deliberately leaves the trade OPEN — and the next 30-second cycle then
+       * derived the identical client order id. Binance answered "duplicate
+       * order", `marketSellBase` classified that as ambiguous (correctly, for a
+       * true retry) and resolved this cycle's sell to the PREVIOUS cycle's
+       * fill: the stale, larger `executedQty` cleared the 0.999 cover test and
+       * the trade was marked closed while the unsold remainder sat unmanaged.
+       *
+       * The durable attempt separates the two. The previous cycle's attempt was
+       * settled when its shortfall was booked, so this cycle opens a new one and
+       * carries a different id; a crash-interrupted cycle finds its own attempt
+       * still open and keeps the id it already sent.
+       */
+      const attempt = await openOrderAttempt({
+        intentKey: `tpsl:${trade.id}:${hitTp ? "tp" : "sl"}`,
+        symbol: trade.pair,
+        side: "SELL",
+      });
+
       const sellResult = await marketSellBase(client, trade.pair, fresh.quantity, {
-        idempotencyScope: `tpsl:${trade.id}:${hitTp ? "tp" : "sl"}`,
+        explicitClientOrderId: attempt.clientOrderId,
       });
       const { pnlUsdt, pnlPct } = calcFinalClosePnl(
         sellResult.cummulativeQuoteQty,
@@ -294,32 +317,48 @@ export async function checkTakeProfitStopLoss(
       // rather than marking it closed with the remainder stranded.
       if (sellResult.executedQty < fresh.quantity * 0.999) {
         const remaining = fresh.quantity - sellResult.executedQty;
-        await prisma.smartTrade.update({
-          where: { id: trade.id },
-          data: {
-            quantity: Math.max(0, remaining),
-            quoteSpent: Math.max(0, fresh.quoteSpent * (remaining / fresh.quantity)),
-            currentPrice: sellResult.avgPrice,
-          },
+        // Settling in the same transaction that books the shortfall is what
+        // makes this fill count exactly once — and is what frees the slot so
+        // the next cycle's sell is a NEW attempt with its own client order id.
+        const applied = await prisma.$transaction(async (tx) => {
+          if (!(await settleOrderAttempt(tx, attempt.id, String(sellResult.orderId)))) return false;
+          await tx.smartTrade.update({
+            where: { id: trade.id },
+            data: {
+              quantity: Math.max(0, remaining),
+              quoteSpent: Math.max(0, fresh.quoteSpent * (remaining / fresh.quantity)),
+              currentPrice: sellResult.avgPrice,
+            },
+          });
+          return true;
         });
-        console.error(
-          `[tpsl] ${trade.pair}: close filled ${sellResult.executedQty} of ${fresh.quantity}; ` +
-          `trade ${trade.id} remains OPEN with ${remaining} outstanding`
-        );
+        if (applied) {
+          console.error(
+            `[tpsl] ${trade.pair}: close filled ${sellResult.executedQty} of ${fresh.quantity}; ` +
+            `trade ${trade.id} remains OPEN with ${remaining} outstanding`
+          );
+        }
         continue;
       }
 
-      await prisma.smartTrade.update({
-        where: { id: trade.id },
-        data: {
-          status: "closed",
-          closedAt: new Date(),
-          closedReason: hitTp ? "take_profit" : "stop_loss",
-          currentPrice: sellResult.avgPrice,
-          pnlUsdt,
-          pnlPct,
-        },
+      const applied = await prisma.$transaction(async (tx) => {
+        if (!(await settleOrderAttempt(tx, attempt.id, String(sellResult.orderId)))) return false;
+        await tx.smartTrade.update({
+          where: { id: trade.id },
+          data: {
+            status: "closed",
+            closedAt: new Date(),
+            closedReason: hitTp ? "take_profit" : "stop_loss",
+            currentPrice: sellResult.avgPrice,
+            pnlUsdt,
+            pnlPct,
+          },
+        });
+        return true;
       });
+      // A fill already booked by another recovery of this same attempt must not
+      // close the trade, record a pair close or notify a second time.
+      if (!applied) continue;
       // Record close so stale SELL webhooks don't close the next trade on this pair
       if (trade.botId) await recordPairClose(trade.botId, trade.pair);
       void sendExecutionNotification({

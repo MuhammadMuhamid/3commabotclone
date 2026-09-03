@@ -3,10 +3,33 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { calcRealizedPnl, calcFinalClosePnl } from "../services/smartTrade.js";
 import { acquireTradeClose, isTradeClosing, releaseTradeClose } from "../lib/tradeCloseLock.js";
-import { marketSellBase, resolveSellQuantity, clientFromAccount, clientFromEnv } from "../services/binance.js";
+import {
+  marketSellBase, resolveSellQuantity, clientFromAccount, clientFromEnv,
+  type BinanceClient,
+} from "../services/binance.js";
+import type { ExchangeAccount } from "@prisma/client";
 import { sendExecutionNotification } from "../services/push.js";
+import { openOrderAttempt, settleOrderAttempt } from "../services/orderAttempt.js";
 
 export const tradesRouter = Router();
+
+/**
+ * How this router obtains an exchange client.
+ *
+ * A mutable export in the same idiom as `checkTakeProfitStopLoss`'s
+ * `resolveClient` option and `reconcilePendingManualOrders`'s `adapterFactory`:
+ * an HTTP handler has nowhere to accept an injected dependency, and without a
+ * seam the only way to exercise this path is against the real Binance client.
+ * Production never reassigns it.
+ */
+export const tradeExchangeClient = {
+  resolve(bot: { exchangeAccountId: string | null; exchangeAccount: ExchangeAccount | null }):
+  BinanceClient | null {
+    return bot.exchangeAccountId && bot.exchangeAccount
+      ? clientFromAccount(bot.exchangeAccount)
+      : clientFromEnv();
+  },
+};
 
 // Delete a closed trade from history
 tradesRouter.delete("/:id", async (req, res) => {
@@ -127,9 +150,7 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
     }
     try {
     // Resolve client
-    const client = trade.bot.exchangeAccountId && trade.bot.exchangeAccount
-      ? clientFromAccount(trade.bot.exchangeAccount)
-      : clientFromEnv();
+    const client = tradeExchangeClient.resolve(trade.bot);
     if (!client) {
       return res.status(503).json({ error: "No Binance credentials configured." });
     }
@@ -138,8 +159,27 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
     const requestedQty = trade.quantity * (pct / 100);
     const sellQty = await resolveSellQuantity(client, trade.pair, requestedQty);
 
+    /*
+     * BOT-P1-1: the scope used to be `partial:${trade.id}:${pct}` — a pure
+     * function of the position and the percentage, with nothing that
+     * distinguishes one 25% exit from the next one. Two legitimate scale-outs
+     * at the same percentage therefore presented the SAME client order id, and
+     * `marketSellBase`'s duplicate-rejection branch resolved the second order
+     * to the FIRST order's fill: a second PartialClose row carrying the first
+     * sale's revenue, the position reduced twice on paper with nothing sold,
+     * and that fabricated P&L feeding the daily-loss kill switch.
+     *
+     * The durable attempt is the missing identity. A retry or crash recovery of
+     * THIS exit finds the same open attempt and keeps its id, so query-first
+     * recovery still works; a genuinely new exit can only be opened once this
+     * one has settled, and therefore carries a different id.
+     */
+    const attempt = await openOrderAttempt({
+      intentKey: `partial:${trade.id}:${pct}`, symbol: trade.pair, side: "SELL",
+    });
+
     const orderResult = await marketSellBase(client, trade.pair, sellQty, {
-      idempotencyScope: `partial:${trade.id}:${pct}`,
+      explicitClientOrderId: attempt.clientOrderId,
     });
 
     // Proportional cost of the slice being sold
@@ -164,9 +204,19 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
       );
     }
 
-    // Record the partial close and update the parent trade atomically
-    const [partial, updatedTrade] = await prisma.$transaction([
-      prisma.partialClose.create({
+    /*
+     * Record the partial close and update the parent trade atomically — and
+     * settle the attempt in the SAME transaction.
+     *
+     * BOT-P1-1: that compare-and-set is the exactly-once key. A crash between
+     * the exchange fill and this write leaves the attempt open, so the next
+     * request reuses its client order id and recovers the SAME fill; settling
+     * here is what guarantees that fill reduces the position and books P&L
+     * once, no matter how many callers recover it.
+     */
+    const applied = await prisma.$transaction(async (tx) => {
+      if (!(await settleOrderAttempt(tx, attempt.id, String(orderResult.orderId)))) return null;
+      const partial = await tx.partialClose.create({
         data: {
           tradeId: trade.id,
           pct,
@@ -176,8 +226,8 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
           avgPrice: orderResult.avgPrice,
           exchangeOrderId: String(orderResult.orderId),
         },
-      }),
-      prisma.smartTrade.update({
+      });
+      const updatedTrade = await tx.smartTrade.update({
         where: { id: trade.id },
         data: {
           quantity:   newQuantity,
@@ -197,8 +247,15 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
           bot: { select: { id: true, name: true, exchangeAccount: { select: { name: true } } } },
           partialCloses: { orderBy: { createdAt: "asc" } },
         },
-      }),
-    ]);
+      });
+      return { partial, updatedTrade };
+    });
+    if (!applied) {
+      return res.status(409).json({
+        error: "This partial exit has already been recorded; no second sale was made.",
+      });
+    }
+    const { partial, updatedTrade } = applied;
 
     void sendExecutionNotification({
       side: "sell", symbol: trade.pair, quantity: orderResult.executedQty,
