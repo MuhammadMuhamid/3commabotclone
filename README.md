@@ -282,6 +282,13 @@ npm run dev
 
 API runs at `http://localhost:4000`.
 
+> **Running the Platform on the same Mac?** It defaults to port 4000 too. Move
+> the bot, not the platform: set `PORT=4001` and `PUBLIC_URL=http://localhost:4001`
+> in `backend/.env`, and point the dev proxy in `frontend/vite.config.ts` at 4001.
+> The platform's `MANUAL_TRADING_BOT_URL` already defaults to
+> `http://localhost:4001`. Leave `PORT=4000` for the Docker deployment — the
+> compose port mapping, the image's `EXPOSE` and its healthcheck all use 4000.
+
 ### 2. Frontend
 
 ```bash
@@ -383,7 +390,8 @@ Host nginx config lives in `deploy/nginx-production.conf`.
 | `ENCRYPTION_KEY` | 32+ char key to encrypt stored API secrets |
 | `PUBLIC_URL` | Public HTTPS URL (webhook links in UI) |
 | `DRY_RUN` | `true` = log orders, no Binance calls |
-| `PORT` | API port (default 4000) |
+| `PORT` | API port (default 4000; use 4001 when the platform runs on the same host — see Quick start) |
+| `EXCHANGE_STOPS_ENABLED` | `false` by default. `true` places resting stop orders at Binance; requires the testnet checks in `backend/src/services/exchangeStops.ts` |
 | `JWT_SECRET` | Signs session tokens (`openssl rand -hex 64`). Changing it logs you out |
 | `SCRYPT_SALT` | KDF salt (`openssl rand -hex 16`). Changing it invalidates stored API keys |
 | `SECURE_COOKIES` | `false` only for local HTTP dev; `true` in production |
