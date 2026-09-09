@@ -1595,7 +1595,7 @@ test("L: a SELL is never blocked by a Shariah authorisation having been spent", 
   assert.ok(orders.some((o) => o.side === "SELL"), "an exit must actually have been placed");
 });
 
-test("M: Mode OFF traffic is unchanged and never needs an authorisation", async () => {
+test("M: internal Mode OFF evaluation remains available behind the public authority gate", async () => {
   const bot = await createBot({ maxInvestmentUnit: "usdt_bot", maxInvestmentPct: 10_000 });
   const { client, orders } = recordingClient();
   // No installation floor, no latch: an ordinary non-enforcing installation.
@@ -1604,7 +1604,8 @@ test("M: Mode OFF traffic is unchanged and never needs an authorisation", async 
       dedupe_key: uniq("W"), ...extra },
     { clientFactory: async () => client as never });
 
-  // A direct TradingView alert: no block, no signature, no nonce. Repeatedly.
+  // These are service-level calls. The public route rejects the equivalent
+  // no-correlation BUY before this internal execution function is reached.
   assert.equal((await call({})).status, "ok");
   assert.equal((await call({})).status, "ok");
 
@@ -1623,6 +1624,43 @@ test("M: Mode OFF traffic is unchanged and never needs an authorisation", async 
   const claimed = await prisma.strategyOrderIntent.count({
     where: { botId: bot.id, authorizationNonceHash: { not: null } } });
   assert.equal(claimed, 0, "nothing under Mode OFF may spend an authorisation");
+});
+
+test("FC1-B3: a correlated signed Platform BUY is accepted once and forged/replayed authority is refused", async () => {
+  const bot = await createBot({ maxInvestmentUnit: "usdt_bot", maxInvestmentPct: 10_000 });
+  const { client, orders } = recordingClient();
+  const authority = signedShariah("APTUSDT", "buy", { mode: "off" });
+  const correlation = {
+    deploymentId: "11111111-1111-4111-8111-111111111111",
+    orderIntentId: "41",
+  };
+  const body = {
+    secret: bot.webhookSecret, action: "buy", symbol: "APTUSDT",
+    quote_order_qty: 100, dedupe_key: uniq("PLATFORM"), ...authority,
+  };
+  const opts = { clientFactory: async () => client as never, platformCorrelation: correlation };
+
+  assert.equal((await processWebhook(body, opts)).status, "ok");
+  assert.equal((await processWebhook(body, opts)).status, "ignored_duplicate");
+  assert.equal(orders.length, 1, "an identical Platform redelivery is idempotent");
+
+  const forged = {
+    ...body,
+    dedupe_key: uniq("FORGED"),
+    shariah_sig: `v1=${"0".repeat(64)}`,
+    shariah_nonce: signedShariah("APTUSDT", "buy", { mode: "off" }).shariah_nonce,
+  };
+  const rejected = await processWebhook(forged, opts);
+  assert.equal(rejected.status, "shariah_blocked");
+  assert.equal(orders.length, 1, "forged Platform authority must never reach the exchange");
+
+  const replayedAuthority = await processWebhook({
+    ...body,
+    dedupe_key: uniq("REPLAY"),
+  }, opts);
+  assert.equal(replayedAuthority.status, "shariah_blocked");
+  assert.equal((replayedAuthority.detail as { code: string }).code, "SHARIAH_EVIDENCE_REPLAYED");
+  assert.equal(orders.length, 1);
 });
 
 test("N: a missing or malformed authorisation under enforcement fails CLOSED", async () => {

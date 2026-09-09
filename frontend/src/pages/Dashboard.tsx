@@ -12,6 +12,7 @@ import {
   Btn, Badge, StatusDot, LongBadge, Skeleton, toast,
 } from "../components/ui";
 import { Dialog } from "../components/Dialog";
+import { startDashboardPolling } from "../dashboardPolling";
 
 type BotFilter = "all" | "active" | "stopped";
 
@@ -916,7 +917,7 @@ export default function Dashboard() {
     }
   };
 
-  const load = async (silent = false) => {
+  const load = useCallback(async (silent = false) => {
     if (!silent) setRefreshing(true);
     try {
       const [botList, s, t, accs, ops] = await Promise.all([
@@ -943,13 +944,12 @@ export default function Dashboard() {
       setLoading(false);
       setRefreshing(false);
     }
-  };
+  }, [tradeTab]);
 
   useEffect(() => {
-    load(false);
-    const id = setInterval(() => load(true), 15000);
-    return () => clearInterval(id);
-  }, [tradeTab]);
+    void load(false);
+    return startDashboardPolling(() => load(true));
+  }, [load]);
 
   const filteredBots = bots.filter((b) =>
     botFilter === "active" ? b.status === "active" :

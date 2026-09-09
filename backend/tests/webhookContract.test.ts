@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { webhookSchema, positionStatusSchema } from "../src/routes/webhookSchema.js";
 import { resolveAction, resolveSymbol, isPlaceholderPayload, tradeEventKey } from "../src/services/webhook.js";
 import { normalizeSymbol, parsePair, toBinanceSymbol } from "../src/lib/symbols.js";
+import { webhooksRouter } from "../src/routes/webhooks.js";
 
 const SECRET = "s".repeat(40);
 const buy = (over: Record<string, unknown> = {}) => ({
@@ -22,11 +23,47 @@ const sell = (over: Record<string, unknown> = {}) => ({
   dedupe_key: "X-1888888-1700000000000", ...over,
 });
 
+async function callPublicWebhook(body: unknown, headers: Record<string, string> = {}) {
+  const layers = (webhooksRouter as unknown as {
+    stack: { route?: { path: string; methods: Record<string, boolean>;
+      stack: { handle: (req: unknown, res: unknown, next: (error?: unknown) => void) => void }[] } }[];
+  }).stack;
+  const layer = layers.find((item) =>
+    item.route?.path === "/signal_bots" && item.route.methods.post);
+  assert.ok(layer?.route, "public signal webhook route is missing");
+  return await new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+    let status = 200;
+    const res = {
+      status(code: number) { status = code; return res; },
+      json(payload: unknown) { resolve({ status, body: payload }); return res; },
+    };
+    layer.route!.stack[0]!.handle({
+      body,
+      get(name: string) { return headers[name.toLowerCase()]; },
+    }, res, (error?: unknown) => error ? reject(error) : undefined);
+  });
+}
+
 // ── Schema ─────────────────────────────────────────────────────────────────
 
 test("the BUY payload the platform emits parses", () => {
   const r = webhookSchema.safeParse(buy());
   assert.equal(r.success, true, r.success ? "" : JSON.stringify(r.error.issues));
+});
+
+test("FC1-B3: every public no-correlation BUY alias is rejected before order processing", async () => {
+  for (const action of ["buy", "BUY", "enter_long", "long", "entry-long", "open long"]) {
+    for (const shariah of [undefined, { mode: "off" }, {
+      mode: "enforce", policyVersion: "TS_SHARIAH_V1", assetId: "reg_apt_0001",
+      baseAsset: "APT", effectiveStatus: "ELIGIBLE", publicationId: "pub-test",
+    }]) {
+      const result = await callPublicWebhook(buy({ action, shariah }));
+      assert.equal(result.status, 403, `${action} without Platform correlation`);
+      assert.deepEqual(result.body, {
+        error: "Platform authority required for exposure-increasing BUY",
+      });
+    }
+  }
 });
 
 test("the full-close SELL payload the platform emits parses", () => {

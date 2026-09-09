@@ -65,8 +65,9 @@ export const webhookSchema = z.object({
   exit_leg: z.enum(["tp1", "tp2", "runner", "stop", "signal"]).optional(),
   dedupe_key: z.string().min(1).max(256).optional(),
   /*
-   * Optional: a sender that does not enforce (including a direct TradingView
-   * alert, which cannot produce one) omits it and keeps its existing behaviour.
+   * Optional at schema level because a direct TradingView SELL cannot produce
+   * it and exits must stay available. The route/service separately require
+   * authenticated durable Platform authority for every BUY.
    */
   shariah: shariahContextSchema,
   /*

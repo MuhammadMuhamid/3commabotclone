@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { processWebhook } from "../services/webhook.js";
+import { processWebhook, resolveAction } from "../services/webhook.js";
 import {
   operationalStatusSchema, positionStatusSchema, strategyExecutionEvidenceSchema, webhookSchema,
 } from "./webhookSchema.js";
@@ -83,6 +83,11 @@ webhooksRouter.post("/signal_bots", async (req, res) => {
         || (deploymentId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deploymentId))
         || (orderIntentId && !/^[1-9]\d{0,18}$/.test(orderIntentId))) {
       return res.status(400).json({ error: "Invalid Platform correlation headers" });
+    }
+    if (resolveAction(parsed.data.action) === "buy" && (!deploymentId || !orderIntentId)) {
+      return res.status(403).json({
+        error: "Platform authority required for exposure-increasing BUY",
+      });
     }
     const result = await processWebhook(parsed.data, { platformCorrelation:
       deploymentId && orderIntentId ? { deploymentId, orderIntentId } : undefined });

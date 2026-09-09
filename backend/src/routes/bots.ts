@@ -106,16 +106,6 @@ function webhookUrl(): string {
   return `${config.publicUrl}/api/webhooks/signal_bots`;
 }
 
-function entryJson(secret: string): object {
-  return {
-    secret,
-    action: "{{strategy.order.action}}",
-    symbol: "{{ticker}}",
-    quote_order_qty: null,
-    dedupe_key: "{{timenow}}",
-  };
-}
-
 function exitJson(secret: string): object {
   return {
     secret,
@@ -128,10 +118,10 @@ function exitJson(secret: string): object {
 function tradingViewSetup(): object {
   return {
     webhookUrl: webhookUrl(),
-    alertCondition: "SR+Trend v5 → alert() function calls only",
+    alertCondition: "Exit alerts only — Platform is the sole BUY authority",
     message: "{{alert_message}}",
     note:
-      "Do not use Order fills and alert() — duplicates every signal. Exits use Pine longJustClosed + alert(). See deploy/TRADINGVIEW-ALERT-FIX-DOUBLE.md",
+      "Direct TradingView BUY alerts are disabled. Exposure-reducing SELL alerts remain available.",
   };
 }
 
@@ -173,7 +163,6 @@ function mapBot(
     // only in a revealed response.
     ...(reveal
       ? {
-          entryWebhookJson: entryJson(webhookSecret),
           exitWebhookJson: exitJson(webhookSecret),
         }
       : {}),

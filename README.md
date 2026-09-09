@@ -1,6 +1,8 @@
-# Signal Bot — TradingView + Binance (3commas-style)
+# Signal Bot — Platform-authorized Binance Spot execution
 
-Full-stack signal trading bot: connect **Binance Spot**, receive **TradingView webhooks**, manage **multi-pair bots**, and trade from a **3commas-inspired** dashboard.
+Full-stack execution bot: connect **Binance Spot**, execute authenticated
+Platform decisions, manage **multi-pair bots**, and monitor them from a
+3commas-inspired dashboard. Direct TradingView traffic is exit-only.
 
 > **Risk:** Live trading can lose money. Start with `DRY_RUN=true` and tiny position sizes.
 
@@ -14,10 +16,12 @@ This is the **execution** half of the system.
 | Places exchange orders | **yes** | no |
 | Holds Binance API keys | yes, AES-256-GCM encrypted at rest | **never** |
 
-It receives buy/sell instructions over HTTP from two independent senders — the
-platform's live runner, and TradingView alerts — and turns them into Binance
-Spot market orders. It has no opinion about whether an instruction is a good
-idea.
+It receives canonical buy/sell decisions from the Platform and turns them into
+Binance Spot market orders. Every exposure-increasing BUY must carry paired
+Platform deployment/order-intent correlation plus signed, single-use durable
+authority. Direct TradingView alerts cannot create exposure; they may only send
+SELL exits so exposure reduction remains available if Platform delivery is
+unavailable.
 
 **Keeping exchange credentials in this process alone is the point of the split.**
 Do not move credential handling into the platform, and do not merge the two
@@ -317,43 +321,33 @@ Sessions use a 15-minute access token with a rotating 30-day refresh token, both
 2. Add your Binance API key + secret (withdraw disabled, IP whitelist recommended).
 3. Create a **Signal Bot** with pairs, direction, entry %, TP/SL toggles.
 
-### 5. TradingView webhook
+### 5. TradingView emergency/independent exit webhook
 
 On the **Create Signal Bot** page, copy:
 
 - **Webhook URL:** `https://YOUR-DOMAIN/api/webhooks/signal_bots`
 - **JSON message** (includes per-bot `secret`)
 
-Paste the URL in TradingView alert → **Notifications** → **Webhook URL**.  
-Paste the JSON in the alert **Message** field (or use Pine `alert()` with the same JSON).
+Paste the URL in TradingView alert → **Notifications** → **Webhook URL**.
+Paste only the generated exit JSON in the alert **Message** field. The UI does
+not generate a BUY payload because direct TradingView entry authority is
+disabled.
 
 Supported actions in JSON:
 
 | action | Meaning |
 |--------|---------|
-| `BUY` / `enter_long` | Open/add long (market buy) |
+| `BUY` / `enter_long` | Rejected unless it carries authenticated durable Platform authority |
 | `SELL` / `exit_long` | Close long (market sell) |
-| `enter_short` | Not fully supported on spot — use futures later |
-| `exit_short` | Close short |
 
-Example:
+Exit example:
 
 ```json
 {
   "secret": "your-bot-secret-from-ui",
-  "action": "BUY",
+  "action": "SELL",
   "symbol": "APTUSDT",
-  "quote_order_qty": 50
-}
-```
-
-Or percentage of bot max investment (omit `quote_order_qty`):
-
-```json
-{
-  "secret": "your-bot-secret",
-  "action": "BUY",
-  "symbol": "APTUSDT"
+  "dedupe_key": "{{timenow}}"
 }
 ```
 

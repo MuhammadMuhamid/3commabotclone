@@ -583,6 +583,9 @@ export function admitSpotEntry(input: {
    * mints no detached evidence and so has nothing to claim.
    */
   intentKey?: string | null;
+  /** Public webhook BUYs set this so signed mode-off decisions are still
+   * single-use durable Platform order authority. */
+  requireDurableAuthority?: boolean;
 }): Promise<EntryAdmission> {
   return withScopeAdmission(input.scope, async () => {
     const { trusted, context, unverified, nonce } = authenticatedDecision(input);
@@ -615,8 +618,14 @@ export function admitSpotEntry(input: {
     }
     await recordShariahMode(input.scope, context);
     const decided = decideEntry(context, input.symbol);
-    const claimHash =
-      context.mode === "enforce" && nonce ? authorizationNonceHash(nonce) : null;
+    // Platform authority and Shariah eligibility are separate boundaries.
+    // Every detached Platform BUY is a single-use durable occasion, including
+    // a truthful signed mode-off decision. The manual HMAC channel already has
+    // its own durable ManualNonce and therefore supplies no detached nonce.
+    const claimHash = input.auth.kind === "detached" && nonce &&
+      (context.mode === "enforce" || input.requireDurableAuthority === true)
+      ? authorizationNonceHash(nonce)
+      : null;
     /*
      * An early, deliberately NON-AUTHORITATIVE replay check.
      *
@@ -636,14 +645,10 @@ export function admitSpotEntry(input: {
       await assertAuthorizationUnspent(claimHash, input.symbol, input.intentKey ?? null);
     }
     /*
-     * Only an ENFORCING decision that actually authorises this entry spends an
-     * authorisation. Two exclusions, both deliberate:
+     * Every detached Platform decision spends its order authorisation. The
+     * eligibility decision may still be mode-off; that does not turn a direct
+     * webhook into Platform authority. One exclusion is deliberate:
      *
-     *   * `mode: "off"` — a signed `off` block still carries a nonce, because
-     *     the nonce is inside the bytes the Platform signs and it signs every
-     *     delivery the same way. But an `off` decision authorises nothing, so
-     *     spending its nonce would make ordinary Mode-OFF traffic single-use
-     *     for no benefit. Mode OFF keeps exactly the behaviour it had.
      *   * the manual HMAC channel — `nonce` is null there by construction, and
      *     that channel is already single-use via `ManualNonce`.
      *

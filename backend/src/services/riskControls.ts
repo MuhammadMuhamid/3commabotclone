@@ -9,9 +9,9 @@
  * and no way to halt trading short of pausing each bot by hand.
  *
  * This is the RECEIVING half. The platform has its own gate before it emits
- * (`engine/riskControls.ts` there), and both are necessary: the platform is not
- * the only sender — TradingView posts to the same endpoint directly — so a gate
- * that lives only in the sender does not cover the second path.
+ * (`engine/riskControls.ts` there), and both are necessary: TradingView may
+ * post exposure-reducing exits to the same endpoint directly, so the receiver
+ * retains its own exit-safe gate too.
  *
  * The decision logic is pure and mirrors the platform's, deliberately: an
  * operator who halts one and not the other should get the same answer to "will

@@ -352,9 +352,16 @@ export async function processWebhook(
         const admission = await admitSpotEntry({
           scope: shariahScope, symbol, context: readShariahContext(body.shariah),
           auth: shariahAuth, intentKey: buyIntentKey,
+          requireDurableAuthority: platformCorrelation !== undefined,
         });
         shariahEvidence = admission.persisted;
         authorizationNonceHash = admission.authorizationNonceHash;
+        if (platformCorrelation && !authorizationNonceHash) {
+          throw new ShariahEnforcementError(
+            "SHARIAH_EVIDENCE_UNVERIFIED",
+            `${symbol}: BUY requires a signed, single-use Platform authorisation`
+          );
+        }
       } catch (error) {
         if (!(error instanceof ShariahEnforcementError)) throw error;
         await prisma.webhookLog.update({ where: { id: log.id },
@@ -430,9 +437,8 @@ export async function processWebhook(
          * BOT-011: the account-level risk gate, immediately before the order.
          *
          * This is the RECEIVING half of the check. The platform gates its own
-         * emission, but it is not the only sender — TradingView posts to this
-         * same endpoint directly — so a gate that lived only in the sender
-         * would not cover the second path.
+         * emission. TradingView may post exits to this endpoint directly, so
+         * the receiver still enforces the same limits while keeping exits safe.
          *
          * `assertCanOpenTrade` above is per-bot and defaults to disabled; this
          * is across every bot on the account.
