@@ -110,6 +110,9 @@ export const config = {
   manualTradingEnabled: process.env.MANUAL_TRADING_ENABLED === "true",
   mainnetManualTradingEnabled: process.env.MAINNET_MANUAL_TRADING_ENABLED === "true",
   manualTradingHmacSecret: process.env.MANUAL_TRADING_HMAC_SECRET ?? "",
+  // X3A has no production counterpart. This flag exposes only the
+  // paper/testnet/demo router; account and environment gates remain mandatory.
+  spotExecutionEnabled: process.env.SPOT_EXECUTION_ENABLED === "true",
 
   // Durable Bot -> Platform realization outbox delivery. Accounting never
   // depends on this peer being available.
@@ -180,6 +183,8 @@ export function collectConfigErrors(): string[] {
     errors.push("MANUAL_TRADING_HMAC_SECRET is a published placeholder value — generate a real one");
   } else if (config.manualTradingEnabled && config.manualTradingHmacSecret.length === 0) {
     errors.push("MANUAL_TRADING_HMAC_SECRET must be set when manual trading is enabled");
+  } else if (config.spotExecutionEnabled && config.manualTradingHmacSecret.length === 0) {
+    errors.push("MANUAL_TRADING_HMAC_SECRET must be set when spot execution is enabled");
   }
 
   if (config.realizationDeliveryEnabled && config.realizationHmacSecret.length < 32) {
@@ -229,6 +234,7 @@ export function collectConfigErrors(): string[] {
   const booleanFlags: Array<[string, RegExp]> = [
     ["DRY_RUN", /^(true|false)$/i],
     ["BINANCE_TESTNET", /^(true|false)$/i],
+    ["SPOT_EXECUTION_ENABLED", /^(true|false)$/],
     ["SECURE_COOKIES", /^(true|false)$/],
   ];
   for (const [name, accepted] of booleanFlags) {

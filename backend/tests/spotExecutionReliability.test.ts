@@ -1,5 +1,6 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
+import express from "express";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -26,6 +27,12 @@ import { deliverPendingRealizations } from "../src/services/realizationEvents.js
 import { canonicalJson, normalizeRealizationEvent, platformWebhookIdentity,
   type RealizationEventV1 } from "../src/contract/realizationEventContract.js";
 import { sumMoney } from "../src/lib/money.js";
+import { spotExecutionRouter } from "../src/routes/spotExecution.js";
+import type { SpotOrderIntent, SpotOrderSnapshot } from "../src/services/spotExecution/model.js";
+import { SpotExecutionError } from "../src/services/spotExecution/model.js";
+import { applySpotSnapshot, cancelSpotExecution, reconcileSpotExecutionOrders,
+  spotExecutionPayloadHash, submitSpotExecution, type SpotExecutionCommand,
+  type SpotExecutionDriver } from "../src/services/spotExecution/service.js";
 
 const backendRoot = path.join(import.meta.dirname, "..");
 const testDb = path.join(backendRoot, "prisma", "tests", ".tmp-test.db");
@@ -36,6 +43,8 @@ const originalConfig = {
   realizationDeliveryEnabled: config.realizationDeliveryEnabled,
   realizationPlatformUrl: config.realizationPlatformUrl,
   realizationHmacSecret: config.realizationHmacSecret,
+  spotExecutionEnabled: config.spotExecutionEnabled,
+  manualTradingHmacSecret: config.manualTradingHmacSecret,
 };
 
 function snapshot(status: ManualOrderSnapshot["status"], base = 0, quote = 0,
@@ -53,6 +62,7 @@ async function createAccount(overrides: Partial<ExchangeAccount> = {}): Promise<
 }
 
 async function clearDatabase(): Promise<void> {
+  await prisma.spotExecutionOrder.deleteMany();
   await prisma.realizationEvent.deleteMany();
   await prisma.partialClose.deleteMany();
   await prisma.strategyOrderIntent.deleteMany();
@@ -77,6 +87,8 @@ before(() => {
   config.dryRun = false;
   config.manualTradingEnabled = true;
   config.mainnetManualTradingEnabled = false;
+  config.spotExecutionEnabled = true;
+  config.manualTradingHmacSecret = "fixture-spot-control-secret-000000000000000";
 });
 
 beforeEach(clearDatabase);
@@ -1256,4 +1268,157 @@ test("F-AUTO-02 F: a single-entry bot's close-then-re-enter in the same minute i
     2,
     "the re-entry reserved a distinct intent from dedupe_key B, not A's"
   );
+});
+
+function x3aCommand(accountId: string, suffix: string, patch: Partial<SpotExecutionCommand> = {}): SpotExecutionCommand {
+  const withoutIdentity = { accountId, venue: "binance" as const, environment: "paper" as const,
+    canonicalInstrumentId: "instrument:v1:crypto:spot:binance:BTC-USDT", venueSymbol: "BTCUSDT",
+    side: "BUY" as const, orderType: "MARKET" as const, quoteQuantity: "100",
+    paperReferencePrice: "50000", ...patch };
+  return { ...withoutIdentity, platformIntent: { id: `platform_intent_${suffix}_1234567890`,
+    dedupeKey: `spot:manual:${suffix}:1234567890`, createdAt: new Date().toISOString(),
+    payloadHash: spotExecutionPayloadHash(withoutIdentity) } };
+}
+
+function x3aSnapshot(intent: SpotOrderIntent, status: SpotOrderSnapshot["status"], base = "0", quote = "0"):
+SpotOrderSnapshot {
+  const now = new Date().toISOString();
+  return { venue: intent.venue, environment: intent.environment, providerOrderId: "provider-x3a-1",
+    clientOrderId: intent.clientOrderId, status, filledBaseQuantity: base, filledQuoteQuantity: quote,
+    averageFillPrice: Number(base) > 0 ? String(Number(quote) / Number(base)) : null,
+    fee: Number(base) > 0 ? { amount: "0.1", asset: "USDT" } : null,
+    providerTimestamp: now, acknowledgedAt: now, lastFillAt: Number(base) > 0 ? now : null,
+    rawStatus: status };
+}
+
+test("X3A timeout after provider acceptance becomes query-only recovery and cannot duplicate", async () => {
+  const account = await createAccount(); const accepted = new Map<string, SpotOrderSnapshot>();
+  let submits = 0, queries = 0;
+  const driver: SpotExecutionDriver = {
+    submit: async (intent) => { submits++; accepted.set(intent.clientOrderId, x3aSnapshot(intent, "FILLED", "0.002", "100"));
+      throw new SpotExecutionError("socket closed after acceptance", "ambiguous"); },
+    query: async (intent) => { queries++; return accepted.get(intent.clientOrderId) ?? null; },
+    cancel: async () => { throw new Error("unused"); },
+  };
+  const command = x3aCommand(account.id, "accepted_timeout");
+  const unknown = await submitSpotExecution(command, () => driver);
+  assert.equal(unknown.status, "ack_unknown"); assert.equal(submits, 1);
+  const replay = await submitSpotExecution(command, () => driver);
+  assert.equal(replay.id, unknown.id); assert.equal(submits, 1, "authenticated retry does not resubmit");
+  await prisma.$disconnect();
+  await reconcileSpotExecutionOrders(() => driver);
+  const filled = await prisma.spotExecutionOrder.findUniqueOrThrow({ where: { id: unknown.id } });
+  assert.equal(filled.status, "filled"); assert.equal(filled.filledBaseQty, "0.002");
+  assert.equal(submits, 1); assert.equal(queries, 1);
+});
+
+test("X3A timeout before acknowledgement stays ambiguous even when lookup is absent", async () => {
+  const account = await createAccount(); let submits = 0, queries = 0;
+  const driver: SpotExecutionDriver = {
+    submit: async () => { submits++; throw new SpotExecutionError("timeout before acknowledgement", "ambiguous"); },
+    query: async () => { queries++; return null; }, cancel: async () => { throw new Error("unused"); },
+  };
+  const command = x3aCommand(account.id, "before_ack");
+  const unknown = await submitSpotExecution(command, () => driver);
+  await reconcileSpotExecutionOrders(() => driver);
+  const pending = await prisma.spotExecutionOrder.findUniqueOrThrow({ where: { id: unknown.id } });
+  assert.equal(pending.status, "ack_unknown");
+  assert.match(pending.error ?? "", /was not retried/); assert.equal(submits, 1); assert.equal(queries, 1);
+});
+
+test("X3A partial fills, duplicate updates, reconnect and restart reconcile monotonically", async () => {
+  const account = await createAccount(); let queryResult: SpotOrderSnapshot | null = null;
+  const driver: SpotExecutionDriver = { submit: async (intent) => {
+    queryResult = x3aSnapshot(intent, "FILLED", "0.002", "100");
+    return x3aSnapshot(intent, "PARTIALLY_FILLED", "0.001", "50"); },
+    query: async () => queryResult, cancel: async () => { throw new Error("unused"); } };
+  const partial = await submitSpotExecution(x3aCommand(account.id, "partial_restart"), () => driver);
+  assert.equal(partial.status, "partially_filled"); assert.equal(partial.filledBaseQty, "0.001");
+  const duplicate = await applySpotSnapshot(partial.id, x3aSnapshot(
+    { ...x3aCommand(account.id, "partial_restart"), clientOrderId: partial.clientOrderId },
+    "PARTIALLY_FILLED", "0.001", "50"));
+  assert.equal(duplicate.filledBaseQty, "0.001");
+  await prisma.$disconnect(); await reconcileSpotExecutionOrders(() => driver);
+  const filled = await prisma.spotExecutionOrder.findUniqueOrThrow({ where: { id: partial.id } });
+  assert.equal(filled.status, "filled"); assert.equal(filled.filledBaseQty, "0.002");
+  const stale = await applySpotSnapshot(filled.id, x3aSnapshot(
+    { ...x3aCommand(account.id, "partial_restart"), clientOrderId: filled.clientOrderId },
+    "PARTIALLY_FILLED", "0.001", "50"));
+  assert.equal(stale.status, "filled"); assert.equal(stale.filledBaseQty, "0.002");
+});
+
+test("X3A cancel race preserves a concurrent fill and never invents cancel success", async () => {
+  const account = await createAccount(); let acceptedIntent: SpotOrderIntent | null = null;
+  const driver: SpotExecutionDriver = {
+    submit: async (intent) => { acceptedIntent = intent; return x3aSnapshot(intent, "OPEN"); },
+    cancel: async () => { throw new SpotExecutionError("cancel response lost", "ambiguous"); },
+    query: async (intent) => x3aSnapshot(intent, "FILLED", "0.002", "100"),
+  };
+  const open = await submitSpotExecution(x3aCommand(account.id, "cancel_race", {
+    orderType: "LIMIT", quoteQuantity: undefined, baseQuantity: "0.002", limitPrice: "50000",
+    timeInForce: "GTC" }), () => driver);
+  assert.ok(acceptedIntent); assert.equal(open.status, "open");
+  const afterCancel = await cancelSpotExecution(open.id, () => driver);
+  assert.equal(afterCancel.status, "open"); assert.match(afterCancel.error ?? "", /cancel outcome unknown/);
+  await reconcileSpotExecutionOrders(() => driver);
+  assert.equal((await prisma.spotExecutionOrder.findUniqueOrThrow({ where: { id: open.id } })).status, "filled");
+});
+
+test("X3A late fill can overtake a cancel acknowledgement only with monotonic fill growth", async () => {
+  const account = await createAccount(); let heldIntent: SpotOrderIntent | null = null;
+  const driver: SpotExecutionDriver = {
+    submit: async (intent) => { heldIntent = intent; return x3aSnapshot(intent, "OPEN"); },
+    query: async () => null,
+    cancel: async (intent) => x3aSnapshot(intent, "CANCELED"),
+  };
+  const open = await submitSpotExecution(x3aCommand(account.id, "late_cancel_fill", {
+    orderType: "LIMIT", quoteQuantity: undefined, baseQuantity: "0.002", limitPrice: "50000",
+    timeInForce: "GTC" }), () => driver);
+  const canceled = await cancelSpotExecution(open.id, () => driver);
+  assert.equal(canceled.status, "canceled"); assert.ok(heldIntent);
+  const duplicateOpen = await applySpotSnapshot(canceled.id, x3aSnapshot(heldIntent, "OPEN"));
+  assert.equal(duplicateOpen.status, "canceled");
+  const filled = await applySpotSnapshot(canceled.id, x3aSnapshot(heldIntent, "FILLED", "0.002", "100"));
+  assert.equal(filled.status, "filled"); assert.equal(filled.filledBaseQty, "0.002");
+});
+
+test("X3A 429/5xx submission errors are ambiguous and never blind-retried", async () => {
+  const account = await createAccount();
+  for (const code of [429, 503]) {
+    let submits = 0; const driver: SpotExecutionDriver = { submit: async () => { submits++;
+      throw new SpotExecutionError(`provider ${code}`, "transient"); }, query: async () => null,
+      cancel: async () => { throw new Error("unused"); } };
+    const command = x3aCommand(account.id, `transient_${code}`);
+    assert.equal((await submitSpotExecution(command, () => driver)).status, "ack_unknown");
+    assert.equal((await submitSpotExecution(command, () => driver)).status, "ack_unknown");
+    assert.equal(submits, 1);
+  }
+});
+
+test("X3A rejects mainnet accounts, payload tampering, and unsupported capability before submission", async () => {
+  const mainnet = await createAccount({ testnet: false }); let submits = 0;
+  const driver: SpotExecutionDriver = { submit: async () => { submits++; throw new Error("must not submit"); },
+    query: async () => null, cancel: async () => { throw new Error("unused"); } };
+  await assert.rejects(submitSpotExecution(x3aCommand(mainnet.id, "mainnet_block"), () => driver), /production\/mainnet/);
+  const safe = await createAccount(); const tampered = x3aCommand(safe.id, "tamper"); tampered.quoteQuantity = "200";
+  await assert.rejects(submitSpotExecution(tampered, () => driver), /payload hash does not match/);
+  const unsupported = x3aCommand(safe.id, "unsupported", { venue: "hyperliquid", orderType: "MARKET",
+    environment: "testnet" });
+  unsupported.platformIntent.payloadHash = spotExecutionPayloadHash(unsupported);
+  await assert.rejects(submitSpotExecution(unsupported, () => driver), /venue\/market does not match|does not support MARKET/);
+  assert.equal(submits, 0); assert.equal(await prisma.spotExecutionOrder.count(), 0);
+});
+
+test("X3A direct/browser exposure-increasing requests are rejected before service code", async () => {
+  const app = express(); app.use(express.json()); app.use("/api/spot-execution/v1", spotExecutionRouter);
+  const server = app.listen(0); await new Promise<void>((resolve) => server.once("listening", resolve));
+  try {
+    const address = server.address(); assert.ok(address && typeof address === "object");
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/spot-execution/v1/orders`, {
+      method: "POST", headers: { "content-type": "application/json", cookie: "access_token=fake-browser-session" },
+      body: JSON.stringify({ side: "BUY" }),
+    });
+    assert.equal(response.status, 401); assert.match(await response.text(), /authentication required/);
+    assert.equal(await prisma.spotExecutionOrder.count(), 0);
+  } finally { await new Promise<void>((resolve, reject) => server.close((e) => e ? reject(e) : resolve())); }
 });

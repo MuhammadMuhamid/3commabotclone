@@ -19,7 +19,56 @@ model ExchangeAccount {
   updatedAt    DateTime    @updatedAt
   bots         SignalBot[]
   manualOrders ManualOrder[]
+  spotExecutionOrders SpotExecutionOrder[]
   smartTrades  SmartTrade[]
+}
+
+/**
+ * X3A venue-neutral crypto Spot execution ledger.
+ *
+ * The Platform identity and complete monetary request are durable before the
+ * status may become `submitted`. Once submitted, recovery is query-only: an
+ * unknown acknowledgement can never create a second provider order.
+ */
+model SpotExecutionOrder {
+  id                    String          @id @default(uuid())
+  platformIntentId      String          @unique
+  platformDedupeKey     String          @unique
+  platformPayloadHash   String
+  platformIntentCreatedAt DateTime
+  exchangeAccountId     String
+  exchangeAccount       ExchangeAccount @relation(fields: [exchangeAccountId], references: [id])
+  venue                 String
+  environment           String
+  canonicalInstrumentId String
+  venueSymbol           String
+  side                  String
+  orderType             String
+  timeInForce           String?
+  requestedBaseQty      String?
+  requestedQuoteQty     String?
+  limitPrice            String?
+  paperReferencePrice   String?
+  clientOrderId         String          @unique
+  status                String          @default("requested")
+  providerOrderId       String?
+  providerStatus        String?
+  filledBaseQty         String          @default("0")
+  filledQuoteQty        String          @default("0")
+  averageFillPrice      String?
+  feeAmount             String?
+  feeAsset              String?
+  error                 String?
+  submittedAt           DateTime?
+  acknowledgedAt        DateTime?
+  lastFillAt            DateTime?
+  reconciledAt          DateTime?
+  completedAt           DateTime?
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+
+  @@index([status, createdAt])
+  @@index([exchangeAccountId, venueSymbol, createdAt])
 }
 
 model SignalBot {

@@ -14,6 +14,7 @@ import { authRouter } from "./routes/auth.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { operationsRouter } from "./routes/operations.js";
 import { manualTradingRouter } from "./routes/manualTrading.js";
+import { spotExecutionRouter } from "./routes/spotExecution.js";
 import { requireAuth } from "./middleware/requireAuth.js";
 import { checkTakeProfitStopLoss } from "./services/smartTrade.js";
 import { detectManualCloses } from "./services/manualCloseSync.js";
@@ -24,6 +25,7 @@ import { startInterval } from "./lib/scheduler.js";
 import { checkManualProtection, reconcileManualTrading } from "./services/manualProtection.js";
 import { reconcilePendingStrategyIntents } from "./services/strategyOrderIntent.js";
 import { deliverPendingRealizations } from "./services/realizationEvents.js";
+import { reconcileSpotExecutionOrders } from "./services/spotExecution/service.js";
 
 // Hard-fail in production if any critical secret is missing
 assertConfig();
@@ -167,6 +169,7 @@ app.use("/api/webhooks", webhookLimiter, webhooksRouter);
 // Separate service-to-service HMAC contract; never accepts strategy body secrets
 // or browser cookies as authentication.
 app.use("/api/manual-trading", apiLimiter, manualTradingRouter);
+app.use("/api/spot-execution/v1", apiLimiter, spotExecutionRouter);
 
 // ─── Protected routes (requireAuth applied globally below) ───────────────────
 app.get("/api/config", requireAuth, apiLimiter, (_req, res) => {
@@ -209,6 +212,10 @@ startInterval("manual-tpsl", 30_000, checkManualProtection);
 void reconcilePendingStrategyIntents().catch(
   (e) => console.error("strategy intent reconciliation failed", e));
 startInterval("strategy-intent-reconcile", 30_000, reconcilePendingStrategyIntents);
+if (config.spotExecutionEnabled) {
+  void reconcileSpotExecutionOrders().catch((e) => console.error("spot execution reconciliation failed", e));
+  startInterval("spot-execution-reconcile", 30_000, reconcileSpotExecutionOrders);
+}
 void deliverPendingRealizations().catch((e) => console.error("realization delivery failed", e));
 startInterval("realization-delivery", 30_000, async () => { await deliverPendingRealizations(); });
 
