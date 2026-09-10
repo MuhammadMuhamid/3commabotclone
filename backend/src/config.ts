@@ -113,6 +113,9 @@ export const config = {
   // X3A has no production counterpart. This flag exposes only the
   // paper/testnet/demo router; account and environment gates remain mandatory.
   spotExecutionEnabled: process.env.SPOT_EXECUTION_ENABLED === "true",
+  // X3B has no production counterpart. External transports remain disabled
+  // until their individual non-production handshakes are evidenced.
+  derivativeExecutionEnabled: process.env.DERIVATIVE_EXECUTION_ENABLED === "true",
 
   // Durable Bot -> Platform realization outbox delivery. Accounting never
   // depends on this peer being available.
@@ -185,6 +188,8 @@ export function collectConfigErrors(): string[] {
     errors.push("MANUAL_TRADING_HMAC_SECRET must be set when manual trading is enabled");
   } else if (config.spotExecutionEnabled && config.manualTradingHmacSecret.length === 0) {
     errors.push("MANUAL_TRADING_HMAC_SECRET must be set when spot execution is enabled");
+  } else if (config.derivativeExecutionEnabled && config.manualTradingHmacSecret.length === 0) {
+    errors.push("MANUAL_TRADING_HMAC_SECRET must be set when derivatives execution is enabled");
   }
 
   if (config.realizationDeliveryEnabled && config.realizationHmacSecret.length < 32) {
@@ -235,6 +240,7 @@ export function collectConfigErrors(): string[] {
     ["DRY_RUN", /^(true|false)$/i],
     ["BINANCE_TESTNET", /^(true|false)$/i],
     ["SPOT_EXECUTION_ENABLED", /^(true|false)$/],
+    ["DERIVATIVE_EXECUTION_ENABLED", /^(true|false)$/],
     ["SECURE_COOKIES", /^(true|false)$/],
   ];
   for (const [name, accepted] of booleanFlags) {

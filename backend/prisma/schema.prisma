@@ -20,6 +20,7 @@ model ExchangeAccount {
   bots         SignalBot[]
   manualOrders ManualOrder[]
   spotExecutionOrders SpotExecutionOrder[]
+  derivativeExecutionOrders DerivativeExecutionOrder[]
   smartTrades  SmartTrade[]
 }
 
@@ -66,6 +67,83 @@ model SpotExecutionOrder {
   completedAt           DateTime?
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt
+
+  @@index([status, createdAt])
+  @@index([exchangeAccountId, venueSymbol, createdAt])
+}
+
+/**
+ * X3B venue-neutral crypto derivatives execution ledger.
+ *
+ * The complete exposure-changing request and the Platform identity are
+ * durable before submission. An ambiguous acknowledgement is reconciled by
+ * client order id and is never resubmitted.
+ */
+model DerivativeExecutionOrder {
+  id                      String          @id @default(uuid())
+  platformIntentId        String          @unique
+  platformDedupeKey       String          @unique
+  platformPayloadHash     String
+  platformIntentCreatedAt DateTime
+  exchangeAccountId       String
+  exchangeAccount         ExchangeAccount @relation(fields: [exchangeAccountId], references: [id])
+  venue                   String
+  environment             String
+  canonicalInstrumentId   String
+  venueSymbol             String
+  contractKind            String
+  contractSize            String
+  baseCurrency            String
+  quoteCurrency           String
+  settlementCurrency      String
+  marginCurrency          String
+  expiry                   DateTime?
+  positionDirection       String
+  actionSide               String
+  quantityUnit            String
+  requestedQuantity       String?
+  marginMode              String
+  leverage                String?
+  positionMode            String
+  reduceOnly              Boolean         @default(false)
+  closePosition           Boolean         @default(false)
+  orderType               String
+  timeInForce             String?
+  limitPrice              String?
+  triggerPrice            String?
+  triggerPriceRole        String?
+  protectionKind          String?
+  paperReferencePrice     String?
+  positionSnapshot        String?
+  shariahContext          String?
+  clientOrderId           String          @unique
+  status                  String          @default("requested")
+  providerOrderId         String?
+  providerStatus          String?
+  filledContracts         String          @default("0")
+  filledBaseQty           String          @default("0")
+  filledNotional          String          @default("0")
+  averageFillPrice        String?
+  realizedPnl             String          @default("0")
+  unrealizedPnl           String          @default("0")
+  pnlCurrency             String?
+  fundingAmount           String          @default("0")
+  fundingCurrency         String?
+  feeAmount               String?
+  feeCurrency             String?
+  markPrice               String?
+  indexPrice              String?
+  lastPrice               String?
+  liquidationPrice        String?
+  maintenanceMargin       String?
+  error                   String?
+  submittedAt             DateTime?
+  acknowledgedAt          DateTime?
+  lastFillAt              DateTime?
+  reconciledAt            DateTime?
+  completedAt             DateTime?
+  createdAt               DateTime        @default(now())
+  updatedAt               DateTime        @updatedAt
 
   @@index([status, createdAt])
   @@index([exchangeAccountId, venueSymbol, createdAt])

@@ -99,16 +99,19 @@ exchangeRouter.get("/:id/total-balance", async (req, res) => {
 exchangeRouter.delete("/:id", async (req, res) => {
   try {
     // BUG-06: Prevent deletion if bots are still linked — they would silently lose credentials
-    const [botCount, manualOrderCount, manualPositionCount, spotExecutionCount] = await Promise.all([
+    const [botCount, manualOrderCount, manualPositionCount, spotExecutionCount, derivativeExecutionCount] = await Promise.all([
       prisma.signalBot.count({ where: { exchangeAccountId: req.params.id } }),
       prisma.manualOrder.count({ where: { exchangeAccountId: req.params.id } }),
       prisma.smartTrade.count({ where: { exchangeAccountId: req.params.id } }),
       prisma.spotExecutionOrder.count({ where: { exchangeAccountId: req.params.id } }),
+      prisma.derivativeExecutionOrder.count({ where: { exchangeAccountId: req.params.id } }),
     ]);
-    if (botCount > 0 || manualOrderCount > 0 || manualPositionCount > 0 || spotExecutionCount > 0) {
+    if (botCount > 0 || manualOrderCount > 0 || manualPositionCount > 0 || spotExecutionCount > 0
+        || derivativeExecutionCount > 0) {
       return res.status(409).json({
         error: `Cannot delete: ${botCount} bot(s), ${manualOrderCount} manual order(s), and ` +
           `${manualPositionCount} manual position record(s), and ${spotExecutionCount} Spot execution order(s) ` +
+          `and ${derivativeExecutionCount} derivatives execution order(s) ` +
           "use this account. Preserve or reassign them first.",
       });
     }

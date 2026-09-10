@@ -28,11 +28,17 @@ import { canonicalJson, normalizeRealizationEvent, platformWebhookIdentity,
   type RealizationEventV1 } from "../src/contract/realizationEventContract.js";
 import { sumMoney } from "../src/lib/money.js";
 import { spotExecutionRouter } from "../src/routes/spotExecution.js";
+import { derivativeExecutionRouter } from "../src/routes/derivativeExecution.js";
 import type { SpotOrderIntent, SpotOrderSnapshot } from "../src/services/spotExecution/model.js";
 import { SpotExecutionError } from "../src/services/spotExecution/model.js";
 import { applySpotSnapshot, cancelSpotExecution, reconcileSpotExecutionOrders,
   spotExecutionPayloadHash, submitSpotExecution, type SpotExecutionCommand,
   type SpotExecutionDriver } from "../src/services/spotExecution/service.js";
+import type { DerivativeOrderIntent, DerivativeOrderSnapshot } from "../src/services/derivativeExecution/model.js";
+import { DerivativeExecutionError } from "../src/services/derivativeExecution/model.js";
+import { applyDerivativeSnapshot, derivativeExecutionPayloadHash, reconcileDerivativeExecutionOrders,
+  submitDerivativeExecution, type DerivativeExecutionCommand,
+  type DerivativeExecutionDriver } from "../src/services/derivativeExecution/service.js";
 
 const backendRoot = path.join(import.meta.dirname, "..");
 const testDb = path.join(backendRoot, "prisma", "tests", ".tmp-test.db");
@@ -44,6 +50,7 @@ const originalConfig = {
   realizationPlatformUrl: config.realizationPlatformUrl,
   realizationHmacSecret: config.realizationHmacSecret,
   spotExecutionEnabled: config.spotExecutionEnabled,
+  derivativeExecutionEnabled: config.derivativeExecutionEnabled,
   manualTradingHmacSecret: config.manualTradingHmacSecret,
 };
 
@@ -62,6 +69,7 @@ async function createAccount(overrides: Partial<ExchangeAccount> = {}): Promise<
 }
 
 async function clearDatabase(): Promise<void> {
+  await prisma.derivativeExecutionOrder.deleteMany();
   await prisma.spotExecutionOrder.deleteMany();
   await prisma.realizationEvent.deleteMany();
   await prisma.partialClose.deleteMany();
@@ -88,6 +96,7 @@ before(() => {
   config.manualTradingEnabled = true;
   config.mainnetManualTradingEnabled = false;
   config.spotExecutionEnabled = true;
+  config.derivativeExecutionEnabled = true;
   config.manualTradingHmacSecret = "fixture-spot-control-secret-000000000000000";
 });
 
@@ -1421,4 +1430,158 @@ test("X3A direct/browser exposure-increasing requests are rejected before servic
     assert.equal(response.status, 401); assert.match(await response.text(), /authentication required/);
     assert.equal(await prisma.spotExecutionOrder.count(), 0);
   } finally { await new Promise<void>((resolve, reject) => server.close((e) => e ? reject(e) : resolve())); }
+});
+
+function x3bCommand(accountId: string, suffix: string,
+  overrides: Partial<DerivativeExecutionCommand> = {}): DerivativeExecutionCommand {
+  const withoutIdentity = { accountId, venue: "binance" as const, environment: "paper" as const,
+    canonicalInstrumentId: "instrument:v1:crypto:perpetual:binance:BTC-USDT", venueSymbol: "BTCUSDT",
+    instrument: { kind: "LINEAR" as const, contractSize: "0.001", baseCurrency: "BTC", quoteCurrency: "USDT",
+      settlementCurrency: "USDT", marginCurrency: "USDT" }, positionDirection: "LONG" as const,
+    actionSide: "BUY" as const, quantityUnit: "CONTRACTS" as const, quantity: "10", marginMode: "ISOLATED" as const,
+    positionMode: "ONE_WAY" as const, reduceOnly: false, closePosition: false, orderType: "MARKET" as const,
+    paperReferencePrice: "50000", shariah: { mode: "off" as const }, ...overrides };
+  return { ...withoutIdentity, platformIntent: { id: `x3b_platform_intent_${suffix}_123456789`,
+    dedupeKey: `x3b:binance:${suffix}:123456789`, createdAt: new Date().toISOString(),
+    payloadHash: derivativeExecutionPayloadHash(withoutIdentity) } };
+}
+
+function x3bSnapshot(intent: DerivativeOrderIntent, status: DerivativeOrderSnapshot["status"],
+  filledContracts = "0", providerOrderId = "derivative-provider-1"): DerivativeOrderSnapshot {
+  const filledBase = String(Number(filledContracts) * 0.001); const filledNotional = String(Number(filledBase) * 50_000);
+  const now = new Date().toISOString();
+  return { venue: intent.venue, environment: intent.environment, providerOrderId,
+    clientOrderId: intent.clientOrderId, status, filledContracts, filledBaseQuantity: filledBase,
+    filledNotional, averageFillPrice: Number(filledContracts) > 0 ? "50000" : null,
+    realizedPnl: "0", unrealizedPnl: "0", pnlCurrency: "USDT",
+    funding: { amount: "0", currency: "USDT" }, fee: Number(filledContracts) > 0
+      ? { amount: "0.25", currency: "USDT" } : null,
+    prices: { mark: "50000", index: "49999", last: "50001" }, liquidationPrice: "30000",
+    maintenanceMargin: "12", providerTimestamp: now, acknowledgedAt: now,
+    lastFillAt: Number(filledContracts) > 0 ? now : null, rawStatus: status };
+}
+
+test("X3B ambiguous acknowledgement, network loss, and restart reconcile by lookup without duplicate exposure", async () => {
+  const account = await createAccount({ marketType: "futures" }); let submits = 0; let queries = 0;
+  const accepted = new Map<string, DerivativeOrderIntent>();
+  const command = x3bCommand(account.id, "ambiguous_restart");
+  const ambiguous: DerivativeExecutionDriver = {
+    submit: async (intent) => { submits++; accepted.set(intent.clientOrderId, intent);
+      throw new DerivativeExecutionError("connection lost after matching engine acceptance", "ambiguous"); },
+    query: async (intent) => { queries++; return accepted.has(intent.clientOrderId)
+      ? x3bSnapshot(intent, "FILLED", "10") : null; },
+    cancel: async () => { throw new Error("unused"); },
+  };
+  const unknown = await submitDerivativeExecution(command, () => ambiguous);
+  assert.equal(unknown.status, "ack_unknown");
+  assert.equal((await submitDerivativeExecution(command, () => ambiguous)).id, unknown.id);
+  assert.equal(submits, 1); assert.equal(await prisma.derivativeExecutionOrder.count(), 1);
+  await prisma.$disconnect();
+  await reconcileDerivativeExecutionOrders(() => ambiguous);
+  const filled = await prisma.derivativeExecutionOrder.findUniqueOrThrow({ where: { id: unknown.id } });
+  assert.equal(filled.status, "filled"); assert.equal(filled.filledContracts, "10");
+  assert.equal(submits, 1); assert.equal(queries, 1);
+});
+
+test("X3B partial fill, duplicate/out-of-order update, disconnect, and restart are monotonic", async () => {
+  const account = await createAccount({ marketType: "perpetual" }); let phase = "partial";
+  const driver: DerivativeExecutionDriver = {
+    submit: async (intent) => x3bSnapshot(intent, "PARTIALLY_FILLED", "4"),
+    query: async (intent) => { if (phase === "lost") throw new DerivativeExecutionError("network loss", "transient");
+      return x3bSnapshot(intent, "FILLED", "10"); }, cancel: async () => { throw new Error("unused"); },
+  };
+  const partial = await submitDerivativeExecution(x3bCommand(account.id, "partial_restart"), () => driver);
+  assert.equal(partial.status, "partially_filled"); assert.equal(partial.filledContracts, "4");
+  const intent = { ...x3bCommand(account.id, "partial_restart"), clientOrderId: partial.clientOrderId };
+  assert.equal((await applyDerivativeSnapshot(partial.id, x3bSnapshot(intent, "OPEN", "0"))).filledContracts, "4");
+  assert.equal((await applyDerivativeSnapshot(partial.id, x3bSnapshot(intent, "PARTIALLY_FILLED", "4"))).filledContracts, "4");
+  phase = "lost"; await reconcileDerivativeExecutionOrders(() => driver);
+  let stored = await prisma.derivativeExecutionOrder.findUniqueOrThrow({ where: { id: partial.id } });
+  assert.equal(stored.status, "partially_filled"); assert.match(stored.error ?? "", /network loss/);
+  await prisma.$disconnect(); phase = "filled"; await reconcileDerivativeExecutionOrders(() => driver);
+  stored = await prisma.derivativeExecutionOrder.findUniqueOrThrow({ where: { id: partial.id } });
+  assert.equal(stored.status, "filled"); assert.equal(stored.filledContracts, "10");
+});
+
+test("X3B reduce-only rejection is terminal and never falls back to an exposure-increasing order", async () => {
+  const account = await createAccount({ marketType: "derivatives" }); let submits = 0;
+  const position = { direction: "LONG" as const, contracts: "10", entryPrice: "50000", markPrice: "49000",
+    observedAt: new Date().toISOString(), version: "position:v1:12345" };
+  const command = x3bCommand(account.id, "reduce_reject", { positionDirection: "LONG", actionSide: "SELL",
+    quantity: "5", reduceOnly: true, position });
+  command.platformIntent.payloadHash = derivativeExecutionPayloadHash(command);
+  const driver: DerivativeExecutionDriver = { submit: async () => { submits++;
+    throw new DerivativeExecutionError("provider reduce-only reject", "rejected"); },
+    query: async () => { throw new Error("terminal order must not reconcile"); },
+    cancel: async () => { throw new Error("unused"); } };
+  const rejected = await submitDerivativeExecution(command, () => driver);
+  assert.equal(rejected.status, "rejected"); assert.match(rejected.error ?? "", /reduce-only reject/);
+  assert.equal((await submitDerivativeExecution(command, () => driver)).status, "rejected");
+  await reconcileDerivativeExecutionOrders(() => driver); assert.equal(submits, 1);
+});
+
+test("X3B provider updates cannot overfill an authorized reduce-only position", async () => {
+  const account = await createAccount({ marketType: "futures" });
+  const position = { direction: "LONG" as const, contracts: "10", entryPrice: "50000", markPrice: "49000",
+    observedAt: new Date().toISOString(), version: "position:overfill:1" };
+  const command = x3bCommand(account.id, "provider_overfill", { actionSide: "SELL", quantity: "5",
+    reduceOnly: true, position }); command.platformIntent.payloadHash = derivativeExecutionPayloadHash(command);
+  let captured: DerivativeOrderIntent | null = null;
+  const driver: DerivativeExecutionDriver = { submit: async (intent) => { captured = intent;
+    return x3bSnapshot(intent, "PARTIALLY_FILLED", "4"); }, query: async () => null,
+    cancel: async () => { throw new Error("unused"); } };
+  const partial = await submitDerivativeExecution(command, () => driver); assert.ok(captured);
+  await assert.rejects(applyDerivativeSnapshot(partial.id, x3bSnapshot(captured, "FILLED", "11")),
+    /exceeds the observed reducible position.*quarantined/);
+  const stored = await prisma.derivativeExecutionOrder.findUniqueOrThrow({ where: { id: partial.id } });
+  assert.equal(stored.status, "partially_filled"); assert.equal(stored.filledContracts, "4");
+});
+
+test("X3B preserves the existing Shariah entry gate while never blocking a reduce-only exit", async () => {
+  const account = await createAccount({ marketType: "perpetual" }); let submits = 0;
+  const review = { mode: "enforce" as const, policyVersion: "TS_SHARIAH_V1", assetId: "asset_btc_x3b",
+    baseAsset: "BTC", effectiveStatus: "REVIEW" as const, publicationId: "pub_btc_x3b" };
+  const blocked = x3bCommand(account.id, "shariah_review_entry", { shariah: review });
+  blocked.platformIntent.payloadHash = derivativeExecutionPayloadHash(blocked);
+  const driver: DerivativeExecutionDriver = { submit: async (intent) => { submits++;
+    return x3bSnapshot(intent, "FILLED", "5"); }, query: async () => null,
+    cancel: async () => { throw new Error("unused"); } };
+  await assert.rejects(submitDerivativeExecution(blocked, () => driver), /REVIEW/);
+  assert.equal(await prisma.derivativeExecutionOrder.count(), 0); assert.equal(submits, 0);
+  const exit = x3bCommand(account.id, "shariah_review_exit", { actionSide: "SELL", quantity: "5",
+    reduceOnly: true, shariah: review, position: { direction: "LONG", contracts: "5", entryPrice: "50000",
+      markPrice: "49000", observedAt: new Date().toISOString(), version: "position:review:1" } });
+  exit.platformIntent.payloadHash = derivativeExecutionPayloadHash(exit);
+  assert.equal((await submitDerivativeExecution(exit, () => driver)).status, "filled"); assert.equal(submits, 1);
+});
+
+test("X3B stale/wrong-way reduce and mainnet account fail before any driver or durable reservation", async () => {
+  const safe = await createAccount({ marketType: "futures" }); const mainnet = await createAccount({ marketType: "futures", testnet: false });
+  let submits = 0; const driver: DerivativeExecutionDriver = { submit: async () => { submits++; throw new Error("must not submit"); },
+    query: async () => null, cancel: async () => { throw new Error("unused"); } };
+  const stale = x3bCommand(safe.id, "stale_position", { actionSide: "SELL", reduceOnly: true,
+    position: { direction: "LONG", contracts: "10", entryPrice: "50000", markPrice: "49000",
+      observedAt: new Date(Date.now() - 20_000).toISOString(), version: "position:stale:1" } });
+  stale.platformIntent.payloadHash = derivativeExecutionPayloadHash(stale);
+  await assert.rejects(submitDerivativeExecution(stale, () => driver), /stale.*not submitted/);
+  const wrong = x3bCommand(safe.id, "wrong_way", { actionSide: "BUY", reduceOnly: true,
+    position: { direction: "LONG", contracts: "10", entryPrice: "50000", markPrice: "49000",
+      observedAt: new Date().toISOString(), version: "position:fresh:1" } });
+  wrong.platformIntent.payloadHash = derivativeExecutionPayloadHash(wrong);
+  await assert.rejects(submitDerivativeExecution(wrong, () => driver), /increase exposure/);
+  await assert.rejects(submitDerivativeExecution(x3bCommand(mainnet.id, "mainnet"), () => driver), /production\/mainnet/);
+  assert.equal(submits, 0); assert.equal(await prisma.derivativeExecutionOrder.count(), 0);
+});
+
+test("X3B direct/browser requests are rejected at the existing HMAC boundary", async () => {
+  const app = express(); app.use(express.json()); app.use("/api/derivative-execution/v1", derivativeExecutionRouter);
+  const server = app.listen(0); await new Promise<void>((resolve) => server.once("listening", resolve));
+  try {
+    const address = server.address(); assert.ok(address && typeof address === "object");
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/derivative-execution/v1/orders`, {
+      method: "POST", headers: { "content-type": "application/json", cookie: "access_token=fake-browser-session" },
+      body: JSON.stringify({ actionSide: "BUY" }) });
+    assert.equal(response.status, 401); assert.match(await response.text(), /authentication required/);
+    assert.equal(await prisma.derivativeExecutionOrder.count(), 0);
+  } finally { await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); }
 });
