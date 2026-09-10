@@ -121,6 +121,11 @@ export const config = {
   equityPaperExecutionEnabled: process.env.EQUITY_PAPER_EXECUTION_ENABLED === "true",
   alpacaPaperApiKey: process.env.ALPACA_PAPER_API_KEY ?? "",
   alpacaPaperApiSecret: process.env.ALPACA_PAPER_API_SECRET ?? "",
+  // X5 has no production endpoint or switch: OANDA practice and IBKR paper only.
+  traditionalPaperExecutionEnabled: process.env.TRADITIONAL_PAPER_EXECUTION_ENABLED === "true",
+  oandaPracticeAccountId: process.env.OANDA_PRACTICE_ACCOUNT_ID ?? "",
+  oandaPracticeToken: process.env.OANDA_PRACTICE_TOKEN ?? "",
+  ibkrPaperGatewayEnabled: process.env.IBKR_PAPER_GATEWAY_ENABLED === "true",
 
   // Durable Bot -> Platform realization outbox delivery. Accounting never
   // depends on this peer being available.
@@ -197,6 +202,8 @@ export function collectConfigErrors(): string[] {
     errors.push("MANUAL_TRADING_HMAC_SECRET must be set when derivatives execution is enabled");
   } else if (config.equityPaperExecutionEnabled && config.manualTradingHmacSecret.length === 0) {
     errors.push("MANUAL_TRADING_HMAC_SECRET must be set when Alpaca paper execution is enabled");
+  } else if (config.traditionalPaperExecutionEnabled && config.manualTradingHmacSecret.length === 0) {
+    errors.push("MANUAL_TRADING_HMAC_SECRET must be set when traditional paper execution is enabled");
   }
   if (config.equityPaperExecutionEnabled && (!config.alpacaPaperApiKey || !config.alpacaPaperApiSecret)) {
     errors.push("ALPACA_PAPER_API_KEY and ALPACA_PAPER_API_SECRET are required when paper equities execution is enabled");
@@ -252,6 +259,8 @@ export function collectConfigErrors(): string[] {
     ["SPOT_EXECUTION_ENABLED", /^(true|false)$/],
     ["DERIVATIVE_EXECUTION_ENABLED", /^(true|false)$/],
     ["EQUITY_PAPER_EXECUTION_ENABLED", /^(true|false)$/],
+    ["TRADITIONAL_PAPER_EXECUTION_ENABLED", /^(true|false)$/],
+    ["IBKR_PAPER_GATEWAY_ENABLED", /^(true|false)$/],
     ["SECURE_COOKIES", /^(true|false)$/],
   ];
   for (const [name, accepted] of booleanFlags) {

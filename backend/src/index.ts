@@ -17,6 +17,7 @@ import { manualTradingRouter } from "./routes/manualTrading.js";
 import { spotExecutionRouter } from "./routes/spotExecution.js";
 import { derivativeExecutionRouter } from "./routes/derivativeExecution.js";
 import { equityExecutionRouter } from "./routes/equityExecution.js";
+import { traditionalExecutionRouter } from "./routes/traditionalExecution.js";
 import { requireAuth } from "./middleware/requireAuth.js";
 import { checkTakeProfitStopLoss } from "./services/smartTrade.js";
 import { detectManualCloses } from "./services/manualCloseSync.js";
@@ -175,6 +176,7 @@ app.use("/api/manual-trading", apiLimiter, manualTradingRouter);
 app.use("/api/spot-execution/v1", apiLimiter, spotExecutionRouter);
 app.use("/api/derivative-execution/v1", apiLimiter, derivativeExecutionRouter);
 app.use("/api/equity-execution/v1", apiLimiter, equityExecutionRouter);
+app.use("/api/traditional-execution/v1", apiLimiter, traditionalExecutionRouter);
 
 // ─── Protected routes (requireAuth applied globally below) ───────────────────
 app.get("/api/config", requireAuth, apiLimiter, (_req, res) => {
