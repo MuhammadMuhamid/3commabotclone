@@ -4,7 +4,8 @@ import { prisma } from "../../lib/prisma.js";
 import { canonicalJson } from "../manualAuth.js";
 import { derivativeAdapter } from "./adapters.js";
 import { derivativeCapabilities } from "./capabilities.js";
-import { decimalProduct, derivativePnl, derivativeSizing } from "./math.js";
+import { decimalProduct, derivativePnl, derivativeSizing, evaluateCompletedCandleProtection,
+  type CompletedCandle } from "./math.js";
 import { DERIVATIVE_VENUES, DerivativeCapabilityError, DerivativeExecutionError,
   type ContractKind, type DerivativeOrderIntent, type DerivativeOrderSnapshot,
   type DerivativeOrderType, type DerivativeSide, type DerivativeTimeInForce,
@@ -334,6 +335,30 @@ export async function cancelDerivativeExecution(orderId: string,
   try { return await applyDerivativeSnapshot(order.id, await driverFactory(intentFromRow(order)).cancel(intentFromRow(order))); }
   catch (error) { return prisma.derivativeExecutionOrder.update({ where: { id: order.id }, data: {
     error: `cancel outcome unknown; reconciliation pending: ${error instanceof Error ? error.message : "unknown error"}` } }); }
+}
+
+/**
+ * Advance one deterministic paper protective order from a completed candle.
+ * A trigger with no subsequent market observation remains OPEN: process or
+ * network loss never fabricates a trigger-price fill.
+ */
+export async function executeDerivativePaperProtection(orderId: string, candle: CompletedCandle,
+  nextMarketPrice?: string): Promise<DerivativeExecutionOrder> {
+  const order = await prisma.derivativeExecutionOrder.findUnique({ where: { id: orderId } });
+  if (!order) throw new DerivativeExecutionServiceError("derivative execution order not found", 404);
+  if (terminal(order.status)) return order;
+  const intent = intentFromRow(order);
+  if (intent.environment !== "paper" || !intent.protective) throw new DerivativeExecutionServiceError(
+    "only a resting deterministic paper protective order can consume a completed candle", 422);
+  const decision = evaluateCompletedCandleProtection(intent.protective, intent.positionDirection, candle);
+  if (!decision.triggered || !nextMarketPrice) return order;
+  if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(nextMarketPrice) || Number(nextMarketPrice) <= 0) {
+    throw new DerivativeExecutionServiceError("next paper market observation is invalid", 422);
+  }
+  const quantity = intent.closePosition ? intent.position!.contracts : intent.quantity!;
+  const contracts = intent.quantityUnit === "CONTRACTS" ? quantity
+    : derivativeSizing(intent.instrument, "BASE", quantity, nextMarketPrice).contracts;
+  return applyDerivativeSnapshot(order.id, snapshot(intent, "FILLED", nextMarketPrice, contracts));
 }
 
 export async function readDerivativeExecutionState(): Promise<object> {

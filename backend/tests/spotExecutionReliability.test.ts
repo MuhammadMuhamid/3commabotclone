@@ -37,7 +37,7 @@ import { applySpotSnapshot, cancelSpotExecution, reconcileSpotExecutionOrders,
 import type { DerivativeOrderIntent, DerivativeOrderSnapshot } from "../src/services/derivativeExecution/model.js";
 import { DerivativeExecutionError } from "../src/services/derivativeExecution/model.js";
 import { applyDerivativeSnapshot, derivativeExecutionPayloadHash, reconcileDerivativeExecutionOrders,
-  submitDerivativeExecution, type DerivativeExecutionCommand,
+  executeDerivativePaperProtection, submitDerivativeExecution, type DerivativeExecutionCommand,
   type DerivativeExecutionDriver } from "../src/services/derivativeExecution/service.js";
 
 const backendRoot = path.join(import.meta.dirname, "..");
@@ -1535,6 +1535,25 @@ test("X3B provider updates cannot overfill an authorized reduce-only position", 
     /exceeds the observed reducible position.*quarantined/);
   const stored = await prisma.derivativeExecutionOrder.findUniqueOrThrow({ where: { id: partial.id } });
   assert.equal(stored.status, "partially_filled"); assert.equal(stored.filledContracts, "4");
+});
+
+test("X3B paper protection fills once at market after a completed-candle trigger, never at trigger price", async () => {
+  const account = await createAccount({ marketType: "perpetual" });
+  const command = x3bCommand(account.id, "paper_protection", { actionSide: "SELL", quantity: "10",
+    reduceOnly: true, orderType: "STOP_MARKET", protective: { kind: "STOP_LOSS", triggerPrice: "48000",
+      triggerPriceRole: "MARK", paperTriggerModel: "COMPLETED_CANDLE_MARKET_AFTER_CLOSE" },
+    position: { direction: "LONG", contracts: "10", entryPrice: "50000", markPrice: "49000",
+      observedAt: new Date().toISOString(), version: "position:protection:1" } });
+  command.platformIntent.payloadHash = derivativeExecutionPayloadHash(command);
+  const open = await submitDerivativeExecution(command); assert.equal(open.status, "open");
+  const forming = { closeTime: new Date().toISOString(), complete: false, mark: "47000", index: "49000", last: "49000" };
+  assert.equal((await executeDerivativePaperProtection(open.id, forming, "47500")).status, "open");
+  const completed = { ...forming, complete: true };
+  assert.equal((await executeDerivativePaperProtection(open.id, completed)).status, "open");
+  const filled = await executeDerivativePaperProtection(open.id, completed, "47500");
+  assert.equal(filled.status, "filled"); assert.equal(filled.averageFillPrice, "47500");
+  assert.notEqual(filled.averageFillPrice, command.protective!.triggerPrice);
+  assert.equal((await executeDerivativePaperProtection(open.id, completed, "47000")).averageFillPrice, "47500");
 });
 
 test("X3B preserves the existing Shariah entry gate while never blocking a reduce-only exit", async () => {
