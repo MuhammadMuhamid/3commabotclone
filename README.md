@@ -10,7 +10,7 @@ Platform decisions, manage **multi-pair bots**, and monitor them from a
 
 This is the **execution** half of the system.
 
-| | This repository | Platform (`MuhammadMuhamid/my-tradingview-clone`) |
+| | This repository | Platform (`2ms-muzammil/trading-scene-platform`) |
 |---|---|---|
 | Decides when to trade | no | **yes** |
 | Places exchange orders | **yes** | no |
@@ -28,7 +28,7 @@ Do not move credential handling into the platform, and do not merge the two
 repositories.
 
 There is a third repository,
-[`MuhammadMuhamid/pythoncryptobacktesingsystems`](https://github.com/MuhammadMuhamid/pythoncryptobacktesingsystems),
+[`2ms-muzammil/trading-scene-research`](https://github.com/2ms-muzammil/trading-scene-research),
 which holds the optimizer trees and research. It is offline analysis: it never
 sends an instruction here and this repository never reads from it. It is named
 only so the name is not mistaken for the platform — it held both until the
@@ -41,8 +41,10 @@ this one is `backend/tests/webhookContract.test.ts`.
 
 ### Repository status
 
-`MuhammadMuhamid/3commabotclone` is authoritative for the bot. There is no
-superseded duplicate of this repository.
+[`2ms-muzammil/trading-scene-bot`](https://github.com/2ms-muzammil/trading-scene-bot)
+is the owner's private canonical bot repository. Mahamid's original bot
+repository remains configured as `mahamid-upstream` for collaboration and
+handoff.
 
 ## Local quality gates
 
