@@ -63,7 +63,18 @@ export const exchangeStopsEnabled = (): boolean =>
   process.env.EXCHANGE_STOPS_ENABLED === "true";
 
 /** Human-readable state, for the operator surface and every log line. */
-export const EXCHANGE_STOPS_STATUS = "disabled by default — requires Binance testnet validation";
+/*
+ * NOT WIRED, and the status says so.
+ *
+ * `placeProtection` and `cancelProtection` below are complete and unreferenced:
+ * nothing in this service calls either. The flag gated only this string, so an
+ * installation that set it was told protective orders were ENABLED while no
+ * order was ever placed — the single most dangerous thing an operations console
+ * can say, because it is read exactly when someone is deciding whether their
+ * positions are safe.
+ */
+export const EXCHANGE_STOPS_STATUS =
+  "not wired — the functions exist but no code path calls them; protection is the in-process poll";
 
 export interface ProtectiveOrderPlan {
   symbol: string;

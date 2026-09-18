@@ -387,7 +387,7 @@ Host nginx config lives in `deploy/nginx-production.conf`.
 | `PUBLIC_URL` | Public HTTPS URL (webhook links in UI) |
 | `DRY_RUN` | `true` = log orders, no Binance calls |
 | `PORT` | API port (default 4000; use 4001 when the platform runs on the same host — see Quick start) |
-| `EXCHANGE_STOPS_ENABLED` | `false` by default. `true` places resting stop orders at Binance; requires the testnet checks in `backend/src/services/exchangeStops.ts` |
+| `EXCHANGE_STOPS_ENABLED` | `false` by default, and **not wired**: `placeProtection`/`cancelProtection` in `backend/src/services/exchangeStops.ts` have no call sites, so `true` changes only a status string and places no order. Protection is the 30-second in-process poll in either state. |
 | `JWT_SECRET` | Signs session tokens (`openssl rand -hex 64`). Changing it logs you out |
 | `SCRYPT_SALT` | KDF salt (`openssl rand -hex 16`). Changing it invalidates stored API keys |
 | `SECURE_COOKIES` | `false` only for local HTTP dev; `true` in production |

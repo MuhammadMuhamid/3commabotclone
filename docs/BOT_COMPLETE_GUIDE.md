@@ -1254,7 +1254,7 @@ below was re-checked against this checkout.
 | 2 | **Sizing** | `pct_trade` / `usdt_trade` read as "per SmartTrade" and do **not** divide by the number of open trades. `*_bot` units DO aggregate across open positions (`BOT-013`); the `*_trade` units are per-signal by design, and the label is the ambiguity. |
 | 3 | **Money precision** | Every monetary column is a SQLite `REAL`. Writes are quantized to 8 decimal places and sums are compensated, which bounds the error; it is not exact decimal arithmetic (`BOT-023`). |
 | 4 | **Exchange SDK** | `binance-api-node@0.12.9` is unmaintained and signs every order. Pinned, surface-bounded and CI-asserted; replacing it needs Binance testnet credentials (`BOT-039`). |
-| 5 | **Protective orders** | The exchange-native stop adapter is **disabled by default**. Until it is enabled, protection is a 30-second in-process poll: a position is unprotected while this process is down, and a gap through the stop fills at the next tick (`BOT-017`). |
+| 5 | **Protective orders** | The exchange-native stop adapter is **not wired**: `placeProtection` and `cancelProtection` have no call sites, so the flag places nothing and protection is a 30-second in-process poll whether it is set or not. A position is unprotected while this process is down, and a gap through the stop fills at the next tick (`BOT-017`). |
 | 6 | **Webhook logs UI** | No frontend page for `WebhookLog`. Database only. |
 | 7 | **Dedupe across replicas** | The close lock is in-process. Two backend replicas would not share it, and nothing prevents running two. |
 | 8 | **Pine** | `deploy/pine-exit-webhook.snippet.pine` is deprecated; use `deploy/SR-Trend-v5-custom-webhook-ALERTS.pine`. |

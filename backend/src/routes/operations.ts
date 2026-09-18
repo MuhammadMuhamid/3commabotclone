@@ -66,9 +66,29 @@ operationsRouter.get(
          * COMPLETELY unprotected during any downtime, and a gap through the
          * stop is filled at the next tick rather than at the stop (BOT-017).
          */
+        /*
+         * ── The flag does not place anything, and this said it did ─────────
+         *
+         * `placeProtection` and `cancelProtection` in `services/exchangeStops.ts`
+         * have ZERO call sites in this service. Setting EXCHANGE_STOPS_ENABLED
+         * therefore changes one status string and nothing else: protection
+         * remains the 30-second in-process poll either way, which is exactly
+         * the during-downtime gap the module's own header enumerates.
+         *
+         * An operator reading "ENABLED" under pressure concludes their open
+         * positions are protected at the exchange and will survive this process
+         * dying. They are not and will not. A false safety claim is worse than
+         * an absent one, so the flag is now reported as ARMED BUT NOT WIRED and
+         * the unprotected-while-down sentence is said in BOTH states — it is
+         * true in both.
+         */
+        wired: false,
         note:
           exchangeStopsEnabled()
-            ? "Exchange-side protective orders are ENABLED. Verify the testnet checks in services/exchangeStops.ts were completed."
+            ? "EXCHANGE_STOPS_ENABLED is set, but no code path in this service places or "
+              + "cancels an exchange-side protective order — the flag arms a capability that "
+              + "is not wired up. Protection is a 30-second in-process poll only, and open "
+              + "positions are unprotected while this process is down."
             : "Protection is a 30-second in-process poll only. Open positions are unprotected while this process is down.",
       },
       /*

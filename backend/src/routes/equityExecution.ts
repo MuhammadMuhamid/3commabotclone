@@ -15,6 +15,20 @@ const decimal = z.string().max(40).regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/)
 const platformIntent = z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
   dedupeKey: z.string().regex(/^[A-Za-z0-9:_-]{16,160}$/), createdAt: z.string().datetime(),
   payloadHash: z.string().regex(/^[0-9a-f]{64}$/) }).strict();
+/*
+ * The signed Shariah decision, declared so a strict schema does not reject it.
+ *
+ * `derivativeExecution.ts` has always declared this; these three did not, and
+ * the Platform attaches the block to every order it sends on any channel. A
+ * `.strict()` schema without the field answers 400 to EVERY order — the gate
+ * that exists to refuse some orders would have refused all of them, by
+ * rejecting its own evidence. The shape mirrors `derivativeExecution.ts`
+ * exactly; it is the same wire contract and there must not be two of them.
+ */
+const shariah = z.object({ mode: z.enum(["off", "enforce"]), policyVersion: z.string().nullable().optional(),
+  assetId: z.string().nullable().optional(), baseAsset: z.string().nullable().optional(),
+  effectiveStatus: z.enum(["ELIGIBLE", "REVIEW", "EXCLUDED"]).nullable().optional(),
+  publicationId: z.string().nullable().optional() }).strict();
 const command = z.object({ platformIntent, environment: z.literal("paper"),
   canonicalInstrumentId: z.string().regex(/^instrument:v1:(NASDAQ|NYSE|ARCA|AMEX|BATS):(stock|etf):[A-Z][A-Z0-9.-]{0,14}:USD:USD:cash$/),
   providerSymbol: z.string().regex(/^[A-Z][A-Z0-9.-]{0,14}$/), instrumentType: z.enum(["STOCK", "ETF"]),
@@ -26,7 +40,8 @@ const command = z.object({ platformIntent, environment: z.literal("paper"),
     observedAt: z.string().datetime(), calendarDate: z.string().date() }).strict(),
   asset: z.object({ status: z.enum(["ACTIVE", "INACTIVE"]), tradable: z.boolean(), fractionable: z.boolean(),
     shortable: z.boolean().nullable(), borrowStatus: z.enum(["EASY_TO_BORROW", "HARD_TO_BORROW", "UNKNOWN"]),
-    observedAt: z.string().datetime() }).strict() }).strict();
+    observedAt: z.string().datetime() }).strict(),
+  shariah: shariah.optional() }).strict();
 
 equityExecutionRouter.get("/state", (_req, res) => res.json({ enabled: config.equityPaperExecutionEnabled,
   credentialsPresent: Boolean(config.alpacaPaperApiKey && config.alpacaPaperApiSecret),
