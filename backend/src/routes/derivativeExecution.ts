@@ -27,10 +27,21 @@ const position = z.object({ direction: z.enum(["LONG", "SHORT"]), contracts: dec
 const protective = z.object({ kind: z.enum(["STOP_LOSS", "TAKE_PROFIT"]), triggerPrice: decimal,
   triggerPriceRole: z.enum(["MARK", "INDEX", "LAST"]),
   paperTriggerModel: z.literal("COMPLETED_CANDLE_MARKET_AFTER_CLOSE") }).strict();
-const shariah = z.object({ mode: z.enum(["off", "enforce"]), policyVersion: z.string().nullable().optional(),
-  assetId: z.string().nullable().optional(), baseAsset: z.string().nullable().optional(),
-  effectiveStatus: z.enum(["ELIGIBLE", "REVIEW", "EXCLUDED"]).nullable().optional(),
-  publicationId: z.string().nullable().optional() }).strict();
+/*
+ * `z.unknown().optional()`, matching `webhookSchema.ts`, and for its reason.
+ *
+ * A strict `z.object` here gives a malformed block the power to reject the
+ * whole request with a 400 — and that request might be a reduceOnly close.
+ * "A Shariah block must never be able to stand between a position and its
+ * exit" is the rule the webhook schema states, and these four routes were
+ * validating it at the wrong layer: the parse happens before the service
+ * reaches its entry/exit branch, so an unknown key or a lowercase `mode`
+ * refused an exit.
+ *
+ * The SERVICE interprets it, through `readShariahContext`, on the entry path
+ * only. The parent schema stays `.strict()`, so no other unknown field gets in.
+ */
+const shariah = z.unknown().optional();
 const command = z.object({ platformIntent, accountId: z.string().uuid(),
   venue: z.enum(["binance", "bybit", "okx", "kucoin", "gateio", "kraken", "hyperliquid", "coinbase"]),
   environment: z.enum(["paper", "testnet", "demo"]), canonicalInstrumentId: z.string().min(8).max(240),
@@ -42,7 +53,7 @@ const command = z.object({ platformIntent, accountId: z.string().uuid(),
   orderType: z.enum(["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]),
   timeInForce: z.enum(["GTC", "IOC", "FOK", "GTD", "POST_ONLY"]).optional(),
   limitPrice: decimal.optional(), protective: protective.optional(), paperReferencePrice: decimal.optional(),
-  position: position.optional(), shariah: shariah.optional() }).strict();
+  position: position.optional(), shariah }).strict();
 
 derivativeExecutionRouter.get("/state", asyncHandler(async (_req, res) => {
   res.json({ enabled: config.derivativeExecutionEnabled, ...await readDerivativeExecutionState() });

@@ -23,22 +23,23 @@ const platformIntent = z.object({
   payloadHash: z.string().regex(/^[0-9a-f]{64}$/),
 }).strict();
 /*
- * The signed Shariah decision, declared so a strict schema does not reject it.
+ * `z.unknown().optional()`, matching `webhookSchema.ts`, and for its reason.
  *
- * `derivativeExecution.ts` has always declared this; these three did not, and
- * the Platform attaches the block to every order it sends on any channel. A
- * `.strict()` schema without the field answers 400 to EVERY order — the gate
- * that exists to refuse some orders would have refused all of them, by
- * rejecting its own evidence. The shape mirrors `derivativeExecution.ts`
- * exactly; it is the same wire contract and there must not be two of them.
+ * A strict `z.object` here gives a malformed block the power to reject the
+ * whole request with a 400 — and that request might be a reduceOnly close.
+ * "A Shariah block must never be able to stand between a position and its
+ * exit" is the rule the webhook schema states, and these four routes were
+ * validating it at the wrong layer: the parse happens before the service
+ * reaches its entry/exit branch, so an unknown key or a lowercase `mode`
+ * refused an exit.
+ *
+ * The SERVICE interprets it, through `readShariahContext`, on the entry path
+ * only. The parent schema stays `.strict()`, so no other unknown field gets in.
  */
-const shariah = z.object({ mode: z.enum(["off", "enforce"]), policyVersion: z.string().nullable().optional(),
-  assetId: z.string().nullable().optional(), baseAsset: z.string().nullable().optional(),
-  effectiveStatus: z.enum(["ELIGIBLE", "REVIEW", "EXCLUDED"]).nullable().optional(),
-  publicationId: z.string().nullable().optional() }).strict();
+const shariah = z.unknown().optional();
 const command = z.object({
   platformIntent,
-  shariah: shariah.optional(),
+  shariah,
   accountId: z.string().uuid(),
   venue: z.enum(["binance", "coinbase", "bybit", "okx", "kraken", "kucoin", "gateio", "robinhood", "hyperliquid"]),
   environment: z.enum(["paper", "testnet", "demo"]),

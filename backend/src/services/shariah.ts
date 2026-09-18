@@ -270,8 +270,17 @@ export function readShariahContext(raw: unknown): ShariahContext | undefined {
  * defines are kept — this is evidence of what was asserted, not a cache of
  * anyone's screening state.
  */
-export function serializeShariahContext(context: ShariahContext | undefined): string | null {
-  return context ? JSON.stringify(context) : null;
+export function serializeShariahContext(context: unknown): string | null {
+  /*
+   * `unknown`, not `ShariahContext`: this stores what the sender ASSERTED, and
+   * the routes no longer parse the block before the service reaches its
+   * entry/exit branch — a strict parse there let a malformed block 400 a
+   * reduceOnly close. Recording the raw assertion is also the more truthful
+   * thing: the comment above says this is evidence of what was asserted, not a
+   * cache of anyone's screening state, and a block that failed to parse is
+   * exactly the evidence someone investigating would want.
+   */
+  return context === undefined || context === null ? null : JSON.stringify(context);
 }
 
 /**

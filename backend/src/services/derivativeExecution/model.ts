@@ -1,6 +1,5 @@
 import type { PlatformOrderIntentIdentity, PreparedVenueRequest, SafeExecutionEnvironment,
   VenueBuildContext } from "../spotExecution/model.js";
-import type { ShariahContext } from "../../contract/webhookContract.js";
 
 export const DERIVATIVE_VENUES = [
   "binance", "bybit", "okx", "kucoin", "gateio", "kraken", "hyperliquid", "coinbase",
@@ -75,7 +74,13 @@ export interface DerivativeOrderIntent {
   paperReferencePrice?: string;
   position?: PositionObservation;
   /** Existing policy context for the underlying; omission fails closed when the installation floor enforces. */
-  shariah?: ShariahContext;
+  /*
+   * `unknown`, because the ROUTE no longer validates it — a strict schema at
+   * that layer gives a malformed block the power to 400 a reduceOnly close,
+   * and a Shariah block must never stand between a position and its exit.
+   * `submitDerivativeExecution` reads it, on the entry path only.
+   */
+  shariah?: unknown;
   clientOrderId: string;
   providerOrderId?: string;
 }

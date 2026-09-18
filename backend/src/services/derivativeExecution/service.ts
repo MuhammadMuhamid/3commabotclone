@@ -14,7 +14,6 @@ import { DERIVATIVE_VENUES, DerivativeCapabilityError, DerivativeExecutionError,
 import type { SafeExecutionEnvironment } from "../spotExecution/model.js";
 import { admitSpotEntry, noteSpotExit, readShariahContext, serializeShariahContext,
   shariahScopeForManualAccount } from "../shariah.js";
-import type { ShariahContext } from "../../contract/webhookContract.js";
 
 const ACTIVE = ["submitted", "ack_unknown", "open", "partially_filled"];
 const TERMINAL = new Set(["filled", "canceled", "rejected", "expired"]);
@@ -42,7 +41,11 @@ export interface DerivativeExecutionCommand {
   protective?: ProtectiveIntent;
   paperReferencePrice?: string;
   position?: DerivativeOrderIntent["position"];
-  shariah?: ShariahContext;
+  /*
+   * `unknown`: the route no longer validates it, because a strict schema there
+   * lets a malformed block 400 a reduceOnly close. Read here, on entry only.
+   */
+  shariah?: unknown;
 }
 
 export interface DerivativeExecutionDriver {
