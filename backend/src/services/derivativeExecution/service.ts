@@ -288,13 +288,27 @@ export async function submitDerivativeExecution(command: DerivativeExecutionComm
   assertPlatformIdentity(command);
   const account = await prisma.exchangeAccount.findUnique({ where: { id: command.accountId } }); assertAccount(account, command);
   const intent = intentFrom(command); derivativeAdapter(command.venue).validate(intent);
-  const shariah = readShariahContext(command.shariah);
   const policySymbol = `${command.instrument.baseCurrency}${command.instrument.quoteCurrency}`;
   const scope = shariahScopeForManualAccount(command.accountId);
   if (!command.reduceOnly && !command.closePosition) {
+    /*
+     * The block is PARSED only on the entry path.
+     *
+     * `readShariahContext` throws on a malformed or incomplete block, and it
+     * used to be called above this branch — so an unusable block refused a
+     * `reduceOnly` CLOSE and trapped the operator in the position. `noteSpotExit`
+     * is careful to swallow everything for exactly that reason, and the throw
+     * was happening before it could.
+     *
+     * An exit is handed the raw value instead: `noteSpotExit` takes `unknown`
+     * and does its own reading inside its own try, where an unverifiable block
+     * records nothing and never touches the exit. Getting OUT must not depend on
+     * the evidence for getting in being well-formed.
+     */
+    const shariah = readShariahContext(command.shariah);
     await admitSpotEntry({ scope, symbol: policySymbol, context: shariah, auth: { kind: "request-signature" } });
   } else {
-    await noteSpotExit(scope, shariah, { symbol: policySymbol, auth: { kind: "request-signature" } });
+    await noteSpotExit(scope, command.shariah, { symbol: policySymbol, auth: { kind: "request-signature" } });
   }
   const held = await reserve(command); if (!held.created || held.order.status !== "requested") return held.order;
   const claimed = await prisma.derivativeExecutionOrder.updateMany({ where: { id: held.order.id, status: "requested" },
