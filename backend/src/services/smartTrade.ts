@@ -163,6 +163,18 @@ const CLIENT_CACHE_KEY = (accountId: string | null | undefined) => accountId ?? 
  * not a latency problem worth solving: it is how two closes on one account
  * interleave.
  */
+/**
+ * How many consecutive unevaluated sweeps before a position is called out.
+ *
+ * Three, at a thirty-second cadence, is ninety seconds of a live position whose
+ * stop loss has not been looked at. One missed cycle is ordinary; three in a
+ * row is a pair that is not coming back on its own.
+ */
+const UNMONITORED_ALERT_CYCLES = 3;
+
+/** Consecutive sweeps a trade has gone unevaluated. Cleared on any success. */
+const unmonitoredCycles = new Map<string, number>();
+
 export async function checkTakeProfitStopLoss(
   /** Test-only override; production always resolves via the account/env clients below. */
   options: { resolveClient?: (accountId: string | null | undefined) => Promise<BinanceClient | undefined> } = {}
@@ -231,6 +243,36 @@ export async function checkTakeProfitStopLoss(
       // no decision, and the next cycle is 30 seconds away.
     }
   });
+
+  /*
+   * ── A position skipped by phase 2 is an UNMONITORED position ─────────────
+   *
+   * Skipping is the right call for one cycle: a take-profit or stop-loss
+   * decision made on a stale P&L is worse than no decision, and the next sweep
+   * is thirty seconds away. What was wrong is that it was silent. A pair whose
+   * price cannot be read — a delisting, a symbol filter change, a persistent
+   * venue error — is skipped on every cycle, for ever, and its stop loss is
+   * simply never evaluated again. Nothing anywhere said so.
+   *
+   * That matters more than it looks, because this in-process sweep is the ONLY
+   * protection there is: `services/exchangeStops.ts` has no call sites, so
+   * nothing rests at the exchange however its flag is set.
+   *
+   * The decision is unchanged — nothing is closed on stale data. This is
+   * observability only, and it resets the moment a refresh succeeds.
+   */
+  for (const { trade } of candidates) {
+    if (refreshed.has(trade.id)) { unmonitoredCycles.delete(trade.id); continue; }
+    const misses = (unmonitoredCycles.get(trade.id) ?? 0) + 1;
+    unmonitoredCycles.set(trade.id, misses);
+    if (misses === UNMONITORED_ALERT_CYCLES || misses % (UNMONITORED_ALERT_CYCLES * 10) === 0) {
+      console.error(
+        `[tpsl] ${trade.pair}: ${trade.id} has not been evaluated for ${misses} consecutive `
+        + "cycles — its price or P&L could not be refreshed, so take-profit and stop-loss have "
+        + "not been checked. This position is not being monitored."
+      );
+    }
+  }
 
   // ── Phase 2: evaluate and close, one at a time ────────────────────────────
   for (const { trade, client } of candidates) {
