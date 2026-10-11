@@ -26,8 +26,15 @@ const platformIntent = z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/
  * reaches its entry/exit branch, so an unknown key or a lowercase `mode`
  * refused an exit.
  *
- * The SERVICE interprets it, through `readShariahContext`, on the entry path
- * only. The parent schema stays `.strict()`, so no other unknown field gets in.
+ * D-8: nothing on this route interprets the block. Unlike the derivative
+ * route, whose service calls `admitSpotEntry` / `noteSpotExit`, the equity
+ * execution service never reads `shariah`: a block is accepted, so it cannot
+ * 400 the request, and then ignored. That is tolerable only because this
+ * route is paper-only (`environment: "paper"`) and the Shariah decision for
+ * these orders is the PLATFORM's gate, applied before it signs the command.
+ * Do not read the absence of a refusal here as Bot-side enforcement, and do
+ * not take this route live without wiring those helpers into the service.
+ * The parent schema stays `.strict()`, so no other unknown field gets in.
  */
 const shariah = z.unknown().optional();
 const command = z.object({ platformIntent, environment: z.literal("paper"),
