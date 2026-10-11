@@ -142,13 +142,47 @@ test("attached TP/SL stays pending until a fill, then edit/remove is authoritati
     { tp: null, sl: null, state: "removed" });
 });
 
-test("manual orders cannot bypass the global halt", () => {
+/*
+ * D-9: the halt refuses new exposure, never an operator's exit. This test used
+ * to pin the opposite — every manual SELL refused while halted — and the halt
+ * latches itself on a daily-loss breach, so the loss that tripped it also took
+ * away the operator's only way out of the position.
+ */
+test("the halt refuses a manual BUY and never a manual SELL", () => {
+  const halted = { ...DEFAULT_BOT_RISK_LIMITS, tradingHalted: true, haltedReason: "operator" };
+  const flat = { openExposureQuote: 0, openTrades: 0, realisedPnlInWindow: 0 };
+
+  const buy = evaluateBotRisk(halted, flat, { side: "buy", quoteQty: 10, origin: "operator" });
+  assert.equal(buy.allowed, false, "a manual BUY stays refused while halted");
+  if (!buy.allowed) assert.equal(buy.code, "trading_halted");
+
+  assert.deepEqual(evaluateBotRisk(halted, flat, { side: "sell", quoteQty: 10, origin: "operator" }),
+    { allowed: true }, "a manual SELL/close is never trapped by the halt");
+  // Also when the halt was latched by the loss itself, with every limit breached.
+  const latched = { ...halted, haltedBy: "daily_loss" as const, maxDailyLossQuote: 1,
+    maxConcurrentTrades: 0, maxTotalExposureQuote: 0 };
+  assert.deepEqual(evaluateBotRisk(latched, { openExposureQuote: 1e6, openTrades: 99,
+    realisedPnlInWindow: -1e6 }, { side: "sell", quoteQty: 1e6, origin: "operator" }), { allowed: true });
+});
+
+test("an unreadable side is judged as an entry, so it cannot borrow the exit exemption", () => {
+  const halted = { ...DEFAULT_BOT_RISK_LIMITS, tradingHalted: true };
+  const flat = { openExposureQuote: 0, openTrades: 0, realisedPnlInWindow: 0 };
+  for (const side of ["SELL", " sell", "sell ", "", undefined, null, "close"]) {
+    const decision = evaluateBotRisk(halted, flat,
+      { side: side as unknown as "sell", quoteQty: 0, origin: "operator" });
+    assert.equal(decision.allowed, false, `side ${JSON.stringify(side)} was treated as an exit`);
+  }
+});
+
+test("the halt still stops AUTOMATION in both directions; only an operator exit is exempt", () => {
+  const halted = { ...DEFAULT_BOT_RISK_LIMITS, tradingHalted: true };
+  const flat = { openExposureQuote: 0, openTrades: 0, realisedPnlInWindow: 0 };
   for (const side of ["buy", "sell"] as const) {
-    const decision = evaluateBotRisk({ ...DEFAULT_BOT_RISK_LIMITS, tradingHalted: true,
-      haltedReason: "operator" }, { openExposureQuote: 0, openTrades: 0, realisedPnlInWindow: 0 },
-      { side, quoteQty: 10 });
-    assert.equal(decision.allowed, false);
-    if (!decision.allowed) assert.equal(decision.code, "trading_halted");
+    assert.equal(evaluateBotRisk(halted, flat, { side, quoteQty: 0, origin: "automation" }).allowed,
+      false, `automated ${side}`);
+    // A caller that does not say who it is gets the stricter answer.
+    assert.equal(evaluateBotRisk(halted, flat, { side, quoteQty: 0 }).allowed, false, `default ${side}`);
   }
 });
 

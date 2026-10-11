@@ -494,26 +494,60 @@ test("P1-5: the dashboard partial close respects an unresolved partial attempt",
   assert.equal(heldLockCount(), 0, "the close lock is never leaked");
 });
 
-test("BOT-P1-2: a scale-out is refused while trading is halted, like every sibling path",
+/*
+ * D-9 (supersedes the BOT-P1-2 halt refusal on this route): a scale-out and a
+ * dashboard Close are an OPERATOR reducing a position by hand, and the halt
+ * never refuses an operator's exit. The halt latches itself on a daily-loss
+ * breach; refusing these traps the very position that caused the loss.
+ */
+test("D-9: an operator scale-out is NOT refused while trading is halted", async () => {
+  const account = await createAccount();
+  const bot = await createBot({ exchangeAccountId: account.id });
+  const trade = await createTrade(bot, { quantity: 1, quoteSpent: 100 });
+  const exchange = fakeExchange({ price: "110", freeBase: "10",
+    fills: [{ status: "FILLED", executedQty: "0.25", quote: "27.5" }] });
+  tradeExchangeClient.resolve = () => exchange.client;
+  await setBotTradingHalted(true, { reason: "daily loss limit", by: "daily_loss" });
+
+  const response = await callTradesRoute(
+    "post", "/:id/partial-close", { id: trade.id }, { pct: 25 });
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(exchange.submissions.length, 1, "the operator's scale-out reached the exchange");
+  assert.equal(exchange.submissions[0]!.side, "SELL");
+  assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id: trade.id } })).quantity, 0.75);
+  assert.equal((await prisma.riskControl.findUniqueOrThrow({ where: { id: "global" } })).tradingHalted,
+    true, "an exit does not lift the halt");
+  assert.equal(heldLockCount(), 0, "the close lock is never leaked");
+});
+
+test("D-9: while halted the dashboard Close still closes, and a signal SELL and BUY stay refused",
   async () => {
     const account = await createAccount();
     const bot = await createBot({ exchangeAccountId: account.id });
     const trade = await createTrade(bot, { quantity: 1, quoteSpent: 100 });
-    const exchange = fakeExchange({ price: "110", freeBase: "10",
-      fills: [{ status: "FILLED", executedQty: "0.25", quote: "27.5" }] });
-    tradeExchangeClient.resolve = () => exchange.client;
-    await setBotTradingHalted(true, { reason: "operator halted everything", by: "operator" });
+    const exchange = fakeExchange({ price: "110", freeBase: "10" });
+    await setBotTradingHalted(true, { reason: "daily loss limit", by: "daily_loss" });
 
-    const response = await callTradesRoute(
-      "post", "/:id/partial-close", { id: trade.id }, { pct: 25 });
-    assert.equal(response.status, 409);
-    assert.match(String((response.body as { error: string }).error), /operator halted everything/);
-    assert.equal(exchange.submissions.length, 0,
-      "no MARKET SELL reached the exchange while the installation reports HALTED");
-    assert.equal(
-      await prisma.exchangeOrderAttempt.count({ where: { smartTradeId: trade.id } }), 0,
-      "and nothing durable was reserved for an order that was never permitted");
-    assert.equal(heldLockCount(), 0, "the close lock is never leaked");
+    // Automation stays halted in both directions.
+    const signalSell = await processWebhook(
+      { secret: bot.webhookSecret, action: "sell", symbol: "BTCUSDT", dedupe_key: "d9-sig-sell" },
+      { clientFactory: async () => exchange.client });
+    assert.equal(signalSell.status, "halted");
+    const signalBuy = await processWebhook(
+      { secret: bot.webhookSecret, action: "buy", symbol: "BTCUSDT", dedupe_key: "d9-sig-buy" },
+      { clientFactory: async () => exchange.client });
+    assert.equal(signalBuy.status, "halted");
+    assert.equal(exchange.submissions.length, 0);
+
+    // The operator's Close — exactly what `/api/trades/:id/close` sends.
+    const close = await processWebhook(
+      { secret: bot.webhookSecret, action: "SELL", symbol: "BTCUSDT", quantity: trade.quantity },
+      { skipExitCheck: true, clientFactory: async () => exchange.client });
+    assert.equal(close.status, "ok", JSON.stringify(close));
+    assert.equal(exchange.submissions.length, 1);
+    assert.equal(exchange.submissions[0]!.side, "SELL");
+    assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id: trade.id } })).status, "closed");
+    assert.equal(heldLockCount(), 0);
   });
 
 test("P1-5: the TP/SL monitor reconciles its own crashed attempt instead of re-selling", async () => {

@@ -89,20 +89,60 @@ const block = (code: BotRiskBlockCode, reason: string): BotRiskDecision =>
   ({ allowed: false, code, reason });
 
 /**
+ * Who is asking for an order, as far as the halt is concerned.
+ *
+ * `operator` is a person managing what is open: the manual-trading routes and
+ * the authenticated dashboard Close / scale-out. `automation` is everything the
+ * bot does on its own or on a signal's say-so: TradingView webhooks, Platform
+ * strategy emissions, the TP/SL monitors and the strategy-intent reconciler.
+ *
+ * It is a server-side fact, set by the CODE PATH a request arrived on — never
+ * read from a request body. The default is `automation`, so a caller that does
+ * not say who it is gets the stricter answer.
+ */
+export type BotOrderOrigin = "operator" | "automation";
+
+/**
+ * True only for an exit an operator asked for.
+ *
+ * Exact comparisons, deliberately: a side that is not literally `"sell"` —
+ * missing, mis-cased, padded, anything a future caller fails to normalise — is
+ * treated as an ENTRY, so it can never borrow the exit exemption.
+ *
+ * Every caller of this gate is Binance Spot (manual trading refuses any other
+ * account in `assertManualAccountGate`; the webhook and strategy paths place
+ * only spot MARKET orders). On spot a SELL can only dispose of an asset the
+ * account already holds — the exchange refuses to sell what is not there, and
+ * there is no margin on these paths — so a SELL here cannot open exposure. A
+ * derivatives caller, where a SELL can open a short, must not reuse this gate
+ * without passing reduce-only evidence of its own.
+ */
+export function isOperatorExit(order: { side: unknown; origin?: BotOrderOrigin }): boolean {
+  return order.origin === "operator" && order.side === "sell";
+}
+
+/**
  * The gate, called before any order is placed.
  *
- * Same two invariants as the platform's, for the same reasons:
+ * Same three invariants as the platform's, for the same reasons:
  *
  *  * an EXIT is never refused by a numeric limit — refusing a sell because
  *    exposure is too high traps the position that caused the problem;
+ *  * the halt stops the AUTOMATION in both directions ("touch nothing"), but
+ *    never an operator's own exit. Halting is the moment an operator most
+ *    needs to close by hand, and the halt latches itself on a daily-loss
+ *    breach, so refusing that close would trap the very position that caused
+ *    the loss (D-9). This is the platform's division exactly: its `evaluateRisk`
+ *    halts every automated emission, and its manual routes refuse only BUY
+ *    while halted (`assertNotHalted` in its `api/routes/manualTrading.ts`);
  *  * every limit is opt-in, so a fresh install behaves exactly as before.
  */
 export function evaluateBotRisk(
   limits: BotRiskLimits,
   snapshot: BotRiskSnapshot,
-  order: { side: "buy" | "sell"; quoteQty: number }
+  order: { side: "buy" | "sell"; quoteQty: number; origin?: BotOrderOrigin }
 ): BotRiskDecision {
-  if (limits.tradingHalted) {
+  if (limits.tradingHalted && !isOperatorExit(order)) {
     return block(
       "trading_halted",
       limits.haltedReason ? `trading is halted: ${limits.haltedReason}` : "trading is halted"

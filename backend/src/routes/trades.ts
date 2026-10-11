@@ -10,7 +10,6 @@ import type { ExchangeAccount } from "@prisma/client";
 import { sendExecutionNotification } from "../services/push.js";
 import { markOrderAttemptSubmitted, openOrderAttempt } from "../services/orderAttempt.js";
 import { applyExitFill, exitAttemptProbe, resolveUnresolvedExitAttempts } from "../services/exitSettlement.js";
-import { getBotRiskLimits } from "../services/riskControls.js";
 import { config } from "../config.js";
 
 export const tradesRouter = Router();
@@ -163,24 +162,20 @@ tradesRouter.post("/:id/partial-close", async (req, res) => {
     }
     try {
     /*
-     * BOT-P1-2: the halt is a hard stop on every real submission, and this was
-     * the one exchange-submitting path that did not check it — a scale-out of
-     * up to 99% of a live position reached Binance while the installation
-     * reported HALTED and every sibling refused: `guardOrder` on the webhook
-     * path (which the dashboard's full Close delegates to), the TP/SL monitor,
-     * manual protection and manual trading. Read fresh here, immediately
-     * inside the lock, so a halt engaged while this request was queued still
-     * takes effect before the sell.
+     * D-9: the halt does NOT refuse this. A scale-out is an operator, on an
+     * authenticated route, reducing a position by hand — and an operator's
+     * exit is never gated by the halt. BOT-P1-2 once added a halt refusal here
+     * to match "every sibling", which made a halted installation impossible to
+     * get out of: the halt latches itself on a daily-loss breach, and the full
+     * Close and manual SELL were refused too. The division is now the
+     * platform's: the halt stops the AUTOMATION in both directions (signals,
+     * the TP/SL monitors), and the operator's own exits — this route, the
+     * dashboard Close and manual SELL — stay open. `evaluateBotRisk` is the
+     * single statement of that rule.
+     *
+     * Everything that makes an exit SAFE still applies below: the close lock,
+     * resolution of any unresolved prior exit, the 99% cap and the wallet cap.
      */
-    const limits = await getBotRiskLimits();
-    if (limits.tradingHalted) {
-      return res.status(409).json({
-        error: limits.haltedReason
-          ? `Trading is halted: ${limits.haltedReason}`
-          : "Trading is halted",
-      });
-    }
-
     // Resolve client
     const client = tradeExchangeClient.resolve(trade.bot);
     if (!client) {

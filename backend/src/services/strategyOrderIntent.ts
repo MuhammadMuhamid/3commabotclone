@@ -642,8 +642,14 @@ async function assertNeverAttemptedMaySubmit(intent: StrategyOrderIntent): Promi
   const limits = await getBotRiskLimits();
   const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours);
   const decision = evaluateBotRisk(limits, snapshot, {
-    side: intent.side === "BUY" ? "buy" : "sell",
+    // Exact: a side that is not literally SELL is judged as an entry.
+    side: intent.side === "SELL" ? "sell" : "buy",
     quoteQty: intent.requestedQuoteQty ?? 0,
+    // D-9: `skipExitCheck` is durable and only the authenticated dashboard
+    // Close sets it, so it is a server-side record that an OPERATOR asked for
+    // this exit — which the halt never refuses. Every other intent is a signal
+    // and stays halted in both directions.
+    origin: intent.skipExitCheck ? "operator" : "automation",
   });
   if (!decision.allowed) {
     const latch = shouldLatchHalt(decision);

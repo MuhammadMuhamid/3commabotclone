@@ -167,18 +167,38 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
   });
 }
 
+/**
+ * The account risk gate for a manual order.
+ *
+ * D-9: this used to refuse a manual SELL while halted, and the halt latches
+ * itself on a daily-loss breach — so the loss that tripped it also took away
+ * the operator's only way to close the position by hand, with a 409. A manual
+ * order is an OPERATOR order, and an operator's exit is never gated by the
+ * halt (see `evaluateBotRisk`). A BUY still is, and so is everything automated.
+ *
+ * "Exit" is decided from server-side facts only: the side is the validated
+ * enum, compared exactly so anything that is not literally `SELL` is judged as
+ * an entry; and the account is Binance Spot (`assertManualAccountGate`), where
+ * a SELL can only dispose of a holding the account already has — the exchange
+ * itself refuses to sell what is not there. `assertSellAssociation` has
+ * already tied it to the tracked position and the real balance.
+ */
 async function enforceRisk(input: SubmitManualOrderInput, adapter: ManualExchangeAdapter): Promise<void> {
+  const side = input.side === "SELL" ? "sell" : "buy";
+  // An exit is exempt from every numeric limit, so its notional is never
+  // needed — and a failed price read must not be what refuses a close.
   let quoteQty = input.quoteQuantity ?? 0;
-  if (quoteQty <= 0) quoteQty = (input.baseQuantity ?? 0) *
+  if (side === "buy" && quoteQty <= 0) quoteQty = (input.baseQuantity ?? 0) *
     (input.limitPrice ?? await adapter.ticker(input.symbol));
   const limits = await getBotRiskLimits();
   const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours);
-  const decision = evaluateBotRisk(limits, snapshot, {
-    side: input.side === "BUY" ? "buy" : "sell", quoteQty });
+  const decision = evaluateBotRisk(limits, snapshot, { side, quoteQty, origin: "operator" });
   if (!decision.allowed) {
     const latch = shouldLatchHalt(decision);
     if (latch) await setBotTradingHalted(true, { by: latch, reason: decision.reason });
-    throw new ManualTradingError(decision.reason, 409);
+    throw new ManualTradingError(decision.code === "trading_halted"
+      ? `${decision.reason}. Closing an open position is still allowed.`
+      : decision.reason, 409);
   }
 }
 
@@ -220,6 +240,11 @@ export async function submitManualOrder(
   const account = await prisma.exchangeAccount.findUnique({ where: { id: input.accountId } });
   if (!account) throw new ManualTradingError("exchange account not found", 404);
   assertManualAccountGate(account, input.mainnetConfirmation);
+  // The route's schema already restricts the side; this is the service's own
+  // floor. An unreadable side is neither an entry nor an exit it can reason
+  // about, and below it would otherwise be noted as a Shariah EXIT.
+  if (input.side !== "BUY" && input.side !== "SELL")
+    throw new ManualTradingError("side must be exactly BUY or SELL", 422);
   if (input.side === "BUY" && (!input.quoteQuantity || input.quoteQuantity <= 0))
     throw new ManualTradingError("BUY requires a positive quote quantity", 422);
   if (input.side === "SELL" && (!input.baseQuantity || input.baseQuantity <= 0))

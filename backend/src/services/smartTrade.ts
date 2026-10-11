@@ -308,6 +308,10 @@ export async function checkTakeProfitStopLoss(
        * that doesn't. Read fresh (not once per cycle) so a halt engaged mid-cycle
        * still takes effect before THIS trade's sell, and leave the trade active
        * — it is re-evaluated next cycle, not closed or faked.
+       *
+       * This is AUTOMATION, so the halt holds it in both directions. The
+       * position is not trapped: the operator's own exits (dashboard Close and
+       * scale-out, manual SELL) are never refused by the halt (D-9).
        */
       if ((await getBotRiskLimits()).tradingHalted) continue;
 

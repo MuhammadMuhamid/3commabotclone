@@ -16,7 +16,7 @@ import { updateSmartTradePnl } from "./smartTrade.js";
 import { acquireTradeClose, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import {
   evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
-  shouldLatchHalt,
+  shouldLatchHalt, type BotOrderOrigin,
 } from "./riskControls.js";
 import {
   SHARIAH_NONCE_FIELD, SHARIAH_SIGNATURE_FIELD, SHARIAH_TIMESTAMP_FIELD,
@@ -282,12 +282,20 @@ export async function processWebhook(
     let result: { status: string; detail?: unknown };
 
     /*
-     * The operator halt applies to every exchange submission. Numeric exposure,
-     * concurrency and loss limits still exempt SELL exits in evaluateBotRisk;
-     * this early pass is what prevents the sell branch from bypassing the halt.
-     * It also stops an already-blocked BUY before credentials/balances are read.
+     * The operator halt applies to every AUTOMATED exchange submission, in
+     * both directions. Numeric exposure, concurrency and loss limits still
+     * exempt SELL exits in evaluateBotRisk; this early pass is what prevents
+     * the sell branch of a signal from bypassing the halt. It also stops an
+     * already-blocked BUY before credentials/balances are read.
+     *
+     * D-9: the one exception is the dashboard Close — `skipExitCheck`, which
+     * only the authenticated `/api/trades/:id/close` route can set and no
+     * webhook body can — because that is an OPERATOR closing a position by
+     * hand, and halting must never take that away. A TradingView or Platform
+     * SELL signal is still automation and is still refused while halted.
      */
-    const preflight = await guardOrder(side, 0);
+    const origin = skipExitCheck ? "operator" : "automation";
+    const preflight = await guardOrder(side, 0, origin);
     if (!preflight.ok) {
       await prisma.webhookLog.update({ where: { id: log.id },
         data: { status: "blocked", message: preflight.reason } });
@@ -812,10 +820,12 @@ type OrderGuard =
  * sender that ignores the response body must still fail safe, which is the
  * lesson of X-12.
  */
-async function guardOrder(side: "buy" | "sell", quoteQty: number): Promise<OrderGuard> {
+async function guardOrder(
+  side: "buy" | "sell", quoteQty: number, origin: BotOrderOrigin = "automation"
+): Promise<OrderGuard> {
   const limits = await getBotRiskLimits();
   const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours);
-  const decision = evaluateBotRisk(limits, snapshot, { side, quoteQty });
+  const decision = evaluateBotRisk(limits, snapshot, { side, quoteQty, origin });
   if (decision.allowed) return { ok: true };
 
   const latch = shouldLatchHalt(decision);

@@ -12,7 +12,7 @@ import { BinanceManualExchange, type ManualExchangeAdapter,
 import { reserveManualNonce } from "../src/services/manualAuth.js";
 import { applyManualSnapshot, cancelManualOrder, reconcileOneManualOrder,
   reconcilePendingManualOrders, runIdempotentManualCommand,
-  submitManualOrder } from "../src/services/manualTrading.js";
+  submitManualOrder, ManualTradingError, updateManualProtection } from "../src/services/manualTrading.js";
 import { clientOrderId, marketBuyQuote, marketSellBase } from "../src/services/binance.js";
 import { clearanceForPersistedEntry } from "../src/services/shariah.js";
 import { processWebhook } from "../src/services/webhook.js";
@@ -1116,6 +1116,69 @@ test("halt, Spot-only, and dry-run gates stop the real adapter submission bounda
   assert.equal(simulated.simulated, true);
   assert.equal(wireOrders, 0);
 });
+
+/*
+ * D-9, end to end through the real manual service and database. The halt is
+ * latched the way it latches itself — by a daily-loss breach — and an open
+ * manual position must still be closable by hand, while a new BUY is refused.
+ */
+test("D-9: while halted a manual BUY is refused with 409, and a manual SELL still closes the position",
+  async () => {
+    const account = await createAccount();
+    await prisma.riskControl.create({ data: { id: "global", tradingHalted: true,
+      haltedReason: "rolling 24h realised loss 600.00 has reached the limit 500.00",
+      haltedBy: "daily_loss", maxDailyLossQuote: 500, maxTotalExposureQuote: 0, maxConcurrentTrades: 0 } });
+    const position = await prisma.smartTrade.create({ data: { source: "manual",
+      exchangeAccountId: account.id, botName: "Manual", pair: "BTCUSDT", status: "active",
+      direction: "long", entryPrice: 100, buyPrice: 100, currentPrice: 100,
+      quantity: 0.5, quoteSpent: 50, protectionType: "bot-managed", protectionState: "none" } });
+    const submitted: string[] = [];
+    const adapter: ManualExchangeAdapter = {
+      submit: async (intent) => { submitted.push(intent.side);
+        return snapshot("FILLED", intent.baseQuantity ?? 0.1, 45, intent.clientOrderId); },
+      query: async () => null, cancel: async () => { throw new Error("not used"); },
+      // A close must not depend on a price read it does not need.
+      ticker: async () => { throw new Error("price feed down"); },
+      baseTotal: async () => 0.5,
+    };
+
+    const buy = await submitManualOrder({ requestId: "d9-buy", accountId: account.id,
+      symbol: "BTCUSDT", side: "BUY", orderType: "MARKET", quoteQuantity: 10 }, () => adapter)
+      .then(() => null, (error: unknown) => error);
+    assert.ok(buy instanceof ManualTradingError, "the halted BUY was not refused");
+    assert.equal(buy.httpStatus, 409);
+    assert.match(buy.message, /trading is halted/);
+    assert.deepEqual(submitted, [], "the refused BUY reached the exchange");
+
+    // Bounding and withdrawing exposure stay open too: a protective stop edit
+    // on the open position, and a cancel of a resting order.
+    const protectedPosition = await updateManualProtection({ positionId: position.id, stopLossPrice: 90 });
+    assert.equal((protectedPosition as { manualSlPrice: number }).manualSlPrice, 90);
+    const resting = await prisma.manualOrder.create({ data: { requestId: "d9-resting",
+      exchangeAccountId: account.id, symbol: "BTCUSDT", side: "BUY", orderType: "LIMIT",
+      quantityType: "quote", requestedQuoteQty: 10, limitPrice: 90, status: "open",
+      clientOrderId: "d9-resting-client" } });
+    const canceled = await cancelManualOrder(resting.id, undefined, () => ({ ...adapter,
+      cancel: async () => snapshot("CANCELED", 0, 0, "d9-resting-client") }));
+    assert.equal(canceled.status, "canceled");
+
+    const sell = await submitManualOrder({ requestId: "d9-sell", accountId: account.id,
+      symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", baseQuantity: 0.5,
+      positionId: position.id }, () => adapter);
+    assert.equal(sell.status, "filled", "the manual close was trapped by the halt");
+    assert.deepEqual(submitted, ["SELL"]);
+    assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id: position.id } })).status,
+      "closed");
+    assert.equal((await prisma.riskControl.findUniqueOrThrow({ where: { id: "global" } })).tradingHalted,
+      true, "the close does not lift the halt");
+
+    // A side the service cannot read is never treated as an exit.
+    await assert.rejects(submitManualOrder({ requestId: "d9-unreadable", accountId: account.id,
+      symbol: "BTCUSDT", side: "sell" as never, orderType: "MARKET", baseQuantity: 0.1 }, () => adapter),
+    (error: unknown) => error instanceof ManualTradingError && error.httpStatus === 422);
+    assert.deepEqual(submitted, ["SELL"]);
+    assert.equal(await prisma.manualOrder.count({ where: { requestId: { in: ["d9-buy", "d9-unreadable"] } } }), 0);
+  });
 
 test("the global halt blocks both BUY and SELL at the strategy webhook submission path", async () => {
   const account = await createAccount();

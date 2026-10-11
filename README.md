@@ -110,9 +110,13 @@ SQLite database. Never point them at a real database or a real key.
   and 0.1% on sell revenue. It is not exchange-observed net P&L. A bounded
   50-event HMAC-authenticated outbox batch retries with backoff; Platform
   failure never rolls back Bot accounting.
-- The operator halt gates both BUY and SELL submission paths. Numeric exposure,
-  concurrency and daily-loss limits continue to permit exits according to the
-  existing policy. A never-attempted strategy intent rechecks those gates, while
+- The operator halt stops the automation in both directions: webhook and
+  Platform signals, strategy intents and the TP/SL monitors place no BUY and no
+  SELL while halted. It never refuses an OPERATOR exit — a manual SELL, the
+  dashboard Close and the dashboard scale-out stay available, and a manual BUY
+  is refused with 409 — so a halt (including one latched by a daily-loss
+  breach) can never trap an open position. Numeric exposure, concurrency and
+  daily-loss limits continue to permit exits according to the existing policy. A never-attempted strategy intent rechecks those gates, while
   an already-attempted intent still reconciles exchange truth during a later
   halt. Dry run never sends an order, and manual live execution is restricted
   to Binance Spot with the existing testnet/mainnet confirmations.
