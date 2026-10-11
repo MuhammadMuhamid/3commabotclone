@@ -122,6 +122,25 @@ export function isOperatorExit(order: { side: unknown; origin?: BotOrderOrigin }
 }
 
 /**
+ * The halt half of the gate on its own, for a caller that must re-check ONLY
+ * the halt — the manual reconciler re-proving an order it already admitted,
+ * whose own pending exposure the snapshot would otherwise count twice.
+ * `evaluateBotRisk` calls this first, so the rule exists exactly once.
+ */
+export function evaluateBotHalt(
+  limits: Pick<BotRiskLimits, "tradingHalted" | "haltedReason">,
+  order: { side: unknown; origin?: BotOrderOrigin }
+): BotRiskDecision {
+  if (limits.tradingHalted && !isOperatorExit(order)) {
+    return block(
+      "trading_halted",
+      limits.haltedReason ? `trading is halted: ${limits.haltedReason}` : "trading is halted"
+    );
+  }
+  return { allowed: true };
+}
+
+/**
  * The gate, called before any order is placed.
  *
  * Same three invariants as the platform's, for the same reasons:
@@ -142,12 +161,8 @@ export function evaluateBotRisk(
   snapshot: BotRiskSnapshot,
   order: { side: "buy" | "sell"; quoteQty: number; origin?: BotOrderOrigin }
 ): BotRiskDecision {
-  if (limits.tradingHalted && !isOperatorExit(order)) {
-    return block(
-      "trading_halted",
-      limits.haltedReason ? `trading is halted: ${limits.haltedReason}` : "trading is halted"
-    );
-  }
+  const halt = evaluateBotHalt(limits, order);
+  if (!halt.allowed) return halt;
 
   if (order.side === "sell") return { allowed: true };
 

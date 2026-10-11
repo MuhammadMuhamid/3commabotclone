@@ -8,8 +8,8 @@ import {
   type ManualOrderSnapshot, ManualOrderValidationError,
 } from "./manualExchange.js";
 import {
-  evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot,
-  setBotTradingHalted, shouldLatchHalt,
+  type BotOrderOrigin, type BotRiskLimits, evaluateBotHalt, evaluateBotRisk, getBotRiskLimits,
+  readBotRiskSnapshot, setBotTradingHalted, shouldLatchHalt,
 } from "./riskControls.js";
 import { calcRealizedPnl } from "./smartTrade.js";
 import {
@@ -27,6 +27,22 @@ export class ManualTradingError extends Error {
   constructor(message: string, readonly httpStatus: number = 400) {
     super(message);
     this.name = "ManualTradingError";
+  }
+}
+
+/**
+ * The halt refused a manual order that has not reached the exchange yet.
+ *
+ * `terminal` says what the reconciler must do with it. An ENTRY is finished:
+ * it is recorded `rejected` with the halt reason, because resubmitting it
+ * after a resume would open a position at a price, and a moment, nobody
+ * chose. An automated EXIT is only held — it stays `requested` and goes out
+ * once the halt lifts — because an exit is never abandoned.
+ */
+export class ManualHaltRefusal extends ManualTradingError {
+  constructor(message: string, readonly terminal: boolean) {
+    super(message, 409);
+    this.name = "ManualHaltRefusal";
   }
 }
 
@@ -363,6 +379,39 @@ export async function updateManualProtection(input: { positionId: string;
   return updated;
 }
 
+/**
+ * Who asked for a stored manual order, for the halt.
+ *
+ * Every manual order is an operator's, except the SELL the bot-managed TP/SL
+ * monitor creates when a level is hit. That one is automation, and the monitor
+ * marks it `protectionState: "triggered"` — a value only this server writes,
+ * never one a request can set. (A snapshot overwrites the field, but by then
+ * the row has left `requested`, which is the only state this is asked about.)
+ */
+export function manualOrderOrigin(order: Pick<ManualOrder, "side" | "protectionState">): BotOrderOrigin {
+  return order.side === "SELL" && order.protectionState === "triggered" ? "automation" : "operator";
+}
+
+/**
+ * The halt, re-checked at the moment the reconciler would place a manual order
+ * for the first time — with the same rule the submission used.
+ *
+ * Only the halt. The numeric limits were applied when the order was admitted,
+ * and re-checking them here would count this order's own reserved exposure (a
+ * `requested` BUY is already in the risk snapshot) a second time.
+ */
+export async function assertManualFirstSubmitNotHalted(
+  order: ManualOrder, readLimits: () => Promise<Pick<BotRiskLimits, "tradingHalted" | "haltedReason">> =
+  getBotRiskLimits
+): Promise<void> {
+  const limits = await readLimits();
+  // Exact: a stored side that is not literally SELL is judged as an entry.
+  const side = order.side === "SELL" ? "sell" : "buy";
+  const decision = evaluateBotHalt(limits, { side, origin: manualOrderOrigin(order) });
+  if (decision.allowed) return;
+  throw new ManualHaltRefusal(decision.reason, side !== "sell");
+}
+
 export async function reconcilePendingManualOrders(
   adapterFactory: AdapterFactory = defaultAdapter, limit = 100
 ): Promise<void> {
@@ -375,6 +424,15 @@ export async function reconcilePendingManualOrders(
       const snapshot = await reconcileOneManualOrder(order, adapter);
       if (snapshot) await applyManualSnapshot(order.id, snapshot);
     } catch (error) {
+      if (error instanceof ManualHaltRefusal && error.terminal) {
+        // Compare-and-set on `requested`: that status is the proof nothing was
+        // sent, and it is the only state this may finish. Same terminal state
+        // a pre-exchange Shariah or validation refusal records.
+        await prisma.manualOrder.updateMany({ where: { id: order.id, status: "requested" }, data: {
+          status: "rejected", completedAt: new Date(),
+          error: `refused before submission: ${error.message}` }});
+        continue;
+      }
       await prisma.manualOrder.update({ where: { id: order.id }, data: {
         error: `reconciliation pending: ${error instanceof Error ? error.message : "unknown error"}` }});
     }
@@ -382,9 +440,12 @@ export async function reconcilePendingManualOrders(
 }
 
 const defaultFirstSubmitGate = async (order: ManualOrder): Promise<unknown> => {
-  // BUY only, and the asymmetry is the point: an exit interrupted between its
-  // reservation and the exchange must always be able to finish, whatever this
-  // installation has since decided about the asset.
+  // The halt first: an entry queued before a halt must not land after it
+  // latched. An operator's exit passes; an automated exit waits.
+  await assertManualFirstSubmitNotHalted(order);
+  // Shariah: BUY only, and the asymmetry is the point: an exit interrupted
+  // between its reservation and the exchange must always be able to finish,
+  // whatever this installation has since decided about the asset.
   if (order.side !== "BUY") return undefined;
   return clearanceForFirstSubmission({
     scope: shariahScopeForManualAccount(order.exchangeAccountId),
@@ -396,7 +457,7 @@ const defaultFirstSubmitGate = async (order: ManualOrder): Promise<unknown> => {
 export async function reconcileOneManualOrder(
   order: ManualOrder, adapter: ManualExchangeAdapter,
   /**
-   * The first-submission Shariah check, injectable so a pure lifecycle test
+   * The first-submission gate (halt, then Shariah), injectable so a pure lifecycle test
    * needs no database. It defaults to the real one — a caller that wants no
    * gate has to ask for it in writing, in this file, where it is visible.
    */

@@ -1180,6 +1180,64 @@ test("D-9: while halted a manual BUY is refused with 409, and a manual SELL stil
     assert.equal(await prisma.manualOrder.count({ where: { requestId: { in: ["d9-buy", "d9-unreadable"] } } }), 0);
   });
 
+/*
+ * The reconciler half of D-9. A manual order left `requested` — reserved, never
+ * sent, e.g. by a crash between the reservation and the exchange call — is
+ * placed by `reconcilePendingManualOrders` later. If the halt latched in
+ * between, an ENTRY must not land; an operator's exit must still go out; an
+ * automated (TP/SL monitor) exit waits for the resume rather than being lost.
+ */
+test("D-9 reconciler: a queued manual BUY is rejected by a later halt; a queued operator SELL still goes out",
+  async () => {
+    const account = await createAccount();
+    const position = await prisma.smartTrade.create({ data: { source: "manual",
+      exchangeAccountId: account.id, botName: "Manual", pair: "BTCUSDT", status: "active",
+      direction: "long", entryPrice: 100, buyPrice: 100, currentPrice: 100,
+      quantity: 0.5, quoteSpent: 50, protectionType: "bot-managed", protectionState: "none" } });
+    const queued = (requestId: string, data: Record<string, unknown>) => prisma.manualOrder.create({
+      data: { requestId, exchangeAccountId: account.id, symbol: "BTCUSDT", orderType: "MARKET",
+        status: "requested", clientOrderId: `${requestId}-client`, side: "BUY", quantityType: "quote",
+        ...data } as Parameters<typeof prisma.manualOrder.create>[0]["data"] });
+    const buy = await queued("q-buy", { requestedQuoteQty: 10 });
+    const unreadable = await queued("q-unreadable", { side: "sell", quantityType: "base", requestedBaseQty: 0.1 });
+    const operatorSell = await queued("q-op-sell", { side: "SELL", quantityType: "base",
+      requestedBaseQty: 0.2, linkedPositionId: position.id, protectionState: "none" });
+    const monitorSell = await queued("q-auto-sell", { side: "SELL", quantityType: "base",
+      requestedBaseQty: 0.3, linkedPositionId: position.id, protectionType: "bot-managed",
+      protectionState: "triggered" });
+
+    // Latched AFTER the orders were reserved, the way a daily-loss breach latches it.
+    await prisma.riskControl.create({ data: { id: "global", tradingHalted: true,
+      haltedReason: "rolling 24h realised loss 600.00 has reached the limit 500.00", haltedBy: "daily_loss" } });
+    const submitted: string[] = [];
+    const adapter: ManualExchangeAdapter = {
+      submit: async (intent) => { submitted.push(intent.clientOrderId);
+        return snapshot("FILLED", intent.baseQuantity ?? 0.1, 20, intent.clientOrderId); },
+      query: async () => null, cancel: async () => { throw new Error("not used"); },
+      ticker: async () => 100, baseTotal: async () => 0.5,
+    };
+    await reconcilePendingManualOrders(() => adapter);
+
+    assert.deepEqual(submitted, ["q-op-sell-client"], "only the operator's exit may be placed while halted");
+    const rejectedBuy = await prisma.manualOrder.findUniqueOrThrow({ where: { id: buy.id } });
+    assert.equal(rejectedBuy.status, "rejected");
+    assert.match(rejectedBuy.error ?? "", /trading is halted: rolling 24h realised loss/);
+    assert.ok(rejectedBuy.completedAt, "the refused entry is terminal");
+    assert.equal((await prisma.manualOrder.findUniqueOrThrow({ where: { id: unreadable.id } })).status,
+      "rejected", "an unreadable side is judged as an entry");
+    assert.equal((await prisma.manualOrder.findUniqueOrThrow({ where: { id: operatorSell.id } })).status,
+      "filled");
+    const held = await prisma.manualOrder.findUniqueOrThrow({ where: { id: monitorSell.id } });
+    assert.equal(held.status, "requested", "an automated exit is held, never abandoned");
+    assert.match(held.error ?? "", /reconciliation pending: trading is halted/);
+
+    // After the resume: the held automated exit goes out; the refused entry never does.
+    await prisma.riskControl.update({ where: { id: "global" }, data: { tradingHalted: false } });
+    await reconcilePendingManualOrders(() => adapter);
+    assert.deepEqual(submitted, ["q-op-sell-client", "q-auto-sell-client"]);
+    assert.equal((await prisma.manualOrder.findUniqueOrThrow({ where: { id: buy.id } })).status, "rejected");
+  });
+
 test("the global halt blocks both BUY and SELL at the strategy webhook submission path", async () => {
   const account = await createAccount();
   const bot = await prisma.signalBot.create({ data: {
