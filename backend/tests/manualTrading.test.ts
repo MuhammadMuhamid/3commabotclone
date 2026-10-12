@@ -196,3 +196,28 @@ test("mainnet requires both the server gate and explicit confirmation", () => {
     assert.doesNotThrow(() => assertManualAccountGate(account(false), MAINNET_MANUAL_CONFIRMATION));
   } finally { config.manualTradingEnabled = oldManual; config.mainnetManualTradingEnabled = oldMainnet; }
 });
+
+ test("future-skewed signatures cannot outlive their replay reservation", async () => {
+  const start = Date.now();
+  const request = signed(start + MANUAL_AUTH_FRESHNESS_MS);
+  const first = verifyManualRequest({ ...request, now: start });
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+  const rows = new Map<string, Date>();
+  let clock = start;
+  const store = {
+    prune: async () => { for (const [nonce, expiry] of rows) if (expiry.getTime() < clock) rows.delete(nonce); },
+    create: async (nonce: string, expiry: Date) => {
+      if (rows.has(nonce)) throw Object.assign(new Error("duplicate"), { code: "P2002" });
+      rows.set(nonce, expiry);
+    },
+  };
+  assert.equal(await reserveManualNonce(first.nonce, first.expiresAt, store), true);
+  for (const elapsed of [MANUAL_AUTH_FRESHNESS_MS + 1, 2 * MANUAL_AUTH_FRESHNESS_MS]) {
+    clock = start + elapsed;
+    const replay = verifyManualRequest({ ...request, now: clock });
+    assert.equal(replay.ok, true);
+    if (replay.ok) assert.equal(await reserveManualNonce(replay.nonce, replay.expiresAt, store), false);
+  }
+  assert.equal(verifyManualRequest({ ...request, now: clock + 1 }).ok, false);
+});

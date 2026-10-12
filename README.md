@@ -1,5 +1,7 @@
 # Signal Bot — Platform-authorized Binance Spot execution
 
+Current documentation starts at [docs/README.md](docs/README.md).
+
 Full-stack execution bot: connect **Binance Spot**, execute authenticated
 Platform decisions, manage **multi-pair bots**, and monitor them from a
 3commas-inspired dashboard. Direct TradingView traffic is exit-only.

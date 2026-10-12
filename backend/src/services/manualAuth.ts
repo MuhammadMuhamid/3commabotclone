@@ -80,7 +80,9 @@ export function verifyManualRequest(input: {
   if (actualBytes.length !== expectedBytes.length || !timingSafeEqual(actualBytes, expectedBytes)) {
     return { ok: false, status: 401, error: "invalid manual command signature" };
   }
-  return { ok: true, requestId, nonce, expiresAt: new Date(now + MANUAL_AUTH_FRESHNESS_MS) };
+  // Future clock skew is accepted, so keep the nonce until the signed
+  // timestamp's entire acceptance window has closed, including its last ms.
+  return { ok: true, requestId, nonce, expiresAt: new Date(ts + MANUAL_AUTH_FRESHNESS_MS + 1) };
 }
 
 export interface ManualNonceStore {
