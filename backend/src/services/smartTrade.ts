@@ -97,6 +97,15 @@ export function calcFinalClosePnl(
   return { pnlUsdt: totalPnlUsdt, pnlPct, finalLegPnlUsdt };
 }
 
+/**
+ * The exchange account a trade is priced through. A strategy trade follows its
+ * bot. A manual trade has no bot and carries its own account, and so does a
+ * trade whose bot was deleted.
+ */
+function pricingAccountId(trade: { bot: { exchangeAccountId: string | null } | null; exchangeAccountId: string | null }) {
+  return trade.bot ? trade.bot.exchangeAccountId : trade.exchangeAccountId;
+}
+
 export async function updateSmartTradePnl(
   tradeId: string,
   client?: BinanceClient,
@@ -116,10 +125,9 @@ export async function updateSmartTradePnl(
 
   let c = client;
   if (!c) {
-    if (trade.bot?.exchangeAccountId) {
-      const acc = await prisma.exchangeAccount.findUnique({
-        where: { id: trade.bot.exchangeAccountId },
-      });
+    const accountId = pricingAccountId(trade);
+    if (accountId) {
+      const acc = await prisma.exchangeAccount.findUnique({ where: { id: accountId } });
       if (acc) c = clientFromAccount(acc);
     }
     if (!c) c = clientFromEnv() ?? undefined;
@@ -129,8 +137,9 @@ export async function updateSmartTradePnl(
   const price = knownPrice ?? await getTickerPrice(c, trade.pair);
   const { pnlUsdt, pnlPct } = calcUnrealizedPnl(trade.quantity, price, trade.quoteSpent);
 
-  await prisma.smartTrade.update({
-    where: { id: tradeId },
+  // A close can land after the read above, and its final P&L must survive.
+  await prisma.smartTrade.updateMany({
+    where: { id: tradeId, status: "active" },
     data: { currentPrice: price, pnlUsdt, pnlPct },
   });
 }
@@ -205,19 +214,24 @@ export async function checkTakeProfitStopLoss(
 
   const candidates: { trade: (typeof trades)[number]; client: BinanceClient }[] = [];
   for (const trade of trades) {
-    // F5: bot is null when the parent bot was deleted — skip TP/SL but still refresh PnL if possible
-    if (!trade.bot) continue;
     // Cheap pre-check so a trade another path is already closing is skipped
     // before any Binance call. The authoritative acquire happens below.
     if (isTradeClosingNow(trade.id)) continue;
-    const client = await clientFor(trade.bot.exchangeAccountId);
+    let client: BinanceClient | undefined;
+    try {
+      client = await clientFor(pricingAccountId(trade));
+    } catch (error) {
+      // Pricing a manual trade must never cost a strategy trade its stop-loss check.
+      if (trade.bot) throw error;
+      continue;
+    }
     if (!client) continue;
     candidates.push({ trade, client });
   }
 
   // ── Phase 1: one price per (account, pair), then refresh P&L concurrently ──
   const priceKeys = [...new Set(candidates.map(
-    (c) => `${CLIENT_CACHE_KEY(c.trade.bot!.exchangeAccountId)}\u0000${c.trade.pair}`
+    (c) => `${CLIENT_CACHE_KEY(pricingAccountId(c.trade))}\u0000${c.trade.pair}`
   ))];
   const prices = new Map<string, number>();
   await mapWithConcurrency(priceKeys, PRICE_CONCURRENCY, async (key) => {
@@ -234,7 +248,7 @@ export async function checkTakeProfitStopLoss(
 
   const refreshed = new Set<string>();
   await mapWithConcurrency(candidates, PNL_CONCURRENCY, async ({ trade, client }) => {
-    const key = `${CLIENT_CACHE_KEY(trade.bot!.exchangeAccountId)}\u0000${trade.pair}`;
+    const key = `${CLIENT_CACHE_KEY(pricingAccountId(trade))}\u0000${trade.pair}`;
     try {
       await updateSmartTradePnl(trade.id, client, prices.get(key));
       refreshed.add(trade.id);
@@ -262,6 +276,8 @@ export async function checkTakeProfitStopLoss(
    * observability only, and it resets the moment a refresh succeeds.
    */
   for (const { trade } of candidates) {
+    // A trade with no bot has no stop to miss here: manual protection runs apart.
+    if (!trade.bot) continue;
     if (refreshed.has(trade.id)) { unmonitoredCycles.delete(trade.id); continue; }
     const misses = (unmonitoredCycles.get(trade.id) ?? 0) + 1;
     unmonitoredCycles.set(trade.id, misses);
@@ -276,7 +292,10 @@ export async function checkTakeProfitStopLoss(
 
   // ── Phase 2: evaluate and close, one at a time ────────────────────────────
   for (const { trade, client } of candidates) {
-    const bot = trade.bot!;
+    // A trade with no bot is only priced. Its bot's rules don't exist, and manual
+    // take-profit and stop-loss belong to `manualProtection.ts`.
+    const bot = trade.bot;
+    if (!bot) continue;
     if (!refreshed.has(trade.id)) continue;
 
     if (!bot.takeProfitEnabled && !bot.stopLossEnabled) continue;

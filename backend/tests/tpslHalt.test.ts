@@ -69,7 +69,7 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
     origin?: string | null; closedReason?: string | null; submittedAt?: Date | null;
     exchangeStatus?: string | null; requestedBaseQty?: number | null }[] = [];
   const originals = {
-    findMany: smartTrade.findMany, findUnique: smartTrade.findUnique, update: smartTrade.update,
+    findMany: smartTrade.findMany, findUnique: smartTrade.findUnique, update: smartTrade.update, updateMany: smartTrade.updateMany,
     riskFindUnique: riskControl.findUnique,
     partialFindMany: partialClose.findMany,
     pairUpsert: pairCloseMark.upsert,
@@ -94,6 +94,13 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
     const t = trades.get(where.id)!;
     Object.assign(t, data);
     return withBot(t);
+  };
+  smartTrade.updateMany = async (arg: unknown) => {
+    const { where, data } = arg as { where: { id: string; status?: string }; data: Record<string, unknown> };
+    const t = trades.get(where.id);
+    if (!t || (where.status && t.status !== where.status)) return { count: 0 };
+    Object.assign(t, data);
+    return { count: 1 };
   };
   riskControl.findUnique = async () => (halted
     ? { id: "global", tradingHalted: true, haltedReason: "operator", haltedBy: "operator",
@@ -148,7 +155,7 @@ function installFakePrisma(bot: FakeBot, trade: FakeTrade) {
     restore: () => {
       smartTrade.findMany = originals.findMany;
       smartTrade.findUnique = originals.findUnique;
-      smartTrade.update = originals.update;
+      smartTrade.update = originals.update; smartTrade.updateMany = originals.updateMany;
       riskControl.findUnique = originals.riskFindUnique;
       partialClose.findMany = originals.partialFindMany;
       pairCloseMark.upsert = originals.pairUpsert;
