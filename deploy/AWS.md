@@ -1,5 +1,8 @@
 # Deploy Signal Bot on AWS EC2
 
+> **Older manual path.** Production uses `platform/deployment/aws/BOT-DEPLOY.md` in
+> the Platform repository.
+
 ## Prerequisites
 
 - Domain (e.g. `bot.yourdomain.com`) pointing to your server IP

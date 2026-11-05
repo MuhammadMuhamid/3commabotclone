@@ -1,7 +1,7 @@
 # Signal Bot — Complete Technical Guide
 
 > **Audience:** AI agents and engineers onboarding to this codebase.  
-> **Repository:** https://github.com/MuhammadMuhamid/3commabotclone (private)  
+> **Repository:** https://github.com/MuhammadMuhamid/3commabotclone (public)  
 > **Local checkout:** wherever this repository is cloned.  
 > **Last audited:** 2026-08-24
 

@@ -361,6 +361,11 @@ Exit example:
 
 ## Deploy on AWS (EC2 + Docker)
 
+> **Production doesn't use this path.** Since 2026-11-04 the Bot is deployed from
+> the Platform repository, with `platform/deployment/aws/bot-stack.sh` and
+> `BOT-DEPLOY.md` beside it. That setup uses Caddy with no SSH port. The steps below
+> describe the older manual deployment.
+
 See [deploy/AWS.md](deploy/AWS.md).
 
 Summary:
