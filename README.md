@@ -123,6 +123,13 @@ SQLite database. Never point them at a real database or a real key.
   halt. Dry run never sends an order, and manual live execution is restricted
   to Binance Spot with the existing testnet/mainnet confirmations.
 
+### Platform's Bot section reads
+
+`GET /api/manual-trading/bot-view/summary`, `/bots` and `/trades` serve the Bot
+section on the Platform. They use the same signature as manual orders, read local
+rows only and never contact an exchange. Responses are built field by field in
+`backend/src/services/botView.ts`, so no webhook secret or exchange key is included.
+
 ### Persisted execution evidence reads
 
 Platform can read one exact persisted order without triggering reconciliation

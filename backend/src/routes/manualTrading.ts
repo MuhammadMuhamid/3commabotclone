@@ -8,6 +8,9 @@ import {
 } from "../services/manualTrading.js";
 import { readManualExecutionEvidence } from "../services/executionEvidence.js";
 import { readManualAccountState } from "../services/manualAccountState.js";
+import {
+  BOT_VIEW_MAX_PAGE_SIZE, listBotViewBots, listBotViewTrades, readBotViewSummary,
+} from "../services/botView.js";
 import { shariahContextSchema } from "./webhookSchema.js";
 import {
   readInstallationShariahMode, setInstallationShariahMode, ShariahEnforcementError,
@@ -102,6 +105,35 @@ manualTradingRouter.get("/account-state", asyncHandler(async (req, res) => {
     return;
   }
   res.json(await readManualAccountState(parsed.data));
+}));
+
+/**
+ * The Platform's Bot section. Read-only: these touch local rows, call no
+ * exchange and change nothing. They live on this router so the signature and
+ * the production proxy's Platform-only rule both apply to them.
+ */
+manualTradingRouter.get("/bot-view/summary", asyncHandler(async (_req, res) => {
+  res.json(await readBotViewSummary());
+}));
+
+manualTradingRouter.get("/bot-view/bots", asyncHandler(async (_req, res) => {
+  res.json(await listBotViewBots());
+}));
+
+const botViewTradesSchema = z.object({
+  status: z.enum(["active", "closed"]),
+  botId: z.string().uuid().optional(),
+  page: z.coerce.number().int().min(1).max(100_000).default(1),
+  pageSize: z.coerce.number().int().min(1).max(BOT_VIEW_MAX_PAGE_SIZE).default(50),
+}).strict();
+
+manualTradingRouter.get("/bot-view/trades", asyncHandler(async (req, res) => {
+  const parsed = botViewTradesSchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.errors[0]?.message ?? "invalid trades request" });
+    return;
+  }
+  res.json(await listBotViewTrades(parsed.data));
 }));
 
 manualTradingRouter.post("/execution-evidence/manual-orders/lookup", asyncHandler(async (req, res) => {
