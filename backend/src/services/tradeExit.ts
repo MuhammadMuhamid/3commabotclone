@@ -34,7 +34,7 @@ import { prisma } from "../lib/prisma.js";
 import { normalizeSymbol } from "../lib/symbols.js";
 import { acquireTradeClose, isTradeClosing, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import {
-  classifyExchangeFailure, clientFromAccount, clientFromEnv, marketSellBase, MinNotionalError,
+  classifyExchangeFailure, clientFromAccount, clientFromEnv, marketSellBase, MinNotionalError, PreWireError,
   resolveSellQuantity, type BinanceClient,
 } from "./binance.js";
 import { config } from "../config.js";
@@ -337,7 +337,20 @@ export async function partialCloseStrategyTrade(
     }
 
     const requestedQty = current.quantity * (pct / 100);
-    const sellQty = await resolveSellQuantity(client, trade.pair, requestedQty);
+    let sellQty: number;
+    try {
+      sellQty = await resolveSellQuantity(client, trade.pair, requestedQty);
+    } catch (error) {
+      // Everything resolveSellQuantity throws is pre-wire (the wallet or lot
+      // check failed before any order existed), so the refusal is definitive
+      // and typed; the raw text stays on the Bot side as detail.
+      if (error instanceof PreWireError) {
+        throw new ControlRefusal(422, "not_executed",
+          "No order was sent: the wallet's free balance is below what this partial close would sell.",
+          error.message);
+      }
+      throw error;
+    }
 
     /*
      * BOT-P1-1: the durable attempt is the order's identity. A retry or crash

@@ -183,6 +183,8 @@ function fakeExchange(opts: {
   failOrders?: boolean;
   /** Integration: throw this Binance-shaped error from order() instead of filling. */
   orderError?: () => unknown;
+  /** Free base balance the fake wallet reports (default 10). */
+  baseFree?: string;
   seed?: { clientOrderId: string; status: string; side?: string }[];
 } = {}): FakeExchange {
   const submissions: Record<string, unknown>[] = [];
@@ -195,7 +197,7 @@ function fakeExchange(opts: {
   const client = {
     prices: async ({ symbol }: { symbol: string }) => ({ [symbol]: opts.price ?? "100" }),
     accountInfo: async () => ({ balances: [
-      { asset: "BTC", free: "10", locked: "0" }, { asset: "USDT", free: "100000", locked: "0" },
+      { asset: "BTC", free: opts.baseFree ?? "10", locked: "0" }, { asset: "USDT", free: "100000", locked: "0" },
     ] }),
     exchangeInfo: async () => ({ symbols: [{ filters: [
       { filterType: "LOT_SIZE", stepSize: "0.0001", minQty: "0.0001" },
@@ -863,6 +865,19 @@ test("C7 × D2: a definite rejection (-2010 insufficient balance) stays 422 exch
   const r = await post(`/trades/${trade.id}/partial-close`, { pct: 50, actor: ACTOR });
   assert.equal(r.status, 422, JSON.stringify(r.body));
   assert.equal(r.body.code, "exchange_rejected");
+});
+
+test("C7: a pre-wire refusal (wallet below the lot minimum) is a typed 422 not_executed, with no order", async () => {
+  const exchange = fakeExchange({ baseFree: "0" });
+  useExchange(exchange);
+  const bot = await createBot();
+  const trade = await createTrade(bot);
+  const r = await post(`/trades/${trade.id}/partial-close`, { pct: 25, actor: ACTOR });
+  assert.equal(r.status, 422, JSON.stringify(r.body));
+  assert.equal(r.body.code, "not_executed");
+  assert.match(String(r.body.error), /No order was sent/);
+  assert.equal(exchange.submissions.length, 0);
+  assert.equal(heldLockCount(), 0);
 });
 
 // ════════════════════════════════════════════════════════════════════════════
