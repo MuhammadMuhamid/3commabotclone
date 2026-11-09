@@ -525,3 +525,36 @@ test("CORS stays Bot-origin only: a preflight from another origin gets no allow-
   } });
   assert.notEqual(response.headers.get("access-control-allow-origin"), "https://mytradingview.example");
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// Review fix 3: every refused key submission is counted exactly once
+// ════════════════════════════════════════════════════════════════════════════
+
+test("review fix 3: two concurrent wrong submissions both count; the next one fails the enrollment", async () => {
+  const { enrollmentId, cookie } = await openSession({ purpose: "create", testnet: true, name: "x" });
+  // Both requests read the session before either probe answers (a barrier of two).
+  let arrived = 0;
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  enrollmentProbeClient.fromKeys = () => ({
+    accountInfo: async () => {
+      arrived += 1;
+      if (arrived === 2) release();
+      await barrier;
+      return { canTrade: false, permissions: ["SPOT"] };
+    },
+    apiPermission: async () => ({}),
+  });
+  const body = { apiKey: KEY, apiSecret: SECRET };
+  const [a, b] = await Promise.all([browser("/keys", body, { cookie }), browser("/keys", body, { cookie })]);
+  assert.equal(a.status, 422);
+  assert.equal(b.status, 422);
+  const row = await prisma.exchangeEnrollment.findUniqueOrThrow({ where: { id: enrollmentId } });
+  assert.equal(row.attempts, 2, "a compare-and-set increment: neither refusal is lost");
+  assert.equal(row.status, "opened");
+  useProbe({ account: { canTrade: false, permissions: ["SPOT"] } });
+  const third = await browser("/keys", body, { cookie });
+  assert.equal(third.status, 422);
+  assert.equal(third.body.returnUrl, `${RETURN_URL}?enrollment=${enrollmentId}&status=failed`);
+  assert.equal((await prisma.exchangeEnrollment.findUniqueOrThrow({ where: { id: enrollmentId } })).status, "failed");
+});

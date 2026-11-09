@@ -85,3 +85,14 @@ test("container nginx serves /enroll with a strict, uncached, no-referrer policy
   assert.match(page, /try_files \/enroll\.html =404;/);
   assert.match(conf, /location \/api\/enroll\/ \{\s*\n\s*client_max_body_size 4k;/);
 });
+
+test("review fix 4: submit and reveal are single-flight, so a double click cannot show a false 'Link not valid'", () => {
+  const app = read("src", "enroll", "EnrollApp.tsx");
+  assert.match(app, /const inFlight = useRef\(false\)/);
+  const submit = app.slice(app.indexOf("const submitKeys"), app.indexOf("const reveal"));
+  const reveal = app.slice(app.indexOf("const reveal"), app.indexOf("if (phase.kind === \"starting\")"));
+  for (const handler of [submit, reveal]) {
+    assert.match(handler, /if \(inFlight\.current\) return;\s*inFlight\.current = true;/);
+    assert.match(handler, /finally \{\s*inFlight\.current = false;/);
+  }
+});

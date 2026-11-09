@@ -64,6 +64,10 @@ export default function EnrollApp({ ticket }: { ticket: string | null }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const started = useRef(false);
+  // Review fix 4: one request at a time. A double click used to send two;
+  // the loser found the session already spent and showed "Link not valid"
+  // although the keys were saved. A ref, not state: it is set synchronously.
+  const inFlight = useRef(false);
 
   useEffect(() => {
     // Exchange the ticket once (StrictMode runs effects twice in development;
@@ -81,6 +85,8 @@ export default function EnrollApp({ ticket }: { ticket: string | null }) {
 
   const submitKeys = async (meta: EnrollmentMeta, e: React.FormEvent) => {
     e.preventDefault();
+    if (inFlight.current) return;
+    inFlight.current = true;
     setError(null);
     setBusy(true);
     try {
@@ -101,11 +107,14 @@ export default function EnrollApp({ ticket }: { ticket: string | null }) {
         setError(err instanceof Error ? err.message : "The keys could not be saved.");
       }
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
 
   const reveal = async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setError(null);
     setBusy(true);
     try {
@@ -114,6 +123,7 @@ export default function EnrollApp({ ticket }: { ticket: string | null }) {
       if (err instanceof EnrollError && err.status === 401) setPhase({ kind: "invalid", message: err.message });
       else setError(err instanceof Error ? err.message : "The secret could not be shown.");
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
