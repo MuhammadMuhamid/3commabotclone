@@ -313,6 +313,10 @@ model ManualCommand {
   id        String   @id @default(uuid())
   requestId String   @unique
   kind      String
+  /// sha256 of the command kind and canonical request body, so a reused
+  /// request id carrying a DIFFERENT body is refused (D2). Null on rows from
+  /// before this existed, which are not compared.
+  bodyHash  String?
   status    String   @default("processing")
   result    String?
   error     String?

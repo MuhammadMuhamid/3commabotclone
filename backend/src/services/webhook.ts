@@ -7,9 +7,8 @@ import {
   clientFromEnv,
   getBaseFreeBalance,
   getUsdtBalance,
+  classifyExchangeFailure,
   clientOrderId,
-  ExchangeError,
-  MinNotionalError,
   type BinanceClient,
 } from "./binance.js";
 import { updateSmartTradePnl } from "./smartTrade.js";
@@ -413,6 +412,27 @@ export async function processWebhook(
       botBuyLocks.add(bot.id);
 
       try {
+        /*
+         * D2: no second exposure while an earlier BUY for this bot and pair has
+         * an unresolved exchange outcome — after a -1006/-1007, a 5xx or a
+         * transport failure the first BUY may already be a position the Bot
+         * does not track yet. The existing `risk_blocked` outcome (409, the
+         * sender stays flat and may retry later) needs no contract change.
+         * A redelivery of the SAME signal is not blocked here: it carries the
+         * same durable identity and goes on to query that intent.
+         */
+        const unresolved = await prisma.strategyOrderIntent.findFirst({ where: {
+          botId: bot.id, symbol, side: "BUY", status: { in: ["requested", "submitted"] },
+          ...(buyIntentKey ? { sourceKey: { not: buyIntentKey } } : {}),
+        }, select: { clientOrderId: true } });
+        if (unresolved) {
+          const reason = `${symbol}: an earlier BUY (${unresolved.clientOrderId}) has an unresolved ` +
+            "exchange outcome; no second entry is placed until it is reconciled";
+          await prisma.webhookLog.update({ where: { id: log.id },
+            data: { status: "blocked", message: reason } });
+          await releasePersistentDedupe(reservedDedupeKeys);
+          return { status: "risk_blocked", detail: reason };
+        }
         await assertCanOpenTrade(bot, symbol);
         const client = await clientFactory(bot);
         const usdt = await getUsdtBalance(client);
@@ -513,10 +533,13 @@ export async function processWebhook(
         const execution = await reconcileStrategyIntent(
           intent.id,
           strategyMarketAdapter(client),
-          { hooks: strategyCrashHooks }
+          { hooks: strategyCrashHooks, rejectOnGateRefusal: true }
         );
         submissionAttempted = execution.intent.status !== "requested" &&
           execution.intent.status !== "rejected";
+        if (execution.intent.status === "rejected") {
+          throw new Error(execution.intent.error ?? `${symbol}: strategy BUY was rejected`);
+        }
         if (execution.pending || !execution.result) {
           throw new Error(
             `${symbol}: strategy BUY outcome remains unresolved; deterministic reconciliation pending`
@@ -766,11 +789,10 @@ export async function processWebhook(
         durable.status !== "requested" && durable.status !== "rejected";
     }
     // A known exchange rejection (or any failure before submission) created no
-    // order, so a retry must be allowed. Ambiguous transport failures and local
-    // post-submit failures retain the receipt to fail safe against duplication.
-    if (!submissionAttempted ||
-        (e instanceof ExchangeError && e.code !== undefined) ||
-        e instanceof MinNotionalError) {
+    // order, so a retry must be allowed. Ambiguous outcomes (D2: anything short
+    // of a definite rejection) and local post-submit failures retain the
+    // receipt to fail safe against duplication.
+    if (!submissionAttempted || classifyExchangeFailure(e).outcome === "rejected") {
       await releasePersistentDedupe(reservedDedupeKeys);
     }
     // BUG-01: Update the existing log entry instead of creating a second one

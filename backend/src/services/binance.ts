@@ -4,7 +4,7 @@ import type { ExchangeAccount } from "@prisma/client";
 import { decrypt } from "../lib/crypto.js";
 import { config } from "../config.js";
 import { parsePair, toBinanceSymbol } from "../lib/symbols.js";
-import { assertClearedForSymbol, type ShariahClearance } from "./shariah.js";
+import { assertClearedForSymbol, ShariahEnforcementError, type ShariahClearance } from "./shariah.js";
 
 /** binance-api-node is CJS; under Node ESM the factory lives on `.default` */
 const Binance =
@@ -127,8 +127,37 @@ export interface OrderResult {
   exchangeStatus?: string;
 }
 
+/**
+ * A refusal this process raised itself, BEFORE any exchange request was sent.
+ *
+ * Nothing exists at the exchange under the order's client id, so it is a
+ * definite rejection for `classifyExchangeFailure`, whatever its message.
+ */
+export class PreWireError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PreWireError";
+  }
+}
+
+/**
+ * F9: run a read that happens BEFORE any order request (exchange rules, a
+ * balance, the minimum notional). Whatever it throws, no order was sent, so
+ * the failure is a `PreWireError` — a definite "not executed" — rather than a
+ * plain error the classifier would have to treat as uncertain.
+ */
+export async function beforeTheWire<T>(symbol: string, what: string, read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (error) {
+    if (error instanceof PreWireError) throw error;
+    throw new PreWireError(`${symbol}: ${what} failed before any order was sent: ${
+      error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 /** Binance rejects an order below the symbol's NOTIONAL filter. */
-export class MinNotionalError extends Error {
+export class MinNotionalError extends PreWireError {
   constructor(readonly required: number, readonly requested: number, symbol: string) {
     super(
       `${symbol}: order notional ${requested.toFixed(2)} is below the exchange minimum ` +
@@ -138,21 +167,127 @@ export class MinNotionalError extends Error {
   }
 }
 
+/**
+ * D2: what a failed order submission proves about the order.
+ *
+ *   `rejected`  — the exchange (or this process, before the wire) definitely did
+ *                 not execute it. Terminal.
+ *   `duplicate` — Binance already holds an order under this client order id
+ *                 ("Duplicate order sent."). Resolve it by querying that id.
+ *   `uncertain` — anything else. It MAY have executed: keep the order pending and
+ *                 reconcile it by its original client order id. Never `rejected`.
+ */
+export type ExchangeFailureOutcome = "rejected" | "duplicate" | "uncertain";
+
+export interface ExchangeFailureClassification {
+  outcome: ExchangeFailureOutcome;
+  /** The numeric Binance code, when the error carries one. */
+  code?: number;
+  /** The HTTP status, when the library exposes it (non-JSON bodies only). */
+  httpStatus?: number;
+  message: string;
+}
+
+/**
+ * Binance codes that mean "this request was not executed".
+ *
+ * A whitelist on purpose: misclassifying "not executed" as uncertain costs a
+ * lookup by client id and a short pending window, while misclassifying "maybe
+ * executed" as rejected costs untracked exposure and a duplicate entry (D2).
+ * Any code not listed here — including -1006/-1007 ("execution status
+ * unknown"), -1000/-1001/-1008 and every future code — is uncertain.
+ *
+ *   -1002 unauthorized · -1003 request weight / 429 / 418 · -1013 filter failure
+ *   -1015 too many new orders · -1021 timestamp outside recvWindow
+ *   -1022 invalid signature · -1100…-1131 request validation
+ *   -2014 bad API-key format · -2015 invalid key, IP or permissions
+ *   -2010 NEW_ORDER_REJECTED, EXCEPT "Duplicate order sent." (an order exists)
+ */
+const DEFINITE_REJECTION_CODES = new Set([-1002, -1003, -1013, -1015, -1021, -1022, -2014, -2015]);
+const NEW_ORDER_REJECTED = -2010;
+const DUPLICATE_ORDER = /duplicate order/i;
+/** HTTP statuses whose meaning is "refused by the rate limiter before processing". */
+const RATE_LIMIT_HTTP_STATUSES = new Set([429, 418]);
+
+function isDefiniteRejectionCode(code: number): boolean {
+  return DEFINITE_REJECTION_CODES.has(code) || (code <= -1100 && code >= -1131);
+}
+
+function classifyRaw(code: number | undefined, httpStatus: number | undefined,
+  message: string): ExchangeFailureOutcome {
+  if (code === NEW_ORDER_REJECTED) return DUPLICATE_ORDER.test(message) ? "duplicate" : "rejected";
+  if (code !== undefined) return isDefiniteRejectionCode(code) ? "rejected" : "uncertain";
+  if (httpStatus !== undefined && RATE_LIMIT_HTTP_STATUSES.has(httpStatus)) return "rejected";
+  return "uncertain";
+}
+
+/** Only a numeric code from a Binance JSON body counts as a Binance code. */
+function binanceCode(err: { code?: unknown; name?: unknown }): number | undefined {
+  // A DOMException (AbortError 20, TimeoutError 23) also carries a numeric
+  // `code`; it is a transport outcome, never a Binance answer.
+  if (err.name === "AbortError" || err.name === "TimeoutError") return undefined;
+  return typeof err.code === "number" && Number.isInteger(err.code) ? err.code : undefined;
+}
+
+function httpStatusOf(err: { response?: unknown }): number | undefined {
+  const status = (err.response as { status?: unknown } | undefined)?.status;
+  return typeof status === "number" ? status : undefined;
+}
+
+/**
+ * D2: the ONE classification every order-submitting path uses — manual MARKET
+ * and LIMIT BUY/SELL, the strategy webhook BUY/SELL (and so the dashboard
+ * Close), and the manual TP/SL protection SELL.
+ */
+export function classifyExchangeFailure(err: unknown): ExchangeFailureClassification {
+  if (err instanceof ExchangeError) {
+    return { outcome: err.outcome, code: err.code, httpStatus: err.httpStatus, message: err.message };
+  }
+  const e = (err ?? {}) as { code?: unknown; name?: unknown; message?: unknown; response?: unknown };
+  const message = typeof e.message === "string" ? e.message : String(err);
+  if (err instanceof PreWireError || err instanceof ShariahEnforcementError) {
+    return { outcome: "rejected", message };
+  }
+  const code = binanceCode(e);
+  const httpStatus = httpStatusOf(e);
+  return { outcome: classifyRaw(code, httpStatus, message), code, httpStatus, message };
+}
+
+/** The operator-facing note for an order left pending by an uncertain answer. */
+export function describeUncertainFailure(failure: ExchangeFailureClassification): string {
+  const detail = failure.code !== undefined ? ` (${failure.code})`
+    : failure.httpStatus !== undefined ? ` (HTTP ${failure.httpStatus})` : "";
+  const head = failure.outcome === "duplicate"
+    ? `the exchange already holds an order under this client order id${detail}`
+    : `execution status unknown${detail}`;
+  return `${head}; reconciliation by client order id is pending: ${failure.message}`;
+}
+
 /** Preserves the Binance error code, which the route used to discard. */
 export class ExchangeError extends Error {
-  constructor(message: string, readonly code: number | undefined, readonly symbol: string) {
+  /** D2: what this failure proves about the order. See `classifyExchangeFailure`. */
+  readonly outcome: ExchangeFailureOutcome;
+
+  constructor(message: string, readonly code: number | undefined, readonly symbol: string,
+    readonly httpStatus?: number) {
     super(message);
     this.name = "ExchangeError";
+    this.outcome = classifyRaw(code, httpStatus, message);
   }
 }
 
-function wrapExchangeError(err: unknown, symbol: string): never {
-  const e = err as { code?: unknown; message?: unknown };
-  const code = typeof e.code === "number" ? e.code : undefined;
+/** Wrap a raw exchange failure, keeping only what is safe to classify on. */
+export function toExchangeError(err: unknown, symbol: string): ExchangeError {
+  if (err instanceof ExchangeError) return err;
+  const e = (err ?? {}) as { code?: unknown; name?: unknown; message?: unknown; response?: unknown };
   const message = typeof e.message === "string" ? e.message : "Binance request failed";
+  return new ExchangeError(message, binanceCode(e), symbol, httpStatusOf(e));
+}
+
+function wrapExchangeError(err: unknown, symbol: string): never {
   // BOT-014: `-2010 Insufficient balance` and `-1013 Filter failure` are
   // actionable and were previously collapsed into a generic 503.
-  throw new ExchangeError(message, code, symbol);
+  throw toExchangeError(err, symbol);
 }
 
 /**
@@ -181,7 +316,17 @@ export type OrderProbe =
   | { state: "open"; exchangeStatus: string }
   | { state: "dead"; exchangeStatus: string }
   | { state: "absent" }
-  | { state: "unknown"; reason: string };
+  | {
+    state: "unknown"; reason: string;
+    /**
+     * D2: set only for a TERMINAL order (CANCELED/EXPIRED/...) that moved base
+     * asset — the executed part, net of base-asset commission for a BUY. The
+     * exit resolvers keep treating this as unknown (fail safe); the strategy
+     * BUY reconciler books it, because an entry that partly filled is real
+     * exposure that must not stay untracked.
+     */
+    partialFill?: OrderResult;
+  };
 
 /** Binance's "Order does not exist" for a lookup by client order id. */
 const ORDER_DOES_NOT_EXIST = -2013;
@@ -254,7 +399,23 @@ export async function probeOrderByClientId(
     // A terminal order that nevertheless moved base asset is real exposure the
     // caller has to reconcile deliberately; this model must not call it "dead".
     if (grossQty > 0) {
-      return { state: "unknown", reason: `${status} order carries a partial fill of ${grossQty}` };
+      const reason = `${status} order carries a partial fill of ${grossQty}`;
+      let executedQty = grossQty;
+      if (side === "BUY") {
+        try {
+          const trades = await client.myTrades({
+            symbol: sym, orderId: Number(order.orderId),
+          } as Parameters<BinanceClient["myTrades"]>[0]);
+          executedQty = netBaseQty(grossQty, trades, parsePair(sym).base);
+        } catch {
+          // Without the commission the net quantity is unknown: no evidence.
+          return { state: "unknown", reason };
+        }
+      }
+      return { state: "unknown", reason, partialFill: {
+        orderId: String(order.orderId), executedQty, cummulativeQuoteQty: quote,
+        avgPrice: quote / grossQty, simulated: false, exchangeStatus: status,
+      }};
     }
     return { state: "dead", exchangeStatus: status };
   }
@@ -324,7 +485,7 @@ export async function marketBuyQuote(
   // refusal here must be indistinguishable from the order never being tried.
   assertClearedForSymbol(opts.shariahClearance, sym);
   const quote = floorQuote(quoteUsdt);
-  if (quote <= 0) throw new Error(`${sym}: nothing to spend after flooring ${quoteUsdt}`);
+  if (quote <= 0) throw new PreWireError(`${sym}: nothing to spend after flooring ${quoteUsdt}`);
 
   /*
    * BOT-035: the dry-run branch comes FIRST and touches nothing but a price.
@@ -348,7 +509,7 @@ export async function marketBuyQuote(
 
   // BOT-031: refuse below the exchange minimum rather than discovering it as a
   // -1013 that the route turned into a generic 503.
-  const minNotional = await getMinNotional(client, sym);
+  const minNotional = await beforeTheWire(sym, "minimum-notional lookup", () => getMinNotional(client, sym));
   if (minNotional > 0 && quote < minNotional) {
     throw new MinNotionalError(minNotional, quote, sym);
   }
@@ -366,7 +527,9 @@ export async function marketBuyQuote(
       ...(stableClientOrderId ? { newClientOrderId: stableClientOrderId } : {}),
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
-    if ((err as { code?: unknown }).code === undefined && stableClientOrderId) {
+    // D2: anything short of a definite rejection may have executed (or, for a
+    // duplicate, already did) — ask by the same client id before failing.
+    if (classifyExchangeFailure(err).outcome !== "rejected" && stableClientOrderId) {
       const recovered = await queryFilledMarketOrder(client, sym, "BUY", stableClientOrderId);
       if (recovered) return recovered;
     }
@@ -448,7 +611,7 @@ export async function resolveSellQuantity(
     const minQty = "minQty" in lot ? parseFloat(lot.minQty) : step;
     qty = floorToStep(qty, step);
     if (qty < minQty) {
-      throw new Error(
+      throw new PreWireError(
         `Sell quantity ${qty} below minimum ${minQty} ${parsePair(sym).base} (free: ${free})`
       );
     }
@@ -504,7 +667,7 @@ export async function marketSellBase(
    */
   let qty: number;
   try {
-    qty = await resolveSellQuantity(client, sym, quantity);
+    qty = await beforeTheWire(sym, "sell-quantity lookup", () => resolveSellQuantity(client, sym, quantity));
   } catch (err) {
     if (stableClientOrderId) {
       const recovered = await queryFilledMarketOrder(client, sym, "SELL", stableClientOrderId);
@@ -523,15 +686,14 @@ export async function marketSellBase(
       ...(stableClientOrderId ? { newClientOrderId: stableClientOrderId } : {}),
     } as Parameters<BinanceClient["order"]>[0]);
   } catch (err) {
-    // The uncoded case is a transport failure of unknown outcome. A coded
-    // "duplicate order" rejection is just as ambiguous in the way that
-    // matters here: Binance already has an order under this exact client id,
-    // which is precisely the already-filled-elsewhere case this recovers.
-    // Any OTHER coded rejection (bad balance, filter failure, ...) is a real,
-    // first-attempt rejection, and a query for it will correctly find nothing.
-    const e = err as { code?: unknown; message?: unknown };
-    const ambiguous = e.code === undefined ||
-      (typeof e.message === "string" && /duplicate/i.test(e.message));
+    // An uncertain outcome (transport failure, -1006/-1007, any code outside
+    // the definite-rejection whitelist) may have executed. A "duplicate
+    // order" answer is just as ambiguous in the way that matters here:
+    // Binance already has an order under this exact client id, which is
+    // precisely the already-filled-elsewhere case this recovers. A definite
+    // rejection (bad balance, filter failure, ...) is a real first-attempt
+    // rejection, and a query for it would correctly find nothing (D2).
+    const ambiguous = classifyExchangeFailure(err).outcome !== "rejected";
     if (ambiguous && stableClientOrderId) {
       const recovered = await queryFilledMarketOrder(client, sym, "SELL", stableClientOrderId);
       if (recovered) return recovered;

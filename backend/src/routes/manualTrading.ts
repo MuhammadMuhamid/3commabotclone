@@ -201,7 +201,7 @@ manualTradingRouter.post("/orders", asyncHandler(async (req, res) => {
   }
   const id = requestId(res);
   const result = await runIdempotentManualCommand(id, "submit_order",
-    () => submitManualOrder({ requestId: id, ...parsed.data }));
+    () => submitManualOrder({ requestId: id, ...parsed.data }), { body: parsed.data });
   res.status(201).json(result);
 }));
 
@@ -209,7 +209,8 @@ manualTradingRouter.post("/orders/:id/cancel", asyncHandler(async (req, res) => 
   const parsed = z.object({ mainnetConfirmation: confirmation }).strict().safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ error: "invalid cancel request" }); return; }
   const result = await runIdempotentManualCommand(requestId(res), "cancel_order",
-    () => cancelManualOrder(pathId(req), parsed.data.mainnetConfirmation));
+    () => cancelManualOrder(pathId(req), parsed.data.mainnetConfirmation),
+    { body: { orderId: pathId(req), ...parsed.data } });
   res.json(result);
 }));
 
@@ -220,7 +221,8 @@ manualTradingRouter.patch("/positions/:id/protection", asyncHandler(async (req, 
     res.status(400).json({ error: "provide takeProfitPrice and/or stopLossPrice; null removes a level" }); return;
   }
   const result = await runIdempotentManualCommand(requestId(res), "update_protection",
-    () => updateManualProtection({ positionId: pathId(req), ...parsed.data }));
+    () => updateManualProtection({ positionId: pathId(req), ...parsed.data }),
+    { body: { positionId: pathId(req), ...parsed.data } });
   res.json(result);
 }));
 
@@ -231,6 +233,11 @@ manualTradingRouter.use((error: unknown, _req: Request, res: Response, next: Nex
     res.status(error.httpStatus).json({ error: error.message, code: error.code });
     return;
   }
-  if (error instanceof ManualTradingError) { res.status(error.httpStatus).json({ error: error.message }); return; }
+  if (error instanceof ManualTradingError) {
+    // `code` only when the refusal carries one (D2), so every existing body is unchanged.
+    res.status(error.httpStatus).json(error.code ? { error: error.message, code: error.code }
+      : { error: error.message });
+    return;
+  }
   next(error);
 });

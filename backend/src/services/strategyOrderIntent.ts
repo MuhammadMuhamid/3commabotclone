@@ -3,13 +3,12 @@ import { config } from "../config.js";
 import { prisma } from "../lib/prisma.js";
 import type { OrderProbe, OrderResult, BinanceClient } from "./binance.js";
 import {
-  clientFromAccount, clientFromEnv, ExchangeError, marketBuyQuote,
-  marketSellBase, MinNotionalError, probeOrderByClientId, queryFilledMarketOrder,
+  classifyExchangeFailure, clientFromAccount, clientFromEnv, describeUncertainFailure, marketBuyQuote,
+  marketSellBase, probeOrderByClientId, queryFilledMarketOrder,
 } from "./binance.js";
 import { calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
 import {
   clearanceForFirstSubmission, clearanceForPersistedEntry, shariahScopeForBot,
-  ShariahEnforcementError,
 } from "./shariah.js";
 import { persistStrategyRealization } from "./realizationEvents.js";
 import {
@@ -18,6 +17,13 @@ import {
 } from "./riskControls.js";
 
 const UNRESOLVED_STATUSES = ["requested", "submitted"];
+
+/**
+ * Consecutive cycles an attempted BUY's exchange state could not be read
+ * before the operator is alerted (bounded, as `UNMONITORED_ALERT_CYCLES`).
+ */
+export const STRATEGY_LOOKUP_ALERT_CYCLES = 3;
+const strategyLookupFailures = new Map<string, number>();
 
 export interface StrategyIntentReservation {
   sourceKey: string;
@@ -633,6 +639,20 @@ async function assertNeverAttemptedMaySubmit(intent: StrategyOrderIntent): Promi
     if (bot.maxEntryOrders != null && pairCount >= bot.maxEntryOrders) {
       throw new Error(`Max entry orders for ${intent.symbol} reached`);
     }
+    /*
+     * D2: no second exposure while an earlier BUY for this bot and pair has an
+     * unresolved exchange outcome. "Earlier" is an attempted (`submitted`)
+     * intent, or an older never-attempted one — so two crash-orphaned
+     * `requested` intents cannot block each other: the oldest goes first.
+     */
+    const unresolved = await prisma.strategyOrderIntent.findFirst({ where: {
+      id: { not: intent.id }, botId: bot.id, symbol: intent.symbol, side: "BUY",
+      OR: [{ status: "submitted" }, { status: "requested", createdAt: { lt: intent.createdAt } }],
+    }, select: { clientOrderId: true } });
+    if (unresolved) {
+      throw new Error(`An earlier BUY for ${intent.symbol} (${unresolved.clientOrderId}) has an ` +
+        "unresolved exchange outcome; no second entry is placed until it is reconciled");
+    }
   } else if (!intent.smartTradeId || !(await prisma.smartTrade.findFirst({ where: {
     id: intent.smartTradeId, status: "active",
   }}))) {
@@ -640,7 +660,10 @@ async function assertNeverAttemptedMaySubmit(intent: StrategyOrderIntent): Promi
   }
 
   const limits = await getBotRiskLimits();
-  const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours);
+  // This intent's own reserved exposure is already in the snapshot as an
+  // unresolved BUY; `quoteQty` below adds it once, so it is excluded there.
+  const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours,
+    { excludeStrategyIntentId: intent.id });
   const decision = evaluateBotRisk(limits, snapshot, {
     // Exact: a side that is not literally SELL is judged as an entry.
     side: intent.side === "SELL" ? "sell" : "buy",
@@ -708,7 +731,18 @@ const defaultAdapterFactory: StrategyAdapterFactory = async (intent) =>
 export async function reconcileStrategyIntent(
   intentId: string,
   adapter: StrategyMarketAdapter,
-  options: { hooks?: StrategyCrashHooks; allowNeverAttempted?: boolean } = {}
+  options: {
+    hooks?: StrategyCrashHooks; allowNeverAttempted?: boolean; now?: number;
+    /**
+     * F2: set by the synchronous webhook admission. A `requested` BUY whose
+     * first-submit gate refuses it there provably never reached the wire, and
+     * its sender is told "no" — so it is closed off `rejected` instead of
+     * lingering (and blocking fresh entries) until it is 15 minutes stale. A
+     * crash-orphaned `requested` row met by the background reconciler keeps
+     * the existing behaviour: held, and still submittable once the gate clears.
+     */
+    rejectOnGateRefusal?: boolean;
+  } = {}
 ): Promise<StrategyExecutionOutcome> {
   let intent = await prisma.strategyOrderIntent.findUnique({ where: { id: intentId } });
   if (!intent) throw new Error("Strategy intent not found");
@@ -728,7 +762,16 @@ export async function reconcileStrategyIntent(
     if (options.allowNeverAttempted === false) {
       return { intent, pending: true, appliedNow: false };
     }
-    await assertNeverAttemptedMaySubmit(intent);
+    try {
+      await assertNeverAttemptedMaySubmit(intent);
+    } catch (error) {
+      if (options.rejectOnGateRefusal && intent.side === "BUY") {
+        // Compare-and-set on `requested`: nothing was sent, nothing is abandoned.
+        await closeOffUnresolvedIntent(intent, "ABSENT", `Refused before submission: ${
+          error instanceof Error ? error.message : "first-submit gate refused"}`);
+      }
+      throw error;
+    }
     const claimed = await prisma.strategyOrderIntent.updateMany({
       where: { id: intent.id, status: "requested" },
       data: { status: "submitted", submittedAt: new Date(), error: null },
@@ -743,6 +786,15 @@ export async function reconcileStrategyIntent(
   }
 
   try {
+    if (!submittedHere && intent.side === "BUY" && adapter.probe) {
+      // D2: an already-attempted BUY is resolved query-first, never resubmitted.
+      const resolved = await resolveAttemptedBuy(intent, adapter, options.now ?? Date.now());
+      if (resolved.result) {
+        await options.hooks?.afterExchangeResult?.(intent, resolved.result);
+        return await applyAuthoritativeResult(intent.id, resolved.result);
+      }
+      return resolved.outcome;
+    }
     result = submittedHere ? await adapter.submit(intent) : await adapter.query(intent);
     if (!result) {
       const pending = await prisma.strategyOrderIntent.update({ where: { id: intent.id }, data: {
@@ -754,21 +806,22 @@ export async function reconcileStrategyIntent(
     return await applyAuthoritativeResult(intent.id, result);
   } catch (error) {
     /*
-     * A Shariah refusal is a rejection, not an ambiguous outcome. The clearance
-     * assertion is the first statement in `marketBuyQuote` and precedes the
-     * exchange call in the manual LIMIT path, so nothing was ever sent. Without
-     * this the intent would be marked `submitted` — a state that may only ever
-     * be queried — and would sit unresolved forever against an order that does
-     * not exist.
+     * D2: only a DEFINITE rejection is terminal — a local refusal raised before
+     * the wire (Shariah: the clearance assertion is the first statement in
+     * `marketBuyQuote`; the minimum notional) or a whitelisted Binance code.
+     * Anything else (-1006/-1007, 5xx, transport failures, unknown codes, a
+     * crash after the exchange answered) may have executed: the intent stays
+     * `submitted` with the reason recorded, and is resolved query-first.
      */
-    const rejected = error instanceof MinNotionalError ||
-      error instanceof ShariahEnforcementError ||
-      (error instanceof ExchangeError && error.code !== undefined);
+    const failure = classifyExchangeFailure(error);
+    const rejected = failure.outcome === "rejected";
     await prisma.strategyOrderIntent.updateMany({
       where: { id: intent.id, status: { not: "reconciled" } },
       data: {
         status: rejected ? "rejected" : "submitted",
-        error: error instanceof Error ? error.message : "Strategy exchange outcome unknown",
+        error: rejected || !submittedHere
+          ? (error instanceof Error ? error.message : "Strategy exchange outcome unknown")
+          : describeUncertainFailure(failure),
         reconciledAt: rejected ? new Date() : null,
       },
     });
@@ -776,10 +829,84 @@ export async function reconcileStrategyIntent(
   }
 }
 
+/**
+ * D2: resolve an attempted (`submitted`) BUY from what the exchange says about
+ * its ORIGINAL client order id. Nothing here ever submits.
+ *
+ *   filled                  -> returned for the ordinary authoritative booking;
+ *   terminal + partial fill -> the executed part is booked (real exposure);
+ *   dead (no fill)          -> closed off `rejected` with that exchange status;
+ *   absent                  -> the existing SELL rule (`resolveOneUnresolvedSell`):
+ *                              pending inside SUBMITTED_ABSENCE_SETTLE_MS, then
+ *                              closed off `rejected`/ABSENT;
+ *   open                    -> pending;
+ *   unknown / lookup failed -> pending, never closed; alert after N cycles.
+ */
+async function resolveAttemptedBuy(
+  intent: StrategyOrderIntent,
+  adapter: StrategyMarketAdapter,
+  now: number
+): Promise<{ result?: OrderResult; outcome: StrategyExecutionOutcome }> {
+  let probe: OrderProbe;
+  try {
+    probe = await adapter.probe!(intent);
+  } catch (error) {
+    probe = { state: "unknown", reason: error instanceof Error ? error.message : "lookup failed" };
+  }
+  const pending = async (error: string, exchangeStatus?: string) => {
+    const updated = await prisma.strategyOrderIntent.update({ where: { id: intent.id }, data: {
+      error, ...(exchangeStatus ? { exchangeStatus } : {}) } });
+    return { outcome: { intent: updated, pending: true, appliedNow: false } };
+  };
+  const closedOff = async (exchangeStatus: string, error: string) => {
+    await closeOffUnresolvedIntent(intent, exchangeStatus, error);
+    const updated = await prisma.strategyOrderIntent.findUniqueOrThrow({ where: { id: intent.id } });
+    return { outcome: { intent: updated, pending: false, appliedNow: false } };
+  };
+
+  if (probe.state === "filled") {
+    strategyLookupFailures.delete(intent.id);
+    return { result: probe.result, outcome: { intent, pending: false, appliedNow: false } };
+  }
+  if (probe.state === "unknown" && probe.partialFill) {
+    strategyLookupFailures.delete(intent.id);
+    return { result: probe.partialFill, outcome: { intent, pending: false, appliedNow: false } };
+  }
+  if (probe.state === "unknown") {
+    const count = (strategyLookupFailures.get(intent.id) ?? 0) + 1;
+    strategyLookupFailures.set(intent.id, count);
+    if (count === STRATEGY_LOOKUP_ALERT_CYCLES || count % (STRATEGY_LOOKUP_ALERT_CYCLES * 10) === 0) {
+      console.error(`[strategy-reconcile] ALERT: BUY ${intent.symbol} intent ${intent.id} ` +
+        `(${intent.clientOrderId}) has had no readable exchange state for ${count} consecutive ` +
+        "cycles; it stays unresolved, and no new entry for this bot and pair is admitted meanwhile.");
+    }
+    return pending(`reconciliation pending: exchange state unknown (${count} consecutive ` +
+      `cycle(s)): ${probe.reason}`);
+  }
+  strategyLookupFailures.delete(intent.id);
+  if (probe.state === "open") {
+    return pending(`still working at the exchange (${probe.exchangeStatus}); reconciliation pending`,
+      probe.exchangeStatus);
+  }
+  if (probe.state === "dead") {
+    return closedOff(probe.exchangeStatus,
+      `The exchange order ended ${probe.exchangeStatus} with no fill; no position was opened`);
+  }
+  // absent
+  const submittedAt = (intent.submittedAt ?? intent.createdAt).getTime();
+  if (now - submittedAt < SUBMITTED_ABSENCE_SETTLE_MS) {
+    return pending("the exchange has no record of this order yet; reconciliation pending", "ABSENT");
+  }
+  return closedOff("ABSENT", "The exchange has no order under this client order id " +
+    `${SUBMITTED_ABSENCE_SETTLE_MS / 1000} s after an uncertain submission; no position was opened`);
+}
+
 /** Startup/periodic recovery. Attempted intents reconcile even while halted. */
 export async function reconcilePendingStrategyIntents(
   adapterFactory: StrategyAdapterFactory = defaultAdapterFactory,
-  limit = 100
+  limit = 100,
+  /** Time seam for the absence rule; production passes nothing. */
+  now: number = Date.now()
 ): Promise<void> {
   const intents = await prisma.strategyOrderIntent.findMany({
     where: { status: { in: UNRESOLVED_STATUSES } },
@@ -788,7 +915,7 @@ export async function reconcilePendingStrategyIntents(
   });
   for (const intent of intents) {
     try {
-      await reconcileStrategyIntent(intent.id, await adapterFactory(intent));
+      await reconcileStrategyIntent(intent.id, await adapterFactory(intent), { now });
     } catch (error) {
       await prisma.strategyOrderIntent.updateMany({
         where: { id: intent.id, status: { not: "reconciled" } },
