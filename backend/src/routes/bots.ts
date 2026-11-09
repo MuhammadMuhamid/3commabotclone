@@ -1,108 +1,33 @@
-import { Router } from "express";
-import { z } from "zod";
-import { v4 as uuidv4 } from "uuid";
+import { Router, type Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { config } from "../config.js";
 import { formatInvestmentLabel, INVESTMENT_UNITS } from "../lib/investment.js";
 import { sumMoney } from "../lib/money.js";
 import { readBotStats } from "../services/botView.js";
 import { asyncHandler } from "../middleware/errors.js";
+import { ControlRefusal } from "../services/controlCommands.js";
+import {
+  createBot, deleteBotGuarded, maskSecret, parseBotCreate, parseBotPatch, updateBot,
+} from "../services/botAdmin.js";
+
+/*
+ * The validation, the guards and the writes live in `services/botAdmin.ts`,
+ * shared with the Platform's signed commands (C10–C14), so the dashboard and
+ * Trading Scene can never disagree about what a valid bot is. Re-exported for
+ * existing importers.
+ */
+export {
+  assertSafeBotConfig, countUnresolvedBotIntents, maskSecret, UNPROTECTED_SIZE_LIMIT_PCT,
+} from "../services/botAdmin.js";
 
 export const botsRouter = Router();
 
-const investmentUnitSchema = z.enum([
-  "pct_bot",
-  "pct_trade",
-  "usdt_bot",
-  "usdt_trade",
-]);
-
-/**
- * The position-size fraction above which a stop loss stops being optional.
- *
- * BOT-003: the shipped defaults were `maxInvestmentPct: 100` with
- * `entryVolumePct: 100` and every exit control off, which turns the entire free
- * USDT balance into one spot position with no automated exit path. Defaults are
- * fixed below; this constant is the API-level refusal that stops the same
- * configuration being rebuilt by hand.
- */
-export const UNPROTECTED_SIZE_LIMIT_PCT = 50;
-
-const botBaseSchema = z.object({
-  name: z.string().min(1),
-  alertType: z.enum(["custom", "tradingview"]).default("custom"),
-  /*
-   * BOT-012: "short" and "reversal" were accepted, stored, and offered in the
-   * UI with no caveat, while `binance.ts` hardcodes BUY and SELL and the
-   * value's only backend consumer is a cosmetic label. A user could configure
-   * a short bot, watch it accept signals, and get long positions. Contrast
-   * `entryOrderType`, whose unimplemented "limit" state IS warned about in the
-   * form.
-   *
-   * Only "long" is accepted until shorts actually exist. The database column
-   * keeps any existing value readable.
-   */
-  direction: z.literal("long").default("long"),
-  pairs: z.array(z.string()).min(1),
-  maxInvestmentPct: z.number().min(0.01).max(10000),
-  maxInvestmentUnit: investmentUnitSchema.default("pct_bot"),
-  exchangeAccountId: z.string().optional().nullable(),
-  entryEnabled: z.boolean().default(true),
-  entryVolumePct: z.number().min(1).max(100).default(100),
-  entryOrderType: z.enum(["market", "limit"]).default("market"),
-  // BOT-015: defaulted false, so a default bot rejected every exit webhook.
-  exitEnabled: z.boolean().default(true),
-  takeProfitEnabled: z.boolean().default(false),
-  takeProfitPct: z.number().positive().max(1000).optional().nullable(),
-  // BOT-003: defaulted false, leaving the position unbounded.
-  stopLossEnabled: z.boolean().default(true),
-  stopLossPct: z.number().positive().max(100).optional().nullable(),
-  maxEntryOrders: z.number().int().min(1).optional().nullable(),
-  maxActiveSmartTradesEnabled: z.boolean().default(false),
-  maxActiveSmartTrades: z.number().int().min(1).optional().nullable(),
-});
-
-/**
- * The cross-field safety rules, applied to a COMPLETE configuration.
- *
- * Split out from the object schema so a PATCH can be checked against the merged
- * result rather than against the patch alone — otherwise a request that only
- * turns `stopLossEnabled` off would pass, and BOT-003's configuration could be
- * rebuilt one field at a time.
- */
-export function assertSafeBotConfig(b: {
-  maxInvestmentPct: number;
-  maxInvestmentUnit: string;
-  entryVolumePct: number;
-  stopLossEnabled: boolean;
-  stopLossPct?: number | null;
-  takeProfitEnabled: boolean;
-  takeProfitPct?: number | null;
-}): string | null {
-  const isPct = b.maxInvestmentUnit === "pct_bot" || b.maxInvestmentUnit === "pct_trade";
-  if (isPct) {
-    const effective = (b.maxInvestmentPct * b.entryVolumePct) / 100;
-    if (effective >= UNPROTECTED_SIZE_LIMIT_PCT && !b.stopLossEnabled) {
-      return (
-        `A position of ${UNPROTECTED_SIZE_LIMIT_PCT}% of the balance or more requires a ` +
-        "stop loss. Either enable stopLossEnabled or reduce maxInvestmentPct / entryVolumePct."
-      );
-    }
-  }
-  if (b.stopLossEnabled && (b.stopLossPct ?? 0) <= 0) {
-    return "stopLossPct must be greater than 0 when a stop loss is enabled";
-  }
-  if (b.takeProfitEnabled && (b.takeProfitPct ?? 0) <= 0) {
-    return "takeProfitPct must be greater than 0 when a take profit is enabled";
-  }
-  return null;
+/** A typed refusal from the shared service, as the dashboard has always shaped it. */
+function sendRefusal(res: Response, error: unknown): boolean {
+  if (!(error instanceof ControlRefusal)) return false;
+  res.status(error.status).json({ error: error.message, code: error.code });
+  return true;
 }
-
-const botSchema = botBaseSchema
-  .refine((b) => assertSafeBotConfig(b) === null, (b) => ({
-    message: assertSafeBotConfig(b) ?? "invalid configuration",
-    path: ["stopLossEnabled"],
-  }));
 
 function webhookUrl(): string {
   return `${config.publicUrl}/api/webhooks/signal_bots`;
@@ -142,11 +67,6 @@ function tradingViewSetup(): object {
  * caller explicitly asks (`GET /api/bots/:id?reveal=1`), which is what the
  * Reveal control in the UI does.
  */
-export function maskSecret(secret: string): string {
-  if (secret.length <= 8) return "*".repeat(secret.length);
-  return `${secret.slice(0, 4)}${"*".repeat(secret.length - 8)}${secret.slice(-4)}`;
-}
-
 function mapBot(
   b: Awaited<ReturnType<typeof prisma.signalBot.findMany>>[0],
   extra?: Record<string, unknown>,
@@ -234,129 +154,53 @@ botsRouter.get("/:id", async (req, res) => {
   res.json(mapBot(bot, undefined, { reveal }));
 });
 
-botsRouter.post("/", async (req, res) => {
-  // BUG-10: Catch ZodError (validation) and Prisma errors with a structured JSON response
-  let body: ReturnType<typeof botSchema.parse>;
+botsRouter.post("/", asyncHandler(async (req, res) => {
+  let bot;
   try {
-    body = botSchema.parse(req.body);
-  } catch (e) {
-    if (e instanceof z.ZodError) {
-      return res.status(400).json({ error: e.errors[0]?.message ?? "Invalid input" });
-    }
-    return res.status(400).json({ error: "Invalid request body" });
+    bot = await createBot(parseBotCreate(req.body));
+  } catch (error) {
+    if (sendRefusal(res, error)) return;
+    throw error;
   }
-  const secret = uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "").slice(0, 16);
-  const bot = await prisma.signalBot.create({
-    data: {
-      name: body.name,
-      alertType: body.alertType,
-      direction: body.direction,
-      pairs: JSON.stringify(body.pairs.map((p) => p.toUpperCase().replace(/\//g, ""))),
-      maxInvestmentPct: body.maxInvestmentPct,
-      maxInvestmentUnit: body.maxInvestmentUnit,
-      exchangeAccountId: body.exchangeAccountId ?? null,
-      entryEnabled: body.entryEnabled,
-      entryVolumePct: body.entryVolumePct,
-      entryOrderType: body.entryOrderType,
-      exitEnabled: body.exitEnabled,
-      takeProfitEnabled: body.takeProfitEnabled,
-      takeProfitPct: body.takeProfitPct,
-      stopLossEnabled: body.stopLossEnabled,
-      stopLossPct: body.stopLossPct,
-      maxEntryOrders: body.maxEntryOrders,
-      maxActiveSmartTradesEnabled: body.maxActiveSmartTradesEnabled,
-      maxActiveSmartTrades: body.maxActiveSmartTradesEnabled
-        ? body.maxActiveSmartTrades ?? 2
-        : null,
-      webhookSecret: secret,
-    },
+  const withAccount = await prisma.signalBot.findUniqueOrThrow({
+    where: { id: bot.id },
     include: { exchangeAccount: { select: { id: true, name: true } } },
   });
   // The creation response is the one place the secret is genuinely needed
   // unprompted: it is the only moment the operator has to copy it out.
   res.status(201).json(
     mapBot(
-      bot,
+      withAccount,
       {
         totalProfit: 0,
         activeSmartTrades: 0,
         signalCount: 0,
-        tradingSince: bot.createdAt,
+        tradingSince: withAccount.createdAt,
       },
       { reveal: true }
     )
   );
-});
+}));
 
-botsRouter.patch("/:id", async (req, res) => {
-  const existing = await prisma.signalBot.findUnique({ where: { id: req.params.id } });
-  if (!existing) return res.status(404).json({ error: "Not found" });
-
-  // BUG-10: Catch ZodError with a structured 400 response
-  let body: Partial<z.infer<typeof botBaseSchema>>;
-  try {
-    body = botBaseSchema.partial().parse(req.body);
-  } catch (e) {
-    if (e instanceof z.ZodError) {
-      return res.status(400).json({ error: e.errors[0]?.message ?? "Invalid input" });
-    }
-    return res.status(400).json({ error: "Invalid request body" });
-  }
+botsRouter.patch("/:id", asyncHandler(async (req, res) => {
   /*
-   * The cross-field rules are checked against the MERGED configuration, not the
-   * patch. A request that only turns `stopLossEnabled` off would otherwise
-   * pass, and BOT-003's unprotected-full-balance configuration could be rebuilt
-   * one field at a time.
+   * Shared with C12: X5 guards (no account change or pair removal under an
+   * open trade), tightened validation for every changed value, and the
+   * cross-field rules against the MERGED configuration — a request that only
+   * turns `stopLossEnabled` off cannot rebuild BOT-003 one field at a time.
    */
-  const merged = {
-    maxInvestmentPct: body.maxInvestmentPct ?? existing.maxInvestmentPct,
-    maxInvestmentUnit: body.maxInvestmentUnit ?? existing.maxInvestmentUnit,
-    entryVolumePct: body.entryVolumePct ?? existing.entryVolumePct,
-    stopLossEnabled: body.stopLossEnabled ?? existing.stopLossEnabled,
-    stopLossPct: body.stopLossPct ?? existing.stopLossPct,
-    takeProfitEnabled: body.takeProfitEnabled ?? existing.takeProfitEnabled,
-    takeProfitPct: body.takeProfitPct ?? existing.takeProfitPct,
-  };
-  const unsafe = assertSafeBotConfig(merged);
-  if (unsafe) return res.status(400).json({ error: unsafe });
-
-  const { pairs, maxActiveSmartTradesEnabled, maxActiveSmartTrades, ...rest } = body;
-  const data: Record<string, unknown> = { ...rest };
-
-  // BUG-13: Coerce empty string exchangeAccountId to null — prevents storing "" as a FK
-  if ("exchangeAccountId" in data && data.exchangeAccountId === "") {
-    data.exchangeAccountId = null;
+  try {
+    await updateBot(String(req.params.id), parseBotPatch(req.body));
+  } catch (error) {
+    if (sendRefusal(res, error)) return;
+    throw error;
   }
-
-  if (pairs) {
-    data.pairs = JSON.stringify(pairs.map((p) => p.toUpperCase().replace(/\//g, "")));
-  }
-  if (maxActiveSmartTradesEnabled !== undefined) {
-    data.maxActiveSmartTradesEnabled = maxActiveSmartTradesEnabled;
-    data.maxActiveSmartTrades = maxActiveSmartTradesEnabled
-      ? (maxActiveSmartTrades ?? existing.maxActiveSmartTrades ?? 2)
-      : null;
-  } else if (maxActiveSmartTrades !== undefined) {
-    data.maxActiveSmartTrades = maxActiveSmartTrades;
-  }
-
-  const bot = await prisma.signalBot.update({
-    where: { id: req.params.id },
-    data,
+  const bot = await prisma.signalBot.findUniqueOrThrow({
+    where: { id: String(req.params.id) },
     include: { exchangeAccount: { select: { id: true, name: true } } },
   });
   res.json(mapBot(bot));
-});
-
-/** The strategy-intent states that may still reach, or already be at, the exchange. */
-const UNRESOLVED_INTENT_STATUSES = ["requested", "submitted"];
-
-/** Unresolved strategy order intents for one bot (requested or submitted). */
-export function countUnresolvedBotIntents(botId: string): Promise<number> {
-  return prisma.strategyOrderIntent.count({
-    where: { botId, status: { in: UNRESOLVED_INTENT_STATUSES } },
-  });
-}
+}));
 
 /**
  * Put a bot in a TARGET state — not a toggle, so a retried or doubled request
@@ -377,55 +221,11 @@ export async function setBotStatus(
   return exists ? { changed: false } : null;
 }
 
-type DeleteBotOutcome =
-  | { deleted: true }
-  | { deleted: false; status: 404 | 409; code?: string; error: string };
-
-const openTradesRefusal = (n: number): DeleteBotOutcome => ({
-  deleted: false, status: 409, code: "bot_has_open_trades",
-  error: `Cannot delete: this bot has ${n} active trade(s). Close them first, ` +
-    "or they would lose take-profit/stop-loss protection and could no longer be closed here.",
-});
-
 botsRouter.delete("/:id", asyncHandler(async (req, res) => {
-  /*
-   * Finding 0.7: a bot's open trades must not be orphaned. Deleting the bot
-   * sets `SmartTrade.botId` to null, and a bot-less trade is skipped by the
-   * TP/SL monitor and cannot be closed or partially closed from here — its
-   * protection disappears silently. An unresolved order intent may still be
-   * placed, or already be live, on the bot's behalf. Close (or let settle)
-   * first; history of closed trades is still preserved (F5, onDelete SetNull).
-   *
-   * Atomic (review A1): the delete itself is one conditional statement that
-   * matches only while the bot has NO active trade, so a trade opened after
-   * the checks cannot be orphaned; the intent check runs in the same
-   * transaction (intents carry a bare `botId`, not a relation).
-   */
-  const id = String(req.params.id);
-  const outcome = await prisma.$transaction(async (tx): Promise<DeleteBotOutcome> => {
-    const activeTrades = await tx.smartTrade.count({ where: { botId: id, status: "active" } });
-    if (activeTrades > 0) return openTradesRefusal(activeTrades);
-    const unresolvedIntents = await tx.strategyOrderIntent.count({
-      where: { botId: id, status: { in: UNRESOLVED_INTENT_STATUSES } },
-    });
-    if (unresolvedIntents > 0) {
-      return {
-        deleted: false, status: 409, code: "bot_has_unresolved_intents",
-        error: `Cannot delete: this bot has ${unresolvedIntents} order(s) whose exchange outcome ` +
-          "is still being reconciled. Wait for them to settle, then delete.",
-      };
-    }
-    const removed = await tx.signalBot.deleteMany({
-      where: { id, smartTrades: { none: { status: "active" } } },
-    });
-    if (removed.count === 1) return { deleted: true };
-    // Nothing matched: either there is no such bot, or a trade opened since.
-    const exists = await tx.signalBot.findUnique({ where: { id }, select: { id: true } });
-    if (!exists) return { deleted: false, status: 404, error: "Not found" };
-    return openTradesRefusal(await tx.smartTrade.count({ where: { botId: id, status: "active" } }));
-  });
+  // Finding 0.7 / review A1: shared with C13 (`deleteBotGuarded`).
+  const outcome = await deleteBotGuarded(String(req.params.id));
   if (!outcome.deleted) {
-    res.status(outcome.status).json({ error: outcome.error, ...(outcome.code ? { code: outcome.code } : {}) });
+    res.status(outcome.status).json({ error: outcome.error, code: outcome.code });
     return;
   }
   res.status(204).send();

@@ -110,7 +110,10 @@ test("U5: the exchange-account form starts on testnet and resets to testnet", ()
 
 test("U5: a mainnet account needs the typed MAINNET confirmation, and the API always gets a boolean", () => {
   const settings = src("pages", "Settings.tsx");
-  assert.match(settings, /"MAINNET"/);
+  // Slice 2: the confirmation word and field moved to the shared ExchangeKeyFields
+  // (also used by enroll.html), and the value is now sent for the server to verify.
+  assert.match(src("components", "ExchangeKeyFields.tsx"), /"MAINNET"/);
+  assert.match(settings, /isMainnetConfirmed\(testnet, mainnetConfirmation\)/);
   assert.match(settings, /mainnetConfirmation/);
-  assert.match(src("api.ts"), /testnet: boolean \}/, "`testnet` is required in the create body");
+  assert.match(src("api.ts"), /testnet: boolean;/, "`testnet` is required (not optional) in the create body");
 });

@@ -1,10 +1,39 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { canStoreSecrets, encrypt } from "../lib/crypto.js";
 import { clientFromAccount, getUsdtBalance, getTotalBalanceUsdt } from "../services/binance.js";
+import { asyncHandler } from "../middleware/errors.js";
+import { ControlRefusal } from "../services/controlCommands.js";
+import {
+  accountNameSchema, apiKeySchema, apiSecretSchema, assertCanStoreSecrets, assertMainnetConfirmed,
+  createExchangeAccount, deleteExchangeAccountGuarded,
+} from "../services/exchangeAccounts.js";
 
 export const exchangeRouter = Router();
+
+function sendRefusal(res: Response, error: unknown): boolean {
+  if (!(error instanceof ControlRefusal)) return false;
+  res.status(error.status).json({ error: error.message, code: error.code });
+  return true;
+}
+
+const createAccountSchema = z.object({
+  name: accountNameSchema,
+  apiKey: apiKeySchema,
+  apiSecret: apiSecretSchema,
+  /*
+   * U5: REQUIRED. It used to be optional and default to false, so any
+   * client that omitted it created a MAINNET account — inside an
+   * installation whose process default is testnet. The choice of network
+   * is always explicit.
+   */
+  testnet: z.boolean({
+    required_error: "testnet is required: true for Binance testnet, false for mainnet",
+    invalid_type_error: "testnet must be true or false",
+  }),
+  /** Required, exactly "MAINNET", when testnet is false — checked here, not only in the browser. */
+  mainnetConfirmation: z.string().max(16).optional(),
+});
 
 exchangeRouter.get("/", async (_req, res) => {
   const accounts = await prisma.exchangeAccount.findMany({
@@ -21,46 +50,22 @@ exchangeRouter.get("/", async (_req, res) => {
   res.json(accounts);
 });
 
-exchangeRouter.post("/", async (req, res) => {
+exchangeRouter.post("/", asyncHandler(async (req, res) => {
   try {
-    const schema = z.object({
-      name: z.string().min(1),
-      apiKey: z.string().min(1),
-      apiSecret: z.string().min(1),
-      /*
-       * U5: REQUIRED. It used to be optional and default to false, so any
-       * client that omitted it created a MAINNET account — inside an
-       * installation whose process default is testnet. The choice of network
-       * is now always explicit; the dashboard asks for a typed confirmation
-       * before it sends `false`.
-       */
-      testnet: z.boolean({
-        required_error: "testnet is required: true for Binance testnet, false for mainnet",
-        invalid_type_error: "testnet must be true or false",
-      }),
-    });
     // Refuse to persist a live exchange credential when key material is
-    // missing or unusable. `assertConfig()` already prevents the server from
-    // starting in that state, but this is the write that would be
-    // unrecoverable: a blob encrypted under the wrong key cannot be read back,
-    // and one encrypted under a *published* key is readable by anyone with the
-    // source (finding X-07).
-    if (!canStoreSecrets()) {
-      return res.status(503).json({
-        error:
-          "Cannot store exchange credentials: ENCRYPTION_KEY and SCRYPT_SALT " +
-          "are not configured. See backend/.env.example.",
-      });
+    // missing or unusable (finding X-07): a blob encrypted under the wrong key
+    // cannot be read back, and one under a *published* key is readable by
+    // anyone with the source.
+    assertCanStoreSecrets();
+    const parsed = createAccountSchema.safeParse(req.body);
+    if (!parsed.success) {
+      // Only zod's message — never an input value.
+      res.status(400).json({ error: parsed.error.errors[0]?.message ?? "Invalid input", code: "invalid_request" });
+      return;
     }
-    const body = schema.parse(req.body);
-    const account = await prisma.exchangeAccount.create({
-      data: {
-        name: body.name,
-        apiKeyEnc: encrypt(body.apiKey),
-        apiSecretEnc: encrypt(body.apiSecret),
-        testnet: body.testnet,
-      },
-    });
+    const body = parsed.data;
+    assertMainnetConfirmed(body.testnet, body.mainnetConfirmation);
+    const account = await createExchangeAccount(body);
     res.status(201).json({
       id: account.id,
       name: account.name,
@@ -68,14 +73,11 @@ exchangeRouter.post("/", async (req, res) => {
       marketType: account.marketType,
       testnet: account.testnet,
     });
-  } catch (e) {
-    // BUG-10: Structured error for ZodError or DB failure
-    if (e instanceof z.ZodError) {
-      return res.status(400).json({ error: e.errors[0]?.message ?? "Invalid input" });
-    }
-    res.status(500).json({ error: e instanceof Error ? e.message : "Failed to create account" });
+  } catch (error) {
+    if (sendRefusal(res, error)) return;
+    throw error; // masked 500, logged without the body (X1)
   }
-});
+}));
 
 exchangeRouter.get("/:id/balance", async (req, res) => {
   const account = await prisma.exchangeAccount.findUnique({
@@ -106,29 +108,14 @@ exchangeRouter.get("/:id/total-balance", async (req, res) => {
   }
 });
 
-exchangeRouter.delete("/:id", async (req, res) => {
+exchangeRouter.delete("/:id", asyncHandler(async (req, res) => {
+  // BUG-06: refused while anything references the account — now atomic and
+  // shared with C16 (`deleteExchangeAccountGuarded`).
   try {
-    // BUG-06: Prevent deletion if bots are still linked — they would silently lose credentials
-    const [botCount, manualOrderCount, manualPositionCount, spotExecutionCount, derivativeExecutionCount] = await Promise.all([
-      prisma.signalBot.count({ where: { exchangeAccountId: req.params.id } }),
-      prisma.manualOrder.count({ where: { exchangeAccountId: req.params.id } }),
-      prisma.smartTrade.count({ where: { exchangeAccountId: req.params.id } }),
-      prisma.spotExecutionOrder.count({ where: { exchangeAccountId: req.params.id } }),
-      prisma.derivativeExecutionOrder.count({ where: { exchangeAccountId: req.params.id } }),
-    ]);
-    if (botCount > 0 || manualOrderCount > 0 || manualPositionCount > 0 || spotExecutionCount > 0
-        || derivativeExecutionCount > 0) {
-      return res.status(409).json({
-        error: `Cannot delete: ${botCount} bot(s), ${manualOrderCount} manual order(s), and ` +
-          `${manualPositionCount} manual position record(s), and ${spotExecutionCount} Spot execution order(s) ` +
-          `and ${derivativeExecutionCount} derivatives execution order(s) ` +
-          "use this account. Preserve or reassign them first.",
-      });
-    }
-    await prisma.exchangeAccount.delete({ where: { id: req.params.id } });
-    res.status(204).send();
-  } catch (e) {
-    // BUG-10: Structured error for DB failure
-    res.status(500).json({ error: e instanceof Error ? e.message : "Delete failed" });
+    await deleteExchangeAccountGuarded(String(req.params.id));
+  } catch (error) {
+    if (sendRefusal(res, error)) return;
+    throw error;
   }
-});
+  res.status(204).send();
+}));

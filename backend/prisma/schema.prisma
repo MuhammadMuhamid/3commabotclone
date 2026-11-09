@@ -14,6 +14,9 @@ model ExchangeAccount {
   marketType   String      @default("spot")
   apiKeyEnc    String
   apiSecretEnc String
+  /// Last four characters of the API key (C15). Null for accounts stored
+  /// before the column existed; never backfilled by decrypting.
+  keyHint      String?
   testnet      Boolean     @default(false)
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt

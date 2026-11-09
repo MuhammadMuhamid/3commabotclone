@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { ShieldAlert, Trash2, Plus, KeyRound, TestTube, Bell, BellOff } from "lucide-react";
 import { api, type ExchangeAccount } from "../api";
 import { Btn, Input, Badge, Spinner, toast } from "../components/ui";
+import {
+  ExchangeKeyInputs, isMainnetConfirmed, MainnetConfirmationField,
+} from "../components/ExchangeKeyFields";
 
 export default function Settings() {
   const [accounts, setAccounts] = useState<ExchangeAccount[]>([]);
@@ -82,7 +85,7 @@ export default function Settings() {
     } finally { setPushBusy(false); }
   };
 
-  const mainnetConfirmed = testnet || mainnetConfirmation === "MAINNET";
+  const mainnetConfirmed = isMainnetConfirmed(testnet, mainnetConfirmation);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -92,7 +95,12 @@ export default function Settings() {
     }
     setSaving(true);
     try {
-      await api.exchange.create({ name, apiKey, apiSecret, testnet });
+      // The typed confirmation goes to the server, which verifies it (slice 2):
+      // a mainnet account is refused without it, whatever this page checks.
+      await api.exchange.create({
+        name, apiKey, apiSecret, testnet,
+        ...(testnet ? {} : { mainnetConfirmation }),
+      });
       setApiKey("");
       setApiSecret("");
       setName("My Binance");
@@ -108,7 +116,9 @@ export default function Settings() {
   };
 
   const remove = async (id: string, accountName: string) => {
-    if (!confirm(`Remove "${accountName}"? Bots using it will lose their credentials.`)) return;
+    // The server refuses removal while any bot, order or position uses the
+    // account, so nothing can lose its credentials here.
+    if (!confirm(`Remove "${accountName}"? This is refused while any bot, order or position still uses it.`)) return;
     try {
       await api.exchange.remove(id);
       toast("Account removed.", "success");
@@ -176,18 +186,11 @@ export default function Settings() {
           onChange={setName}
           placeholder="e.g. My Binance Main"
         />
-        <Input
-          label="API Key"
-          value={apiKey}
-          onChange={setApiKey}
-          placeholder="Binance API key"
-        />
-        <Input
-          label="API Secret"
-          value={apiSecret}
-          onChange={setApiSecret}
-          type="password"
-          placeholder="Binance API secret"
+        <ExchangeKeyInputs
+          apiKey={apiKey}
+          onApiKey={setApiKey}
+          apiSecret={apiSecret}
+          onApiSecret={setApiSecret}
         />
 
         <label className="flex items-center gap-2.5 mb-5 cursor-pointer group">
@@ -206,18 +209,7 @@ export default function Settings() {
         </label>
 
         {!testnet && (
-          <div className="mb-5 px-3 py-3 rounded-lg bg-[var(--color-danger-dim)] border border-[var(--color-danger)]/30">
-            <p className="text-xs text-[var(--color-danger)] mb-2 leading-relaxed">
-              <strong>Mainnet:</strong> bots using this account place real-money orders on Binance.
-              Type <code>MAINNET</code> to confirm.
-            </p>
-            <Input
-              label="Mainnet confirmation"
-              value={mainnetConfirmation}
-              onChange={setMainnetConfirmation}
-              placeholder="MAINNET"
-            />
-          </div>
+          <MainnetConfirmationField value={mainnetConfirmation} onChange={setMainnetConfirmation} />
         )}
 
         <Btn primary type="submit" loading={saving} disabled={!mainnetConfirmed} className="w-full justify-center">

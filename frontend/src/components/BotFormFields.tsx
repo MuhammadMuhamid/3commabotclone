@@ -369,8 +369,12 @@ export function BotFormFields({
                   <button
                     key={t}
                     type="button"
+                    // Limit entries are not implemented, and the server refuses
+                    // setting one (slice 2). A bot that already stores "limit"
+                    // keeps showing it, and stays editable.
+                    disabled={t === "limit" && form.entryOrderType !== "limit"}
                     onClick={() => setForm((f) => ({ ...f, entryOrderType: t }))}
-                    className={`px-4 py-2 rounded-lg text-sm font-medium capitalize transition-all ${
+                    className={`px-4 py-2 rounded-lg text-sm font-medium capitalize transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
                       form.entryOrderType === t
                         ? "bg-[var(--color-accent)] text-black"
                         : "text-[var(--color-muted)] hover:text-white hover:bg-[var(--color-panel-3)]"
@@ -380,10 +384,13 @@ export function BotFormFields({
                   </button>
                 ))}
               </div>
-              {form.entryOrderType === "limit" && (
+              {form.entryOrderType === "limit" ? (
                 <p className="text-xs text-amber-400 mt-2 flex items-center gap-1">
-                  <span>⚠</span> Limit orders are stored but only market orders execute. Limit support is planned.
+                  <span>⚠</span> This bot stores a limit entry, which never executed: only market orders run.
+                  Switch to market; limit cannot be selected again.
                 </p>
+              ) : (
+                <p className="text-xs text-[var(--color-muted)] mt-2">Limit entries are not implemented.</p>
               )}
             </label>
           </div>
