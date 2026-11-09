@@ -283,3 +283,84 @@ test("delivery: oldest first, one version per batch — v1 rows go out as a v1 b
   // Every body the Bot sent is a valid batch under the shared contract.
   for (const body of p.bodies) assert.doesNotThrow(() => contract.normalizeRealizationBatch(body));
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// Review fix 1: a Platform rolled back after advertising realization.v2
+// (reproduces tmp/review-ctl/probe-od5-rollback.test.mts)
+// ════════════════════════════════════════════════════════════════════════════
+
+/** A v1-only (rolled-back) Platform: refuses any batch that is not contractVersion 1. */
+function v1OnlyPlatform() {
+  const versions: number[] = [];
+  const fetchImpl: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { contractVersion: number; events: Array<{ eventId: string }> };
+    versions.push(body.contractVersion);
+    if (body.contractVersion !== 1) {
+      return new Response(JSON.stringify({ error: "invalid realization batch" }), { status: 400 });
+    }
+    return new Response(JSON.stringify({ status: "accepted", acceptedEventIds: body.events.map((e) => e.eventId) }),
+      { status: 200 });
+  };
+  return { fetchImpl, versions };
+}
+
+test("rollback: the first refused v2 batch clears the capability; new events are v1 and drain; v2 rows never block them", async () => {
+  config.realizationContractV2Enabled = true;
+  await seeV2();
+  const held = await persist(await intent({ executionEnvironment: "TESTNET" }));
+  assert.equal(held?.contractVersion, 2);
+
+  const old = v1OnlyPlatform();
+  let now = new Date(Date.UTC(2026, 10, 11));
+  assert.deepEqual(await deliverPendingRealizations(old.fetchImpl, now), { attempted: 1, delivered: 0 });
+  assert.equal(await prisma.platformCapability.count(), 0, "a definitive 4xx to a v2 batch clears realization.v2");
+
+  // The probe's 12 cycles: the Bot keeps trading; every new event is v1 and is delivered.
+  for (let cycle = 0; cycle < 12; cycle += 1) {
+    const event = await persist(await intent({ executionEnvironment: "TESTNET" }));
+    assert.equal(event?.contractVersion, 1, `cycle ${cycle}: new events are v1 again (flag still on)`);
+    now = new Date(now.getTime() + 2 * 60 * 60_000); // past every backoff, so the v2 row is due too
+    const result = await deliverPendingRealizations(old.fetchImpl, now);
+    assert.equal(result.delivered, 1, `cycle ${cycle}: the v1 event goes out; the held v2 row does not seize the batch`);
+  }
+  assert.equal(await prisma.realizationEvent.count({ where: { deliveryStatus: "delivered" } }), 12);
+  assert.equal(await prisma.realizationEvent.count({ where: { deliveryStatus: "pending" } }), 1, "only the v2 row is held");
+  assert.equal(old.versions.filter((v) => v === 2).length, 1, "no v2 batch was sent while v1 rows were due");
+
+  // Nothing v1 due: the held v2 row is re-tried under its own backoff (a bounded probe), refused, still pending.
+  now = new Date(now.getTime() + 2 * 60 * 60_000);
+  assert.deepEqual(await deliverPendingRealizations(old.fetchImpl, now), { attempted: 1, delivered: 0 });
+  assert.deepEqual(await deliverPendingRealizations(old.fetchImpl, now), { attempted: 0, delivered: 0 },
+    "backed off: not re-sent in the same cycle window");
+
+  // The Platform is re-upgraded: the held v2 row drains and the capability is learned again.
+  const upgraded = platform(acceptAll(["realization.v2"]));
+  now = new Date(now.getTime() + 2 * 60 * 60_000);
+  assert.deepEqual(await deliverPendingRealizations(upgraded.fetchImpl, now), { attempted: 1, delivered: 1 });
+  assert.equal(upgraded.bodies[0]!.contractVersion, 2);
+  assert.ok(await prisma.platformCapability.findUnique({ where: { name: "realization.v2" } }));
+  const stored = await prisma.realizationEvent.findUniqueOrThrow({ where: { id: String(held?.eventId) } });
+  assert.equal(JSON.parse(stored.payload).contractVersion, 2, "the stored payload was never rewritten");
+});
+
+test("rollback: a transport failure, a 5xx, a 429 or an auth 401 to a v2 batch does not clear the capability", async () => {
+  config.realizationContractV2Enabled = true;
+  await seeV2();
+  await persist(await intent({ executionEnvironment: "MAINNET" }));
+  let now = new Date(Date.UTC(2026, 10, 12));
+  for (const status of [0, 500, 502, 429, 401]) {
+    const answer: typeof fetch = async () => {
+      if (status === 0) throw new Error("socket hang up");
+      return new Response(JSON.stringify({ error: "x" }), { status });
+    };
+    await deliverPendingRealizations(answer, now);
+    assert.ok(await prisma.platformCapability.findUnique({ where: { name: "realization.v2" } }), `status ${status}`);
+    now = new Date(now.getTime() + 2 * 60 * 60_000);
+  }
+  // A refused v1 batch says nothing about v2 either.
+  config.realizationContractV2Enabled = false;
+  await prisma.realizationEvent.deleteMany();
+  await persist(await intent({ executionEnvironment: "MAINNET" }));
+  await deliverPendingRealizations(async () => new Response("{}", { status: 400 }), now);
+  assert.ok(await prisma.platformCapability.findUnique({ where: { name: "realization.v2" } }));
+});

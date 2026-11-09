@@ -710,8 +710,11 @@ model ExchangeEnrollment {
 /**
  * OD-5: a capability the Platform advertised in its LAST acknowledged
  * realization-ingest answer (`capabilities: [...]`). A row exists while the
- * latest acknowledgement listed it; an acknowledgement without it deletes the
- * row, so a rolled-back Platform stops receiving the newer shape.
+ * latest acknowledgement listed it. It is deleted by an acknowledgement
+ * without it, AND by a definitive 4xx refusal of a v2 batch — a rolled-back
+ * (v1-only) Platform never acknowledges v2, so that refusal is the only
+ * signal it gives. While no row exists, new events are v1 and stored v2 rows
+ * are held aside (retried only when no v1 row is due).
  */
 model PlatformCapability {
   name   String   @id
