@@ -194,6 +194,8 @@ export interface EntriesStatus {
   /** Manual LIMIT BUYs still working at the exchange: a pause does not stop them. */
   workingEntryLimits: number;
   unresolvedBuyIntents: number;
+  /** Manual BUYs left `submitted` by an uncertain answer: they can still prove FILLED. */
+  uncertainBuyOrders: number;
 }
 
 export const api = {

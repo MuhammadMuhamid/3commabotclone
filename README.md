@@ -184,6 +184,7 @@ runs the contract diff, below.
   an already-attempted intent still reconciles exchange truth during a later
   halt. Dry run never sends an order, and manual live execution is restricted
   to Binance Spot with the existing testnet/mainnet confirmations.
+- The OD-3 entries pause (and the halt) does not gate the paper/testnet X3A Spot and X3B derivative routers (`services/spotExecution`, `services/derivativeExecution`); they reach no live venue today.
 
 ### Platform's Bot section reads
 

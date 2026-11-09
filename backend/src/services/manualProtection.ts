@@ -5,9 +5,10 @@ import type { ExchangeAccount, ManualOrder, SmartTrade } from "@prisma/client";
 import { classifyExchangeFailure, describeUncertainFailure, floorToStep } from "./binance.js";
 import { BinanceManualExchange, type ManualExchangeAdapter } from "./manualExchange.js";
 import {
-  applyManualSnapshot, cancelWorkingEntryForExit, closeManualDust, entryOfRaceFillPosition,
-  handOffRaceFillSweep, manualExitCapacity, PENDING_STATUSES, RACE_FILL_SWEEP,
-  RACE_FILL_SWEPT_REASON, reconcilePendingManualOrders,
+  applyManualSnapshot, cancelWorkingEntryForExit, closeHaircutRemainder, closeManualDust,
+  entryOfRaceFillPosition, haircutForUnnettedEntry, handOffRaceFillSweep, manualExitCapacity,
+  PENDING_STATUSES, RACE_FILL_SWEEP, RACE_FILL_SWEPT_REASON, reconcilePendingManualOrders,
+  resolveUnresolvedManualExits, UNNETTED_EXIT_HAIRCUT,
 } from "./manualTrading.js";
 import {
   abandonOrderAttempt, markOrderAttemptSubmitted, openOrderAttempt, settleOrderAttempt,
@@ -36,9 +37,10 @@ export const SWEEP_NETTING_WAIT_CYCLES = 3;
 /**
  * X7: the haircut of a sweep whose fee netting never confirmed — Binance's
  * maximum spot fee, 0.1 % [EXT-UNVERIFIED offline]. Selling that much less
- * keeps a gross figure from selling fee-sized untracked coins.
+ * keeps a gross figure from selling fee-sized untracked coins. The same
+ * figure as the TP/SL and manual full-SELL haircut (review F3).
  */
-export const SWEEP_UNNETTED_HAIRCUT = 0.001;
+export const SWEEP_UNNETTED_HAIRCUT = UNNETTED_EXIT_HAIRCUT;
 const sweepNettingWaits = new Map<string, number>();
 
 function noteProtectionFailure(positionId: string, pair: string, reason: string,
@@ -120,7 +122,7 @@ export async function checkManualProtection(
       let plan: ManualExitPlan;
       let price: number;
       if (fresh.protectionState === RACE_FILL_SWEEP) {
-        const sweep = await planRaceFillSweep(fresh, exchange, halted);
+        const sweep = await planRaceFillSweep(fresh, exchange, halted, now);
         if (!sweep) continue;
         ({ plan, position: fresh } = sweep);
         price = await exchange.ticker(fresh.pair);
@@ -132,6 +134,15 @@ export async function checkManualProtection(
           : fresh.manualSlPrice != null && price <= fresh.manualSlPrice ? "sl" : null;
         await prisma.smartTrade.update({ where: { id: fresh.id }, data: { currentPrice: price } });
         if (!reason) { protectionFailures.delete(fresh.id); continue; }
+        const level = reason === "tp" ? fresh.manualTpPrice : fresh.manualSlPrice;
+        const intentKey = `manual-${reason}-${fresh.id}-${level}`;
+
+        // Review F1: another exit of this position left `submitted` (the
+        // operator's SELL, or the TP exit when the SL now triggers) is
+        // resolved first; still unresolved, no exit this cycle.
+        const settled = await resolvePriorExits(fresh, exchange, intentKey, now, "has hit its TP/SL");
+        if (!settled) continue;
+        fresh = settled;
 
         /*
          * OD-1 (owner-approved option C) on top of D1/I8: an entry still
@@ -146,16 +157,21 @@ export async function checkManualProtection(
         const cancel = await cancelWorkingEntryForExit(fresh, exchange, "automation");
         fresh = cancel.position;
         if (!fresh || fresh.status !== "active") continue;
-        const level = reason === "tp" ? fresh.manualTpPrice : fresh.manualSlPrice;
         const race = cancel.raceDelta > 1e-12 && (cancel.outcome === "canceled" ||
           cancel.outcome === "already_terminal")
           ? `RACE FILL: ${Number(cancel.raceDelta.toPrecision(12))} more of the entry had filled by the time it was ` +
             "cancelled for this exit; this exit includes it."
           : null;
-        plan = { label: reason.toUpperCase(), intentKey: `manual-${reason}-${fresh.id}-${level}`,
+        // Review F3 (X7 on the active trade): entry fills still booked gross
+        // after one re-query are sold with the 0.1 % haircut, on THIS cycle —
+        // a stop-loss never waits for a fee lookup.
+        const netting = await haircutForUnnettedEntry(fresh, exchange);
+        fresh = netting.position;
+        if (!fresh || fresh.status !== "active") continue;
+        plan = { label: reason.toUpperCase(), intentKey,
           closedReason: reason === "tp" ? "manual_take_profit" : "manual_stop_loss",
-          attemptOrigin: "manual-protection", rowState: "triggered", sizeCap: fresh.quantity,
-          flag: [race, cancel.flag].filter((note) => note).join(" ") || null,
+          attemptOrigin: "manual-protection", rowState: "triggered", sizeCap: netting.sizeCap ?? fresh.quantity,
+          flag: [race, cancel.flag, netting.flag].filter((note) => note).join(" ") || null,
           failureWhat: "has hit its TP/SL" };
       }
       await runManualExit(fresh, plan, exchange, price, position.exchangeAccount.id, now);
@@ -180,12 +196,16 @@ export async function checkManualProtection(
  *    the entry is re-queried each cycle and the sweep waits; after
  *    `SWEEP_NETTING_WAIT_CYCLES` it sells 0.1 % less, with a note.
  */
-async function planRaceFillSweep(position: SmartTrade, exchange: ManualExchangeAdapter, halted: boolean):
-  Promise<{ plan: ManualExitPlan; position: SmartTrade } | null> {
-  const entry = await entryOfRaceFillPosition(position);
+async function planRaceFillSweep(held: SmartTrade, exchange: ManualExchangeAdapter, halted: boolean,
+  now: number): Promise<{ plan: ManualExitPlan; position: SmartTrade } | null> {
+  const entry = await entryOfRaceFillPosition(held);
   const origin = entry?.exitOrigin === "operator" ? "operator" : "automation";
   if (halted && origin !== "operator") return null;
-  const intentKey = `manual-sweep-${position.id}`;
+  const intentKey = `manual-sweep-${held.id}`;
+  // Review F1: an operator SELL of this race-fill position left `submitted`
+  // is resolved before the sweep sizes anything.
+  const position = await resolvePriorExits(held, exchange, intentKey, now, "is a race fill awaiting its sweep");
+  if (!position) return null;
   const last = await prisma.exchangeOrderAttempt.findFirst({ where: { intentKey },
     orderBy: { attempt: "desc" } });
   if (last && last.status !== "open" && last.attempt >= SWEEP_MAX_ATTEMPTS) {
@@ -224,6 +244,34 @@ async function planRaceFillSweep(position: SmartTrade, exchange: ManualExchangeA
   return { position: current, plan: { label: "SWEEP", intentKey, closedReason: RACE_FILL_SWEPT_REASON,
     attemptOrigin: "manual-sweep", rowState: origin === "operator" ? "sweep" : "triggered", sizeCap, flag,
     failureWhat: "is a race fill awaiting its sweep" } };
+}
+
+/**
+ * Review F1 (2026-11-09): before this cycle sizes an exit of `position`, every
+ * OTHER SELL of it still `submitted` — the operator's, or another slot's (the
+ * TP exit when the SL now triggers) — is resolved query-first
+ * (`resolveUnresolvedManualExits`). Still unresolved: no exit this cycle, and
+ * the bounded protection alert; never a blind second SELL. Resolved to a fill
+ * that closed the position: nothing to do. The cycle's own slot (`ownSlot`)
+ * is excluded: `runManualExit` already queries it first (D1/I6).
+ *
+ * Returns the position to size from, or null when no exit may be placed now.
+ */
+async function resolvePriorExits(position: SmartTrade, exchange: ManualExchangeAdapter, ownSlot: string,
+  now: number, failureWhat: string): Promise<SmartTrade | null> {
+  const prior = await resolveUnresolvedManualExits(position.id, exchange,
+    { now, skip: (order) => order.requestId.startsWith(`${ownSlot}#`) });
+  if (prior.blocked) {
+    noteProtectionFailure(position.id, position.pair,
+      `a prior exit of this position is unresolved: ${prior.reason}`, failureWhat);
+    return null;
+  }
+  if (prior.reconciled + prior.discarded === 0) return position;
+  const fresh = await prisma.smartTrade.findUnique({ where: { id: position.id } });
+  if (fresh?.status === "active") return fresh;
+  protectionFailures.delete(position.id);
+  sweepNettingWaits.delete(position.id);
+  return null;
 }
 
 /**
@@ -409,8 +457,13 @@ async function runManualExit(fresh: SmartTrade, plan: ManualExitPlan, exchange: 
   }
   const after = await prisma.smartTrade.findUnique({ where: { id: fresh.id } });
   if (after?.status === "active" && settledExit.filledBaseQty > 0) {
+    // Review F3: what a haircut exit deliberately left (the presumed
+    // commission of gross entry fills) closes with the position, under this
+    // exit's reason — it is never sold later out of untracked coins.
+    const closedHaircut = await closeHaircutRemainder(settledExit, exchange,
+      { closedReason, origin: plan.rowState === "sweep" ? "operator" : "automation" });
     // D1/I7: an exit that left only an unsellable remainder closes it now.
-    const rules = exchange.lotRules ? await exchange.lotRules(fresh.pair) : null;
+    const rules = !closedHaircut && exchange.lotRules ? await exchange.lotRules(fresh.pair) : null;
     if (rules) {
       await closeManualDust(fresh.id, rules, price, settledExit.id, { adapter: exchange, origin: "automation" });
     }

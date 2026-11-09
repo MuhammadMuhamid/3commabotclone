@@ -281,7 +281,8 @@ test("C0: `entries` and `capabilities` are reported; the live daily-loss breach 
     assert.equal(status.status, 200);
     const entries = status.body.entries as Record<string, unknown>;
     assert.deepEqual(Object.keys(entries).sort(),
-      ["pausedAt", "pausedBy", "paused", "reason", "unresolvedBuyIntents", "workingEntryLimits"].sort());
+      ["pausedAt", "pausedBy", "paused", "reason", "uncertainBuyOrders", "unresolvedBuyIntents",
+        "workingEntryLimits"].sort());
     assert.equal(entries.paused, true);
     assert.equal(entries.workingEntryLimits, 1);
     assert.equal(entries.unresolvedBuyIntents, 1);
