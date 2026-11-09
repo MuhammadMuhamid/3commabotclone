@@ -259,8 +259,18 @@ export async function updateBotRiskLimits(patch: {
  * `quoteSpent` on an open trade is what was actually committed, so exposure
  * here is an observation rather than the platform's intent-based estimate.
  */
-export async function readBotRiskSnapshotSince(since: Date): Promise<BotRiskSnapshot> {
-  const [open, closed, partials, pendingManualBuys] = await Promise.all([
+export interface BotRiskSnapshotOptions {
+  /**
+   * An unresolved strategy BUY being re-checked at its own first submission:
+   * its reserved exposure is the order being judged, so it is not counted twice.
+   */
+  excludeStrategyIntentId?: string;
+}
+
+export async function readBotRiskSnapshotSince(
+  since: Date, options: BotRiskSnapshotOptions = {}
+): Promise<BotRiskSnapshot> {
+  const [open, closed, partials, pendingManualBuys, unresolvedStrategyBuys] = await Promise.all([
     prisma.smartTrade.findMany({
       where: { status: "active" },
       select: { quoteSpent: true },
@@ -286,18 +296,33 @@ export async function readBotRiskSnapshotSince(since: Date): Promise<BotRiskSnap
       where: { side: "BUY", status: { in: ["requested", "submitted", "open", "partially_filled"] } },
       select: { requestedQuoteQty: true, filledQuoteQty: true, filledBaseQty: true },
     }),
+    // D2: a strategy BUY whose exchange outcome is unresolved (reserved, or
+    // attempted with an uncertain answer) may already be a position. It has no
+    // SmartTrade until it reconciles — at which point it leaves this set — so
+    // it is counted here once, as its requested quote.
+    prisma.strategyOrderIntent.findMany({
+      where: { side: "BUY", status: { in: ["requested", "submitted"] },
+        ...(options.excludeStrategyIntentId ? { id: { not: options.excludeStrategyIntentId } } : {}) },
+      select: { requestedQuoteQty: true },
+    }),
   ]);
   const pendingExposure = sumMoney(pendingManualBuys.map((order) =>
     Math.max(0, (order.requestedQuoteQty ?? 0) - order.filledQuoteQty)));
+  const unresolvedStrategyExposure = sumMoney(unresolvedStrategyBuys.map((intent) =>
+    intent.requestedQuoteQty ?? 0));
   return {
-    openExposureQuote: sumMoney([...open.map((t) => t.quoteSpent), pendingExposure]),
-    openTrades: open.length + pendingManualBuys.filter((order) => order.filledBaseQty <= 0).length,
+    openExposureQuote: sumMoney([...open.map((t) => t.quoteSpent), pendingExposure,
+      unresolvedStrategyExposure]),
+    openTrades: open.length + pendingManualBuys.filter((order) => order.filledBaseQty <= 0).length +
+      unresolvedStrategyBuys.length,
     realisedPnlInWindow: realisedPnlFromTradeEvents(closed, partials),
   };
 }
 
-export async function readBotRiskSnapshot(windowHours: number): Promise<BotRiskSnapshot> {
-  return readBotRiskSnapshotSince(new Date(Date.now() - windowHours * 3_600_000));
+export async function readBotRiskSnapshot(
+  windowHours: number, options: BotRiskSnapshotOptions = {}
+): Promise<BotRiskSnapshot> {
+  return readBotRiskSnapshotSince(new Date(Date.now() - windowHours * 3_600_000), options);
 }
 
 /** One-line operator summary. */

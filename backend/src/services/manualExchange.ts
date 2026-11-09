@@ -1,9 +1,9 @@
 import { config } from "../config.js";
 import {
   type BinanceClient, clientFromAccount, floorToStep, getTickerPrice,
-  getBaseTotalBalance,
-  marketBuyQuote, marketSellBase, MinNotionalError,
-  ExchangeError,
+  getBaseFreeBalance, getBaseTotalBalance,
+  beforeTheWire, marketBuyQuote, marketSellBase, MinNotionalError, PreWireError,
+  toExchangeError,
 } from "./binance.js";
 import type { ExchangeAccount } from "@prisma/client";
 import { parsePair, toBinanceSymbol } from "../lib/symbols.js";
@@ -40,8 +40,28 @@ export interface ManualOrderSnapshot {
   simulated: boolean;
 }
 
-export class ManualOrderValidationError extends Error {
+/** A local exchange-filter refusal, raised before any order is sent. */
+export class ManualOrderValidationError extends PreWireError {
   constructor(message: string) { super(message); this.name = "ManualOrderValidationError"; }
+}
+
+/**
+ * A cancel answered `-2011 Unknown order sent.` and a lookup by the same client
+ * order id then found nothing: there is no order at the exchange to cancel.
+ */
+export class ManualOrderNotFoundError extends Error {
+  constructor(readonly symbol: string, readonly clientOrderId: string) {
+    super(`${symbol}: the exchange has no order under client order id ${clientOrderId} ` +
+      "(cancel -2011, then not found); nothing was canceled");
+    this.name = "ManualOrderNotFoundError";
+  }
+}
+
+/** Exchange size rules an exit has to satisfy (D1/I7). */
+export interface ManualLotRules {
+  stepSize: number;
+  minQty: number;
+  minNotional: number;
 }
 
 export interface ManualExchangeAdapter {
@@ -50,6 +70,14 @@ export interface ManualExchangeAdapter {
   cancel(symbol: string, clientOrderId: string): Promise<ManualOrderSnapshot>;
   ticker(symbol: string): Promise<number>;
   baseTotal(symbol: string): Promise<number>;
+  /**
+   * D1/I3: the FREE base balance, which bounds an exit together with the other
+   * tracked positions in the same asset. Optional: an adapter without it gets
+   * the previous, unbounded-by-free behaviour.
+   */
+  baseFree?(symbol: string): Promise<number>;
+  /** D1/I7: the LOT_SIZE / NOTIONAL rules, so dust is recognised. Optional. */
+  lotRules?(symbol: string): Promise<ManualLotRules>;
 }
 
 interface SymbolRules {
@@ -193,6 +221,23 @@ export class BinanceManualExchange implements ManualExchangeAdapter {
   }
 
   /**
+   * In dry run the positions are simulated and the real wallet does not hold
+   * them, so the free balance is no bound at all; anything else would refuse
+   * every simulated exit.
+   */
+  async baseFree(symbol: string): Promise<number> {
+    if (this.dryRun) return Number.POSITIVE_INFINITY;
+    return getBaseFreeBalance(this.client, symbol);
+  }
+
+  /** No rules in dry run, exactly as the dry-run LIMIT path below. */
+  async lotRules(symbol: string): Promise<ManualLotRules> {
+    if (this.dryRun) return { stepSize: 0, minQty: 0, minNotional: 0 };
+    const rules = await symbolRules(this.client, toBinanceSymbol(symbol));
+    return { stepSize: rules.lotStep, minQty: rules.minQty, minNotional: rules.minNotional };
+  }
+
+  /**
    * Re-prove the stored Shariah decision for a BUY.
    *
    * Called by both submission shapes and on every attempt — a first submission
@@ -239,7 +284,7 @@ export class BinanceManualExchange implements ManualExchangeAdapter {
     const rawPrice = intent.limitPrice ?? 0;
     const rules = this.dryRun
       ? { lotStep: 0, minQty: 0, priceTick: 0, minNotional: 0 }
-      : await symbolRules(this.client, sym);
+      : await beforeTheWire(sym, "exchange-rules lookup", () => symbolRules(this.client, sym));
     const price = intent.side === "SELL"
       ? ceilToStep(rawPrice, rules.priceTick)
       : floorToStep(rawPrice, rules.priceTick);
@@ -276,8 +321,15 @@ export class BinanceManualExchange implements ManualExchangeAdapter {
         newOrderRespType: "FULL",
       } as Parameters<BinanceClient["order"]>[0]);
     } catch (error) {
-      const detail = error as { code?: number; message?: string };
-      throw new ExchangeError(detail.message ?? "Binance limit order failed", detail.code, sym);
+      // D2: numeric Binance codes only, classified once. "Duplicate order
+      // sent." means an order under this exact client id already exists:
+      // resolve it by that id instead of failing.
+      const failure = toExchangeError(error, sym);
+      if (failure.outcome === "duplicate") {
+        const existing = await this.query(intent.symbol, intent.clientOrderId);
+        if (existing) return existing;
+      }
+      throw failure;
     }
     return fromBinanceOrder(this.client, sym, order as unknown as Record<string, unknown>);
   }
@@ -311,6 +363,7 @@ export class BinanceManualExchange implements ManualExchangeAdapter {
       if ((error as { code?: number }).code === -2011) {
         const current = await this.query(symbol, clientOrderId);
         if (current) return current;
+        throw new ManualOrderNotFoundError(toBinanceSymbol(symbol), clientOrderId);
       }
       throw error;
     }
