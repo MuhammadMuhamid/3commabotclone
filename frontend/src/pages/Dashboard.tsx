@@ -3,10 +3,11 @@ import { Link } from "react-router-dom";
 import {
   TrendingUp, TrendingDown, Layers, DollarSign, BarChart3,
   Bot, ChevronRight, ArrowUpRight, ArrowDownRight, Clock,
-  Zap, X, Play, Square, Pencil, RefreshCw, Wallet, Scissors, Trash2, ShieldAlert,
+  Zap, X, Play, Square, Pencil, RefreshCw, Wallet, Scissors, Trash2, ShieldAlert, PauseCircle,
 } from "lucide-react";
 import {
   api, formatPair, type BotListItem, type SmartTrade, type Stats, type ExchangeAccount,
+  type EntriesStatus,
 } from "../api";
 import {
   Btn, Badge, StatusDot, LongBadge, Skeleton, toast,
@@ -20,6 +21,12 @@ type BotFilter = "all" | "active" | "stopped";
 const HALT_POLICY =
   "While the Bot is halted, TP/SL protection is not checked and TradingView exits are refused; " +
   "your own SELL / Close / Partial still work.";
+
+/** What "Pause new entries" does (OD-3) — separate from the halt. */
+const ENTRIES_PAUSE_POLICY =
+  "While new entries are paused, every BUY is refused (signals and manual). Exits, TP/SL " +
+  "protection and your own SELL / Close / Partial keep working. A LIMIT BUY already resting " +
+  "at the exchange is not stopped by the pause unless you also cancel it.";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -900,6 +907,23 @@ function OpsBadge({ mode, halted, reason }: {
   );
 }
 
+/** OD-3: the entries pause pill, shown beside (never instead of) the mode and the halt. */
+function EntriesPausedPill({ entries }: { entries: EntriesStatus }) {
+  const title = `New entries are paused${entries.reason ? `: ${entries.reason}` : ""}. ` +
+    ENTRIES_PAUSE_POLICY +
+    (entries.workingEntryLimits > 0
+      ? ` ${entries.workingEntryLimits} LIMIT BUY(s) still working at the exchange.` : "");
+  return (
+    <span
+      title={title}
+      aria-label={title}
+      className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border font-medium bg-amber-500/15 text-amber-400 border-amber-500/30"
+    >
+      <PauseCircle size={11} aria-hidden="true" />ENTRIES PAUSED
+    </span>
+  );
+}
+
 export default function Dashboard() {
   const [botFilter, setBotFilter]   = useState<BotFilter>("all");
   const [bots, setBots]             = useState<BotListItem[]>([]);
@@ -931,6 +955,9 @@ export default function Dashboard() {
     note: string;
   } | null>(null);
   const [haltBusy, setHaltBusy]     = useState(false);
+  // OD-3: null = unknown, or an older Bot without the switch (control hidden).
+  const [entries, setEntries]       = useState<EntriesStatus | null>(null);
+  const [entriesBusy, setEntriesBusy] = useState(false);
   const [loadError, setLoadError]   = useState<string | null>(null);
   const [loading, setLoading]       = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -982,6 +1009,60 @@ export default function Dashboard() {
     }
   };
 
+  /** OD-3: pause or resume NEW entries. Independent of the halt. */
+  const toggleEntries = async () => {
+    if (!entries) return;
+    if (entries.paused) {
+      if (!confirm(
+        "Resume new entries?\n\nSignals and manual BUYs will be placed again. The halt, if any, " +
+        "is not changed by this."
+      )) return;
+      setEntriesBusy(true);
+      try {
+        await api.ops.entries({ paused: false });
+        toast("New entries resumed", "success");
+        await load(true);
+      } catch (e) {
+        toast(e instanceof Error ? e.message : "Could not resume entries", "error");
+      } finally {
+        setEntriesBusy(false);
+      }
+      return;
+    }
+    const reason = prompt(
+      "Pause NEW entries.\n\n" + ENTRIES_PAUSE_POLICY + "\n\n" +
+      "Give a reason so the pause is explicable later:"
+    );
+    if (reason === null) return;
+    if (reason.trim().length < 3) {
+      toast("A reason of at least 3 characters is required", "error");
+      return;
+    }
+    // Explicit opt-in: a pause never changes resting orders unless asked to.
+    const cancelWorkingEntries = entries.workingEntryLimits > 0 && confirm(
+      `${entries.workingEntryLimits} manual LIMIT BUY(s) are still working at the exchange, and a ` +
+      "pause does not stop them.\n\nAlso cancel them now? (OK = cancel them, Cancel = leave them working)"
+    );
+    setEntriesBusy(true);
+    try {
+      const result = await api.ops.entries({ paused: true, reason: reason.trim(), cancelWorkingEntries });
+      const unconfirmed = (result.canceledEntries ?? [])
+        .filter((c) => c.outcome === "unknown" || c.outcome === "failed");
+      toast(
+        !result.changed ? "New entries were already paused; the existing pause was kept"
+          : unconfirmed.length > 0
+            ? `New entries paused. ${unconfirmed.length} LIMIT BUY cancel(s) NOT confirmed — check them`
+            : "New entries paused",
+        unconfirmed.length > 0 ? "error" : result.changed ? "success" : "info"
+      );
+      await load(true);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Could not pause entries", "error");
+    } finally {
+      setEntriesBusy(false);
+    }
+  };
+
   const load = useCallback(async (silent = false) => {
     if (!silent) setRefreshing(true);
     try {
@@ -1001,6 +1082,7 @@ export default function Dashboard() {
       setOpsMode(ops ? ops.mode : "UNKNOWN");
       setHaltReason(ops?.risk.haltedReason ?? null);
       setHalted(ops?.risk.tradingHalted ?? null);
+      setEntries(ops?.entries ?? null);
       setExchange(ops?.exchange ?? null);
       setProtectiveOrders(ops?.protectiveOrders ?? null);
       setLoadError(null);
@@ -1044,6 +1126,7 @@ export default function Dashboard() {
             was shown, and a halt did not exist to be shown.
           */}
           <OpsBadge mode={opsMode} halted={halted === true} reason={haltReason} />
+          {entries?.paused && <EntriesPausedPill entries={entries} />}
           <ExchangeBadge exchange={exchange} />
           {/*
             Finding 0.4: shown in DRY_RUN too. A halt gates a dry run exactly as
@@ -1062,6 +1145,21 @@ export default function Dashboard() {
               }
             >
               {halted ? "Resume trading" : "Halt trading"}
+            </Btn>
+          )}
+          {/* OD-3: shown only when the Bot reports the switch (an older Bot has none). */}
+          {entries && (
+            <Btn
+              small
+              onClick={toggleEntries}
+              disabled={entriesBusy}
+              className={
+                entries.paused
+                  ? "text-[var(--color-success)] border-[var(--color-success)]/30 bg-[var(--color-success-dim)]"
+                  : "text-amber-400 border-amber-500/30 bg-amber-500/15"
+              }
+            >
+              {entries.paused ? "Resume new entries" : "Pause new entries"}
             </Btn>
           )}
           <button
@@ -1094,6 +1192,19 @@ export default function Dashboard() {
           <span>
             <span className="font-semibold">Bot halted{haltReason ? `: ${haltReason}` : ""}. </span>
             {HALT_POLICY}
+          </span>
+        </div>
+      )}
+
+      {/* OD-3: the entries pause, stated where it cannot be missed; independent of the halt */}
+      {entries?.paused && (
+        <div className="flex items-start gap-3 px-4 py-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-400">
+          <PauseCircle size={14} className="flex-shrink-0 mt-0.5" aria-hidden="true" />
+          <span>
+            <span className="font-semibold">New entries paused{entries.reason ? `: ${entries.reason}` : ""}. </span>
+            {ENTRIES_PAUSE_POLICY}
+            {entries.workingEntryLimits > 0 &&
+              ` ${entries.workingEntryLimits} manual LIMIT BUY(s) are still working at the exchange.`}
           </span>
         </div>
       )}

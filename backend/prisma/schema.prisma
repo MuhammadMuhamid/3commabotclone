@@ -596,6 +596,13 @@ model RiskControl {
   maxConcurrentTrades   Int?
   maxDailyLossQuote     Float?
   dailyLossWindowHours  Int       @default(24)
+  /// OD-3: refuse every new entry (any side that is not literally "sell"),
+  /// independent of `tradingHalted`. Exits, TP/SL, cancels and sweeps pass.
+  entriesPaused         Boolean   @default(false)
+  entriesPausedAt       DateTime?
+  /// The control actor's platformUserId, or `dashboard:<userId>`.
+  entriesPausedBy       String?
+  entriesPausedReason   String?
   updatedAt             DateTime  @updatedAt
 }
 

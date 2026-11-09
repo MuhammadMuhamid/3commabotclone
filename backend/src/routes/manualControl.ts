@@ -29,9 +29,10 @@ import { asyncHandler } from "../middleware/errors.js";
 import { config } from "../config.js";
 import { prisma } from "../lib/prisma.js";
 import {
-  describeBotRiskState, getBotRiskLimits, haltBotTrading, readBotHaltState, readBotRiskSnapshot,
-  resumeBotTrading, updateBotRiskLimits,
+  dailyLossBreached, describeBotRiskState, getBotRiskLimits, haltBotTrading, readBotHaltState,
+  readBotRiskSnapshot, readEntriesStatus, resumeBotTrading, setEntriesPaused, updateBotRiskLimits,
 } from "../services/riskControls.js";
+import { cancelWorkingEntryLimits, manualControlAdapter } from "../services/manualTrading.js";
 import { readBotOperationalStatus } from "../services/operationalStatus.js";
 import { readInstallationShariahMode } from "../services/shariah.js";
 import { exchangeStopsEnabled } from "../services/exchangeStops.js";
@@ -52,6 +53,13 @@ export const BOT_HALT_POLICY =
 
 /** `startInterval("tpsl", 30_000, …)` in index.ts. */
 const TPSL_POLL_INTERVAL_SEC = 30;
+
+/**
+ * B-CAP: what this Bot can do, so the Platform shows a feature only when its
+ * backend would accept it (absence = an older Bot: hide or disable it).
+ * Additive; other capabilities are appended by their own slices.
+ */
+export const BOT_CAPABILITIES: readonly string[] = ["entries.v1"];
 
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const idSchema = z.string().uuid();
@@ -93,6 +101,17 @@ const botStatusSchema = z.object({
   status: z.enum(["active", "paused"]),
   actor: actorSchema,
 }).strict();
+
+// OD-3 C9: target state. Pausing needs a reason; resuming takes nothing else.
+const entriesSchema = z.discriminatedUnion("paused", [
+  z.object({
+    paused: z.literal(true),
+    reason: z.string().trim().min(3).max(200),
+    cancelWorkingEntries: z.boolean().optional(),
+    actor: actorSchema,
+  }).strict(),
+  z.object({ paused: z.literal(false), actor: actorSchema }).strict(),
+]);
 
 const closeSchema = z.object({ actor: actorSchema }).strict();
 
@@ -144,6 +163,7 @@ async function readRiskState() {
   };
 }
 
+
 // ── C0 GET /status ──────────────────────────────────────────────────────────
 
 /**
@@ -153,7 +173,7 @@ async function readRiskState() {
  * mode` (DRY_RUN outranks HALTED) must not be read as the halt.
  */
 export async function readControlStatus() {
-  const [operational, halt, risk, accounts, activeBots, pausedBots, shariah] = await Promise.all([
+  const [operational, halt, risk, accounts, activeBots, pausedBots, shariah, entries] = await Promise.all([
     readBotOperationalStatus(),
     readBotHaltState(),
     readRiskState(),
@@ -161,6 +181,7 @@ export async function readControlStatus() {
     prisma.signalBot.count({ where: { status: "active" } }),
     prisma.signalBot.count({ where: { status: { not: "active" } } }),
     readInstallationShariahMode(),
+    readEntriesStatus(),
   ]);
   const testnet = accounts.filter((a) => a.testnet).length;
   const mainnet = accounts.length - testnet;
@@ -189,7 +210,10 @@ export async function readControlStatus() {
       accounts: { testnet, mainnet },
       routing,
     },
-    risk,
+    // OD-3: a paused Bot evaluates no BUY, so nothing latches while paused. The
+    // live breach is shown (C0 only; C3's shape is pinned) so the operator sees
+    // it before resuming entries.
+    risk: { ...risk, dailyLossBreached: dailyLossBreached(risk.limits, risk.snapshot) },
     bots: { active: activeBots, paused: pausedBots },
     protection: {
       mode: "in_process_poll",
@@ -206,6 +230,9 @@ export async function readControlStatus() {
     },
     shariahFloor: { mode: shariah.mode, policyVersion: shariah.policyVersion },
     manual: { enabled: config.manualTradingEnabled, mainnetEnabled: config.mainnetManualTradingEnabled },
+    // OD-3: independent of `halt` and of the daily-loss latch.
+    entries,
+    capabilities: [...BOT_CAPABILITIES],
     version: operational.service.version,
     time: new Date().toISOString(),
   };
@@ -256,6 +283,46 @@ manualControlRouter.post("/resume", asyncHandler(async (req, res) => {
       previousReason: outcome.previousReason,
     } };
   });
+}));
+
+// ── C9 POST /entries ────────────────────────────────────────────────────────
+
+/**
+ * OD-3: pause or resume NEW ENTRIES, as a target state. Never touches the
+ * halt. While paused, every BUY is refused (webhook 409 `risk_blocked`, manual
+ * 409 `entries_paused`, both reconcilers); every exit, the TP/SL monitors,
+ * OD-1 cancels and sweeps, and reconciliation continue. A pause cannot stop a
+ * LIMIT BUY already resting at the exchange: `cancelWorkingEntries` (explicit
+ * opt-in) cancels each one and reports every outcome, `unknown` included.
+ */
+manualControlRouter.post("/entries", asyncHandler(async (req, res) => {
+  const body = parseBody(entriesSchema, req, res);
+  if (!body) return;
+  const params = body.paused
+    ? { paused: true, reason: body.reason, cancelWorkingEntries: body.cancelWorkingEntries ?? false }
+    : { paused: false };
+  await runAndSend(req, res, { kind: "entries", target: "entries", params, actor: body.actor },
+    async () => {
+      const { changed, state } = body.paused
+        ? await setEntriesPaused({ paused: true, reason: body.reason, by: body.actor.platformUserId })
+        : await setEntriesPaused({ paused: false, by: body.actor.platformUserId });
+      if (changed) {
+        console.warn(`[risk] new entries ${body.paused ? "PAUSED" : "RESUMED"} by the Platform control ` +
+          `channel (actor ${body.actor.platformUserId})`);
+      }
+      const canceledEntries = body.paused && body.cancelWorkingEntries
+        ? await cancelWorkingEntryLimits(manualControlAdapter.factory) : undefined;
+      return { body: {
+        entries: {
+          paused: state.paused,
+          pausedAt: state.pausedAt?.toISOString() ?? null,
+          pausedBy: state.pausedBy,
+          reason: state.reason,
+        },
+        changed,
+        ...(canceledEntries ? { canceledEntries } : {}),
+      } };
+    });
 }));
 
 // ── C3 GET / C4 PATCH /risk-limits ──────────────────────────────────────────

@@ -12,7 +12,7 @@ import {
 } from "./shariah.js";
 import { persistStrategyRealization } from "./realizationEvents.js";
 import {
-  evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
+  entriesPausedDecision, evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
   shouldLatchHalt,
 } from "./riskControls.js";
 
@@ -590,6 +590,23 @@ async function assertNeverAttemptedMaySubmit(intent: StrategyOrderIntent): Promi
     throw new Error(reason);
   }
 
+  /*
+   * OD-3 (owner decision): while new entries are paused, a never-attempted
+   * BUY is CLOSED OFF as rejected at once — not held as under a halt — so an
+   * entry queued before the pause can never land after entries resume. Same
+   * safety argument as above: `requested` provably never reached the wire.
+   * Checked first, and on the pause alone (not behind the halt or any other
+   * gate), so nothing can keep such an intent alive across a pause.
+   */
+  if (intent.side !== "SELL") {
+    const paused = entriesPausedDecision(await getBotRiskLimits(), { side: "buy" });
+    if (paused && !paused.allowed) {
+      const reason = `Refused before submission: ${paused.reason}`;
+      await closeOffUnresolvedIntent(intent, "ABSENT", reason);
+      throw new Error(reason);
+    }
+  }
+
   const bot = await prisma.signalBot.findUnique({ where: { id: intent.botId } });
   if (!bot || bot.status !== "active") throw new Error("Strategy bot is not active");
   if (intent.side === "BUY" && !bot.entryEnabled) throw new Error("Entry orders disabled on this bot");
@@ -917,8 +934,10 @@ export async function reconcilePendingStrategyIntents(
     try {
       await reconcileStrategyIntent(intent.id, await adapterFactory(intent), { now });
     } catch (error) {
+      // Only a still-unresolved intent is "pending"; one the gate just closed
+      // off (stale, or OD-3 paused) keeps its own terminal reason.
       await prisma.strategyOrderIntent.updateMany({
-        where: { id: intent.id, status: { not: "reconciled" } },
+        where: { id: intent.id, status: { in: UNRESOLVED_STATUSES } },
         data: { error: `reconciliation pending: ${
           error instanceof Error ? error.message : "unknown error"}` },
       });

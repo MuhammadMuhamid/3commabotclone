@@ -55,7 +55,9 @@ export class ControlPending extends Error {
 }
 
 export type ControlKind =
-  | "halt" | "resume" | "risk_limits" | "bot_status" | "trade_close" | "trade_partial_close";
+  | "halt" | "resume" | "risk_limits" | "bot_status" | "trade_close" | "trade_partial_close"
+  // OD-3 C9: pause / resume new entries (target state).
+  | "entries";
 
 export interface ControlActor {
   platformUserId: string;

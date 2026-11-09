@@ -87,6 +87,13 @@ export interface SubmitManualOrderInput {
 type AdapterFactory = (account: ExchangeAccount) => ManualExchangeAdapter;
 const defaultAdapter: AdapterFactory = (account) => new BinanceManualExchange(account);
 
+/**
+ * The adapter the control-plane cancels use (OD-3 `cancelWorkingEntries`, from
+ * C9 and the dashboard). A seam in the `tradeExchangeClient` idiom, so a route
+ * test can point it at a fake exchange; production never changes it.
+ */
+export const manualControlAdapter: { factory: AdapterFactory } = { factory: defaultAdapter };
+
 export function manualLifecycleStatus(status: ManualOrderSnapshot["status"]): string {
   return ({ NEW: "open", PARTIALLY_FILLED: "partially_filled", FILLED: "filled",
     CANCELED: "canceled", REJECTED: "rejected", EXPIRED: "canceled" } as const)[status];
@@ -665,6 +672,72 @@ function entryCancelFailedMessage(entry: ManualOrder, detail: string): string {
 }
 
 /**
+ * The exchange's answer to a system cancel (OD-1, OD-3). A1: a simulated entry
+ * is cancelled locally, keeping its recorded fills (the dry-run adapter cannot
+ * know them); a live order is never cancelled by simulation — every caller
+ * refuses it first, and so does this guard.
+ */
+async function cancelForPolicy(order: ManualOrder, adapter: ManualExchangeAdapter): Promise<ManualOrderSnapshot> {
+  if (!simulatesCancels(adapter)) return adapter.cancel(order.symbol, order.clientOrderId);
+  if (isRealExchangeOrderId(order.exchangeOrderId)) {
+    throw new ManualTradingError(LIVE_ENTRY_IN_DRY_RUN, 409, "live_order_in_dry_run");
+  }
+  return { exchangeOrderId: order.exchangeOrderId ?? `dry-${order.clientOrderId}`,
+    clientOrderId: order.clientOrderId, status: "CANCELED",
+    executedBaseQuantity: order.filledBaseQty, executedQuoteQuantity: order.filledQuoteQty,
+    averagePrice: order.averageFillPrice, simulated: true };
+}
+
+/** OD-3: what `cancelWorkingEntries` did to one working manual LIMIT BUY. */
+export interface WorkingEntryCancel {
+  orderId: string;
+  symbol: string;
+  outcome: "canceled" | "already_terminal" | "unknown" | "failed";
+}
+
+/**
+ * OD-3 `cancelWorkingEntries` (explicit operator opt-in on pause): cancel each
+ * manual LIMIT BUY still working at the exchange — `open` or
+ * `partially_filled` — with the OD-1 cancel classification, and report each
+ * outcome. Never blind and never retried here: `unknown` means the cancel may
+ * or may not have been applied, the order stays tracked by the reconciler,
+ * and the operator sees it. A system action that only reduces exposure (no
+ * mainnet confirmation); the A1 dry-run guard still applies. Whatever filled
+ * before the cancel stays booked (I2); nothing is sold.
+ */
+export async function cancelWorkingEntryLimits(adapterFactory: AdapterFactory = defaultAdapter):
+  Promise<WorkingEntryCancel[]> {
+  const orders = await prisma.manualOrder.findMany({ where: { side: "BUY", orderType: "LIMIT",
+    status: { in: ["open", "partially_filled"] } }, include: { exchangeAccount: true },
+  orderBy: { createdAt: "asc" }, take: 100 });
+  const results: WorkingEntryCancel[] = [];
+  for (const order of orders) {
+    let outcome: WorkingEntryCancel["outcome"];
+    try {
+      const adapter = adapterFactory(order.exchangeAccount);
+      if (simulatesCancels(adapter) && isRealExchangeOrderId(order.exchangeOrderId)) {
+        outcome = "failed"; // A1: still working; never "cancelled" by simulation
+      } else {
+        const applied = await applyManualSnapshot(order.id, await cancelForPolicy(order, adapter), { adapter });
+        outcome = !isComplete(applied.status) ? "unknown"
+          : applied.status === "canceled" ? "canceled" : "already_terminal";
+      }
+    } catch (error) {
+      outcome = error instanceof ManualOrderNotFoundError ? "failed"
+        : classifyCancelFailure(error).outcome === "not_canceled" ? "failed" : "unknown";
+      await prisma.manualOrder.update({ where: { id: order.id }, data: { exitCancelLastError:
+        `pause cancel ${outcome}: ${error instanceof Error ? error.message : String(error)}` } });
+    }
+    if (outcome !== "canceled" && outcome !== "already_terminal") {
+      console.error(`[manual] entries pause: LIMIT BUY ${order.clientOrderId} (${order.symbol}) was ` +
+        `NOT confirmed cancelled (${outcome}); it may still be working at the exchange.`);
+    }
+    results.push({ orderId: order.id, symbol: order.symbol, outcome });
+  }
+  return results;
+}
+
+/**
  * One cancel of a working entry, issued by whichever OD-1 path claimed the
  * attempt (`attemptNo`). Never blind: a -2011 is resolved by a lookup in the
  * adapter, a definite rejection leaves the cancel owed (`pending`), anything
@@ -678,18 +751,7 @@ async function performExitCancel(entry: ManualOrder, adapter: ManualExchangeAdap
   let outcome: "not_canceled" | "unknown";
   let lastError: string;
   try {
-    // A1: a simulated entry is cancelled locally, keeping its recorded fills
-    // (the dry-run adapter cannot know them). A live order never reaches here
-    // under DRY_RUN: every caller refuses it first, and so does this guard.
-    if (simulatesCancels(adapter) && isRealExchangeOrderId(entry.exchangeOrderId)) {
-      throw new ManualTradingError(LIVE_ENTRY_IN_DRY_RUN, 409, "live_order_in_dry_run");
-    }
-    const snapshot = simulatesCancels(adapter)
-      ? { exchangeOrderId: entry.exchangeOrderId ?? `dry-${entry.clientOrderId}`,
-        clientOrderId: entry.clientOrderId, status: "CANCELED" as const,
-        executedBaseQuantity: entry.filledBaseQty, executedQuoteQuantity: entry.filledQuoteQty,
-        averagePrice: entry.averageFillPrice, simulated: true }
-      : await adapter.cancel(entry.symbol, entry.clientOrderId);
+    const snapshot = await cancelForPolicy(entry, adapter);
     const applied = await applyManualSnapshot(entry.id, snapshot, { adapter });
     if (isComplete(applied.status)) return applied.status === "canceled" ? "canceled" : "already_terminal";
     outcome = "not_canceled";
@@ -894,6 +956,11 @@ async function enforceRisk(input: SubmitManualOrderInput, adapter: ManualExchang
   if (!decision.allowed) {
     const latch = shouldLatchHalt(decision);
     if (latch) await setBotTradingHalted(true, { by: latch, reason: decision.reason });
+    // OD-3: a paused entry is a typed refusal the Platform can tell apart.
+    if (decision.code === "entries_paused") {
+      throw new ManualTradingError(`New entries are paused on the Bot (${decision.reason}). ` +
+        "Closing an open position is still allowed.", 409, "entries_paused");
+    }
     throw new ManualTradingError(decision.code === "trading_halted"
       ? `${decision.reason}. Closing an open position is still allowed.`
       : decision.reason, 409);
@@ -1213,8 +1280,8 @@ export function manualOrderOrigin(order: Pick<ManualOrder, "side" | "protectionS
  * `requested` BUY is already in the risk snapshot) a second time.
  */
 export async function assertManualFirstSubmitNotHalted(
-  order: ManualOrder, readLimits: () => Promise<Pick<BotRiskLimits, "tradingHalted" | "haltedReason">> =
-  getBotRiskLimits
+  order: ManualOrder, readLimits: () => Promise<Pick<BotRiskLimits, "tradingHalted" | "haltedReason"> &
+    Partial<Pick<BotRiskLimits, "entriesPaused" | "entriesPausedReason">>> = getBotRiskLimits
 ): Promise<void> {
   const limits = await readLimits();
   // Exact: a stored side that is not literally SELL is judged as an entry.

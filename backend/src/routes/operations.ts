@@ -18,9 +18,10 @@ import { Router } from "express";
 import { z } from "zod";
 import { config } from "../config.js";
 import {
-  describeBotRiskState, getBotRiskLimits, haltBotTrading, readBotRiskSnapshot,
-  resumeBotTrading, updateBotRiskLimits,
+  describeBotRiskState, getBotRiskLimits, haltBotTrading, readBotRiskSnapshot, readEntriesStatus,
+  resumeBotTrading, setEntriesPaused, updateBotRiskLimits,
 } from "../services/riskControls.js";
+import { cancelWorkingEntryLimits, manualControlAdapter } from "../services/manualTrading.js";
 import { EXCHANGE_STOPS_STATUS, exchangeStopsEnabled } from "../services/exchangeStops.js";
 import { asyncHandler } from "../middleware/errors.js";
 import { prisma } from "../lib/prisma.js";
@@ -45,7 +46,7 @@ operationsRouter.get(
   asyncHandler(async (_req, res) => {
     const limits = await getBotRiskLimits();
     const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours);
-    const [activeBots, pausedBots, accounts] = await Promise.all([
+    const [activeBots, pausedBots, accounts, entries] = await Promise.all([
       prisma.signalBot.count({ where: { status: "active" } }),
       prisma.signalBot.count({ where: { status: { not: "active" } } }),
       // Names and the testnet flag only. No key material leaves this process.
@@ -53,12 +54,15 @@ operationsRouter.get(
         select: { id: true, name: true, testnet: true },
         orderBy: { createdAt: "asc" },
       }),
+      readEntriesStatus(),
     ]);
 
     res.json({
       mode: config.dryRun ? "DRY_RUN" : limits.tradingHalted ? "HALTED" : "LIVE",
       dryRun: config.dryRun,
       risk: { ...limits, snapshot, summary: describeBotRiskState(limits, snapshot) },
+      // OD-3: the entries pause, independent of the halt (and of `mode`).
+      entries,
       bots: { active: activeBots, paused: pausedBots },
       protectiveOrders: {
         enabled: exchangeStopsEnabled(),
@@ -181,6 +185,48 @@ operationsRouter.post(
     console.warn(`[risk] trading RESUMED by operator (was: ${outcome.previousReason ?? "no reason"})`);
     res.json({
       halted: false, previousHaltedBy: outcome.previousHaltedBy, previousReason: outcome.previousReason,
+    });
+  })
+);
+
+/**
+ * OD-3 break-glass parity with the Platform's signed C9: pause or resume NEW
+ * ENTRIES as a target state, never touching the halt. Pausing needs a reason;
+ * `cancelWorkingEntries` (explicit opt-in) also cancels each manual LIMIT BUY
+ * still working at the exchange and reports every outcome. The audit line is
+ * a `console.warn`, as for reveal; the body is never logged.
+ */
+operationsRouter.post(
+  "/entries",
+  asyncHandler(async (req, res) => {
+    const schema = z.discriminatedUnion("paused", [
+      z.object({
+        paused: z.literal(true),
+        reason: z.string().trim().min(3, "a reason is required, so the pause is explicable later").max(200),
+        cancelWorkingEntries: z.boolean().optional(),
+      }).strict(),
+      z.object({ paused: z.literal(false) }).strict(),
+    ]);
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.errors[0]?.message ?? "Invalid request" });
+      return;
+    }
+    const by = `dashboard:${String(res.locals.userId ?? "unknown")}`;
+    const body = parsed.data;
+    const { changed, state } = body.paused
+      ? await setEntriesPaused({ paused: true, reason: body.reason, by })
+      : await setEntriesPaused({ paused: false, by });
+    if (changed) console.warn(`[risk] new entries ${body.paused ? "PAUSED" : "RESUMED"} by ${by}`);
+    const canceledEntries = body.paused && body.cancelWorkingEntries
+      ? await cancelWorkingEntryLimits(manualControlAdapter.factory) : undefined;
+    res.json({
+      entries: {
+        paused: state.paused, pausedAt: state.pausedAt?.toISOString() ?? null,
+        pausedBy: state.pausedBy, reason: state.reason,
+      },
+      changed,
+      ...(canceledEntries ? { canceledEntries } : {}),
     });
   })
 );

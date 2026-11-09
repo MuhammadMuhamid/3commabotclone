@@ -185,6 +185,17 @@ export type AuthUser = { username: string; totpEnabled: boolean };
 
 // ─── API surface ──────────────────────────────────────────────────────────────
 
+/** OD-3: the entries pause as `/api/ops/status` reports it. */
+export interface EntriesStatus {
+  paused: boolean;
+  pausedAt: string | null;
+  pausedBy: string | null;
+  reason: string | null;
+  /** Manual LIMIT BUYs still working at the exchange: a pause does not stop them. */
+  workingEntryLimits: number;
+  unresolvedBuyIntents: number;
+}
+
 export const api = {
   // ── Auth ──────────────────────────────────────────────────────────────────
   auth: {
@@ -259,9 +270,16 @@ export const api = {
           maxConcurrentTrades: number | null;
           maxDailyLossQuote: number | null;
           dailyLossWindowHours: number;
+          entriesPaused?: boolean;
+          entriesPausedReason?: string | null;
           snapshot: { openExposureQuote: number; openTrades: number; realisedPnlInWindow: number };
           summary: string;
         };
+        /**
+         * OD-3: the "Pause new entries" switch, independent of the halt. Absent
+         * on an older Bot, which has no such switch.
+         */
+        entries?: EntriesStatus;
         bots: { active: number; paused: number };
         protectiveOrders: { enabled: boolean; status: string; note: string };
         /**
@@ -294,6 +312,22 @@ export const api = {
       }>("/api/ops/resume", {
         method: "POST",
         body: JSON.stringify({ confirmation: "RESUME_TRADING" }),
+      }),
+
+    /**
+     * OD-3: pause or resume NEW ENTRIES (target state). Never touches the halt.
+     * `cancelWorkingEntries` is an explicit opt-in to also cancel resting
+     * manual LIMIT BUYs; each outcome is reported, `unknown` included.
+     */
+    entries: (target: { paused: true; reason: string; cancelWorkingEntries?: boolean } | { paused: false }) =>
+      request<{
+        entries: { paused: boolean; pausedAt: string | null; pausedBy: string | null; reason: string | null };
+        changed: boolean;
+        canceledEntries?: { orderId: string; symbol: string;
+          outcome: "canceled" | "already_terminal" | "unknown" | "failed" }[];
+      }>("/api/ops/entries", {
+        method: "POST",
+        body: JSON.stringify(target),
       }),
   },
   stats: () => request<Stats>("/api/bots/stats"),
