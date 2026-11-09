@@ -311,18 +311,22 @@ export async function setEntriesPaused(target:
 
 /**
  * OD-3: the entries pause as C0, C9 and the dashboard report it, with what a
- * pause cannot stop by itself: manual LIMIT BUYs resting at the exchange, and
- * strategy BUYs whose exchange outcome is still unresolved.
+ * pause cannot stop by itself: manual LIMIT BUYs resting at the exchange,
+ * strategy BUYs whose exchange outcome is still unresolved, and (review F6)
+ * manual BUYs left `submitted` by an uncertain answer (-1006/-1007, 5xx,
+ * transport), which can still prove FILLED after the pause. Counted only:
+ * they are resolved by the reconciler, query-first, never cancelled blind.
  */
 export async function readEntriesStatus(): Promise<{
   paused: boolean; pausedAt: string | null; pausedBy: string | null; reason: string | null;
-  workingEntryLimits: number; unresolvedBuyIntents: number;
+  workingEntryLimits: number; unresolvedBuyIntents: number; uncertainBuyOrders: number;
 }> {
-  const [pause, workingEntryLimits, unresolvedBuyIntents] = await Promise.all([
+  const [pause, workingEntryLimits, unresolvedBuyIntents, uncertainBuyOrders] = await Promise.all([
     readEntriesPause(),
     prisma.manualOrder.count({ where: { side: "BUY", orderType: "LIMIT",
       status: { in: ["open", "partially_filled"] } } }),
     prisma.strategyOrderIntent.count({ where: { side: "BUY", status: { in: ["requested", "submitted"] } } }),
+    prisma.manualOrder.count({ where: { side: "BUY", status: "submitted" } }),
   ]);
   return {
     paused: pause.paused,
@@ -331,6 +335,7 @@ export async function readEntriesStatus(): Promise<{
     reason: pause.reason,
     workingEntryLimits,
     unresolvedBuyIntents,
+    uncertainBuyOrders,
   };
 }
 

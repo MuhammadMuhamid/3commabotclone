@@ -661,20 +661,33 @@ export async function processWebhook(
           throw new Error("Trade is already being closed. Please wait.");
         }
         closeLockHeld = active.id;
-        if (operatorTarget) {
-          /*
-           * The targeted close does not share the pair-wide 45 s exit receipt
-           * (its leg names the trade), so it re-reads under the lock: an exit
-           * that finished between the selection above and this lock — a
-           * TradingView SELL, a TP/SL — has closed it, and must not be repeated.
-           */
-          const locked = await prisma.smartTrade.findUnique({ where: { id: active.id } });
-          if (!locked || locked.status !== "active") {
+        /*
+         * Every SELL path re-reads the trade under the lock (review F5). The
+         * targeted close does not share the pair-wide 45 s exit receipt (its
+         * leg names the trade); since it no longer does, a TradingView SELL
+         * cannot rely on that receipt either. An exit that finished between
+         * the selection above and this lock — a Close, a TP/SL — has closed
+         * the trade, and must not be repeated. Safe today only because no
+         * `await` separates the selection from the lock; this keeps it safe
+         * when one is added.
+         */
+        const locked = await prisma.smartTrade.findUnique({ where: { id: active.id } });
+        if (!locked || locked.status !== "active") {
+          if (operatorTarget) {
             throw new ControlRefusal(409, "trade_not_active",
               "This trade was closed by another exit a moment ago. Nothing was sold.");
           }
-          active = locked;
+          if (expectSmartTradeId !== undefined) {
+            throw new ControlRefusal(422, "ambiguous_trade",
+              "The trade to close is no longer active: another exit closed it a moment ago. Nothing was sold.");
+          }
+          await prisma.webhookLog.update({ where: { id: log.id }, data: { status: "ok" } });
+          return {
+            status: "ignored_duplicate",
+            detail: `${symbol}: another exit closed this position a moment ago; no second order was placed.`,
+          };
         }
+        active = locked;
       }
 
       // STALE-SELL GUARD: if the active trade was opened AFTER the last close

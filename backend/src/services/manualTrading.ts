@@ -12,6 +12,7 @@ import {
   BinanceManualExchange, type ManualExchangeAdapter, type ManualLotRules, type ManualOrderIntent,
   type ManualOrderSnapshot, ManualOrderNotFoundError,
 } from "./manualExchange.js";
+import { abandonOrderAttempt, settleOrderAttempt } from "./orderAttempt.js";
 import { sendExecutionNotification } from "./push.js";
 import { SUBMITTED_ABSENCE_SETTLE_MS } from "./strategyOrderIntent.js";
 import {
@@ -199,6 +200,26 @@ function durableFlag(error: string | null): string | null {
   return error != null && DURABLE_FLAG_PREFIXES.some((prefix) => error.startsWith(prefix))
     ? error : null;
 }
+
+/**
+ * F7 (review 2026-11-09): a new operator flag goes first, and a durable flag
+ * already on the order is kept after it, never erased (a `RACE FILL` or
+ * `NETTING UNCONFIRMED` the operator still has to see). A transient note is
+ * dropped, exactly as a later snapshot drops it.
+ */
+function withDurableFlag(note: string, previous: string | null): string {
+  const kept = durableFlag(previous);
+  return kept && kept !== note ? `${note} ${kept}` : note;
+}
+
+/**
+ * X7 / F3: the haircut of an exit whose entry fills could not be netted of
+ * their base-asset commission — Binance's maximum spot fee, 0.1 %
+ * [EXT-UNVERIFIED offline]. Selling that much less keeps a gross figure from
+ * selling fee-sized untracked coins. The sweep (`SWEEP_UNNETTED_HAIRCUT`), the
+ * TP/SL exits and the manual full SELL all use this one figure.
+ */
+export const UNNETTED_EXIT_HAIRCUT = 0.001;
 
 function baseAssetOf(symbol: string): string {
   try { return parsePair(symbol).base; } catch { return normalizeSymbol(symbol); }
@@ -607,7 +628,12 @@ export async function closeManualDust(positionId: string, rules: ManualLotRules,
     data: { status: "closed", closedAt: new Date(), closedReason: DUST_CLOSED_REASON,
       protectionState: "removed" } });
   if (closed.count !== 1) return false;
-  if (noteOrderId) await prisma.manualOrder.update({ where: { id: noteOrderId }, data: { error: note } });
+  if (noteOrderId) {
+    // F7: the dust note never erases a durable flag already on the exit.
+    const noted = await prisma.manualOrder.findUnique({ where: { id: noteOrderId }, select: { error: true } });
+    await prisma.manualOrder.update({ where: { id: noteOrderId }, data: {
+      error: withDurableFlag(note, noted?.error ?? null) } });
+  }
   console.error(`[manual] ${note}`);
   if (position.manualOrderId) {
     // OD-1: a dust close is a close; a still-working entry owes a cancel too.
@@ -930,8 +956,232 @@ export async function handOffRaceFillSweep(position: SmartTrade, entry: ManualOr
     `(${fmtQty(position.quantity)} ${base}) after ${attempts} attempts. It is no longer sold ` +
     `automatically and has no TP/SL: sell ${fmtQty(position.quantity)} ${base} from the Trade panel ` +
     "(a manual SELL of that position).";
-  if (entry) await prisma.manualOrder.update({ where: { id: entry.id }, data: { error: flag } });
+  if (entry) {
+    // F7: read the entry's current flag (a RACE FILL or NETTING UNCONFIRMED
+    // recorded since the caller's read) and keep it after this one.
+    const current = await prisma.manualOrder.findUnique({ where: { id: entry.id }, select: { error: true } });
+    await prisma.manualOrder.update({ where: { id: entry.id }, data: {
+      error: withDurableFlag(flag, current?.error ?? null) } });
+  }
   console.error(`[manual] ALERT: ${flag}`);
+  return true;
+}
+
+/** F1: what resolving the other uncertain exits of one manual position found. */
+export interface ManualExitResolution {
+  /** True while any of them is still live or unknowable: no new exit may be sized. */
+  blocked: boolean;
+  /** Resolved to a terminal exchange state and applied; any fill was booked once. */
+  reconciled: number;
+  /** Proved never placed (ABSENT after the settle window) and closed off. */
+  discarded: number;
+  reason?: string;
+}
+
+/**
+ * F1 (review 2026-11-09): before ANY exit of a manual position is sized — the
+ * operator's SELL, or a TP/SL exit or sweep of the poller — every OTHER SELL of
+ * that position still `submitted` (sent, outcome unknown: -1006/-1007, 5xx,
+ * transport) is resolved first, query-first by its client order id. The
+ * manual mirror of `resolveUnresolvedStrategySells`, with the D2 rules the
+ * reconciler already applies:
+ *
+ *   found, terminal  applied through `applyManualSnapshot` (its fill closes or
+ *                    reduces the position exactly once, never as a late fill),
+ *                    its attempt settled and its exit reason stamped;
+ *   found, working   still live at the exchange: blocked;
+ *   not found        within `SUBMITTED_ABSENCE_SETTLE_MS` of submission:
+ *                    blocked (a lookup can miss a just-accepted order); after
+ *                    it, closed off ABSENT — none was placed;
+ *   lookup failed    no evidence: blocked.
+ *
+ * Never a blind second SELL. X4's lock covers one owner's cycle only, so before
+ * this a TP exit left `submitted` and an operator's full SELL (or the reverse)
+ * both sold, the second out of the owner's untracked coins. A `requested` row
+ * has not crossed the wire and is not resolved here. `skip` excludes the
+ * caller's own order slot, which its own path already queries first.
+ */
+export async function resolveUnresolvedManualExits(positionId: string, adapter: ManualExchangeAdapter,
+  opts: { now?: number; skip?: (order: ManualOrder) => boolean } = {}): Promise<ManualExitResolution> {
+  const now = opts.now ?? Date.now();
+  const rows = await prisma.manualOrder.findMany({ where: { linkedPositionId: positionId, side: "SELL",
+    status: "submitted" }, orderBy: { createdAt: "asc" } });
+  const outcome: ManualExitResolution = { blocked: false, reconciled: 0, discarded: 0 };
+  const reasons: string[] = [];
+  for (const row of rows) {
+    if (opts.skip?.(row)) continue;
+    const label = `a prior SELL of this position (${row.clientOrderId})`;
+    if (simulatesCancels(adapter)) {
+      // A1: a dry-run adapter answers every lookup "not found" without asking
+      // the exchange; that is no evidence, and never a reason to close off a
+      // SELL that crossed the wire while DRY_RUN was off.
+      reasons.push(`${label} was sent to the exchange and cannot be looked up while DRY_RUN is on`);
+      continue;
+    }
+    let found: ManualOrderSnapshot | null;
+    try {
+      found = await adapter.query(row.symbol, row.clientOrderId);
+    } catch (error) {
+      reasons.push(`${label} could not be looked up at the exchange (${
+        error instanceof Error ? error.message : "lookup failed"})`);
+      continue;
+    }
+    if (found) {
+      const applied = await applyManualSnapshot(row.id, found, { adapter });
+      if (PENDING_STATUSES.includes(applied.status)) {
+        reasons.push(`${label} is still ${applied.status} at the exchange; it must settle before another exit`);
+        continue;
+      }
+      const attempt = await prisma.exchangeOrderAttempt.findUnique({ where: { clientOrderId: row.clientOrderId } });
+      if (attempt) {
+        // The poller's exit: free its slot and stamp its own exit reason, as
+        // `runManualExit` would have. An operator SELL has no attempt and
+        // keeps `manual_sell`.
+        await prisma.$transaction((tx) => settleOrderAttempt(tx, attempt.id, applied.exchangeOrderId ?? undefined));
+        if (attempt.closedReason) {
+          await prisma.smartTrade.updateMany({ where: { id: positionId, status: "closed",
+            closedReason: "manual_sell" }, data: { closedReason: attempt.closedReason } });
+        }
+      }
+      // F3: a resolved haircut exit closes what it deliberately left.
+      await closeHaircutRemainder(applied, adapter,
+        { closedReason: attempt?.closedReason, origin: manualOrderOrigin(row) });
+      outcome.reconciled += 1;
+      continue;
+    }
+    const submittedAt = (row.submittedAt ?? row.createdAt).getTime();
+    if (now - submittedAt < SUBMITTED_ABSENCE_SETTLE_MS) {
+      reasons.push(`${label} was submitted moments ago and the exchange has no record of it yet; ` +
+        "retry once it settles");
+      continue;
+    }
+    const closed = await prisma.manualOrder.updateMany({ where: { id: row.id, status: "submitted" }, data: {
+      status: "rejected", completedAt: new Date(),
+      error: `ABSENT: the exchange has no order under client order id ${row.clientOrderId} ` +
+        `${SUBMITTED_ABSENCE_SETTLE_MS / 1000} s after submission, so none was placed (resolved before ` +
+        "another exit of this position)." } });
+    if (closed.count !== 1) {
+      reasons.push(`${label} changed state while it was being resolved; retry`);
+      continue;
+    }
+    const attempt = await prisma.exchangeOrderAttempt.findUnique({ where: { clientOrderId: row.clientOrderId } });
+    if (attempt) await abandonOrderAttempt(attempt.id, "ABSENT");
+    outcome.discarded += 1;
+  }
+  if (reasons.length > 0) {
+    outcome.blocked = true;
+    outcome.reason = reasons.join("; ");
+  }
+  return outcome;
+}
+
+/** F1: the operator-facing refusal while another exit of the position is unresolved. */
+function exitUnresolvedError(reason: string | undefined): ManualTradingError {
+  return new ManualTradingError("Another exit of this position may already be live at the exchange and " +
+    `is not resolved yet${reason ? ` (${reason})` : ""}. Nothing was placed: read the position again and ` +
+    "retry once it is resolved.", 409, "exit_unresolved");
+}
+
+/** F3: the most a full exit may sell while its position's entry fills are booked gross. */
+export interface NettingHaircut {
+  /** The position re-read after the one re-query (null if it is gone). */
+  position: SmartTrade | null;
+  /** The haircut quantity, floored to the lot; null when the fills are netted (no haircut). */
+  sizeCap: number | null;
+  /** The durable `NETTING UNCONFIRMED` note for the exit order, with the haircut. */
+  flag: string | null;
+}
+
+/**
+ * F3 (review 2026-11-09, X7 on the active trade): a FULL exit — TP, SL, or the
+ * operator's full SELL — of a position whose entry fills are booked GROSS
+ * (`fillsNetted: false`: the trades lookup failed) would sell the gross
+ * figure, i.e. the base-asset commission too, out of the owner's untracked
+ * coins. The entry is re-queried ONCE; a netted answer corrects the position
+ * and no haircut applies. Still gross, the exit sells the
+ * `UNNETTED_EXIT_HAIRCUT` less, floored to the lot, with a note. It never
+ * waits: a stop-loss is never delayed for a fee lookup.
+ */
+export async function haircutForUnnettedEntry(position: SmartTrade, adapter: ManualExchangeAdapter):
+  Promise<NettingHaircut> {
+  const none: NettingHaircut = { position, sizeCap: null, flag: null };
+  if (!position.manualOrderId) return none;
+  const entry = await prisma.manualOrder.findUnique({ where: { id: position.manualOrderId } });
+  if (!entry || entry.side !== "BUY" || entry.fillsNetted) return none;
+  try {
+    const snapshot = await adapter.query(entry.symbol, entry.clientOrderId);
+    if (snapshot) await applyManualSnapshot(entry.id, snapshot, { adapter });
+  } catch (error) {
+    console.error(`[manual] ${position.id}: the netting re-query of entry ${entry.clientOrderId} failed: ` +
+      `${error instanceof Error ? error.message : error}`);
+  }
+  const [fresh, reread] = await Promise.all([
+    prisma.smartTrade.findUnique({ where: { id: position.id } }),
+    prisma.manualOrder.findUnique({ where: { id: entry.id }, select: { fillsNetted: true } }),
+  ]);
+  if (!fresh || fresh.status !== "active" || reread?.fillsNetted !== false) {
+    return { position: fresh, sizeCap: null, flag: null };
+  }
+  let stepSize = 0;
+  try {
+    stepSize = adapter.lotRules ? (await adapter.lotRules(fresh.pair)).stepSize : 0;
+  } catch {
+    // The exchange floors the order to its lot anyway; the haircut must not wait.
+  }
+  const sizeCap = floorToStep(fresh.quantity * (1 - UNNETTED_EXIT_HAIRCUT), stepSize);
+  const base = baseAssetOf(fresh.pair);
+  const flag = `NETTING UNCONFIRMED: the base-asset commission of the entry fills of position ${fresh.id} ` +
+    `could not be confirmed (its trades lookup failed again), so this exit sells ${fmtQty(sizeCap)} ${base}: ` +
+    `${UNNETTED_EXIT_HAIRCUT * 100}% less than the gross ${fmtQty(fresh.quantity)} (the maximum spot fee), ` +
+    "floored to the lot, rather than risk selling untracked coins. What it leaves is the presumed " +
+    "commission and closes with the position.";
+  console.error(`[manual] ${flag}`);
+  return { position: fresh, sizeCap, flag };
+}
+
+/**
+ * F3: after a haircut exit FILLED, what it deliberately left — the presumed
+ * commission of gross entry fills — closes with the position, under the
+ * exit's own reason, so it is never sold later out of the owner's untracked
+ * coins. Only when the exit sold exactly the haircut of the position as it
+ * stood: a smaller sale (I3 capped it, or the position grew meanwhile) leaves
+ * a real remainder, which stays tracked.
+ */
+export async function closeHaircutRemainder(exit: ManualOrder, adapter: ManualExchangeAdapter,
+  opts: { closedReason?: string | null; origin: ExitOrigin }): Promise<boolean> {
+  if (exit.side !== "SELL" || exit.status !== "filled" || !exit.linkedPositionId || !(exit.filledBaseQty > 0)) {
+    return false;
+  }
+  const position = await prisma.smartTrade.findUnique({ where: { id: exit.linkedPositionId } });
+  if (!position || position.status !== "active" || !position.manualOrderId || !(position.quantity > 0)) {
+    return false;
+  }
+  const entry = await prisma.manualOrder.findUnique({ where: { id: position.manualOrderId },
+    select: { fillsNetted: true } });
+  if (!entry || entry.fillsNetted) return false;
+  let stepSize = 0;
+  try {
+    stepSize = adapter.lotRules ? (await adapter.lotRules(position.pair)).stepSize : 0;
+  } catch {
+    return false; // no rules, no proof the remainder is the haircut: it stays tracked
+  }
+  const before = position.quantity + exit.filledBaseQty;
+  const haircut = floorToStep(before * (1 - UNNETTED_EXIT_HAIRCUT), stepSize);
+  if (Math.abs(exit.filledBaseQty - haircut) > Math.max(QTY_EPSILON, haircut * 1e-9)) return false;
+  // The whole trade's P&L: this exit's proceeds against everything it cost.
+  const realised = calcRealizedPnl(exit.filledQuoteQty, position.quoteSpent * before / position.quantity);
+  const closed = await prisma.smartTrade.updateMany({ where: { id: position.id, status: "active" }, data: {
+    status: "closed", closedAt: new Date(), closedReason: opts.closedReason ?? "manual_sell",
+    protectionState: "removed", currentPrice: exit.averageFillPrice ?? undefined,
+    pnlUsdt: realised.pnlUsdt, pnlPct: realised.pnlPct } });
+  if (closed.count !== 1) return false;
+  console.error(`[manual] position ${position.id} closed after its haircut exit ${exit.clientOrderId}: the ` +
+    `remaining ${fmtQty(position.quantity)} ${baseAssetOf(position.pair)} is the presumed commission of its ` +
+    "gross entry fills and stays in the wallet, untracked.");
+  // OD-1: a close is a close; an entry still working owes a cancel.
+  const effects: AfterCommit[] = [];
+  await markEntryForExitCancel(prisma, position.id, position.manualOrderId, opts.origin, effects, adapter);
+  for (const effect of effects) await effect();
   return true;
 }
 
@@ -1089,19 +1339,44 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
    * PARTIAL exit never cancels and is never raised (F1): it sells at most what
    * was asked, the entry keeps working, and its later fills add to the still
    * active, still protected position.
+   *
+   * Review F1 (2026-11-09): before any of that, every OTHER SELL of the
+   * position still `submitted` (a TP/SL exit or an earlier SELL whose outcome
+   * is unknown) is resolved query-first. Still unresolved, this SELL — full or
+   * partial — is refused 409 `exit_unresolved` with nothing placed; resolved
+   * to a fill that closed the position, 409 `already_closed`.
+   *
+   * Review F3: a full exit of a position whose entry fills are booked gross
+   * sells the 0.1 % haircut, and what it leaves closes with the position.
    */
   let refreshFlag: string | null = null;
   let exitNote: string | null = null;
   let fullExitPositionId: string | null = null;
   if (input.side === "SELL" && input.positionId) {
-    const target = await prisma.smartTrade.findFirst({ where: { id: input.positionId, source: "manual",
-      exchangeAccountId: account.id, pair: input.symbol, status: "active" } });
+    const targetWhere = { id: input.positionId, source: "manual", exchangeAccountId: account.id,
+      pair: input.symbol, status: "active" };
+    let target = await prisma.smartTrade.findFirst({ where: targetWhere });
+    if (target) {
+      // A replay of this very request is the P2002 path's to answer, not a prior exit.
+      const prior = await resolveUnresolvedManualExits(target.id, adapter,
+        { skip: (order) => order.requestId === input.requestId });
+      if (prior.blocked) throw exitUnresolvedError(prior.reason);
+      if (prior.reconciled + prior.discarded > 0) {
+        target = await prisma.smartTrade.findFirst({ where: targetWhere });
+        if (!target) {
+          throw new ManualTradingError("A prior exit of this position was resolved at the exchange and has " +
+            "closed it. No second order was placed.", 409, "already_closed");
+        }
+      }
+    }
     if (target) {
       let current: SmartTrade | null = target;
       let entryWorking = false;
+      let refreshFailed = false;
       if (target.manualOrderId) {
         const refresh = await refreshWorkingEntry(target, adapter);
         refreshFlag = refresh.flag ?? null;
+        refreshFailed = refresh.flag != null;
         current = refresh.position;
         entryWorking = refresh.entryWorking;
       }
@@ -1115,14 +1390,25 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
               "read the position again before selling", 409, "trade_closing");
           }
           lock.positionId = target.id;
+          // F1, under the lock: an exit the poller placed between the
+          // resolution above and this lock is refused, never doubled.
+          if (await prisma.manualOrder.count({ where: { linkedPositionId: target.id, side: "SELL",
+            status: "submitted", requestId: { not: input.requestId } } }) > 0) {
+            throw exitUnresolvedError("an exit of it was submitted a moment ago");
+          }
         }
         if (entryWorking) {
           let raceDelta = 0;
+          let netting: NettingHaircut | null = null;
           if (full) {
             const cancel = await cancelWorkingEntryForExit(current, adapter, "operator");
             refreshFlag = cancel.flag ?? refreshFlag;
             raceDelta = cancel.raceDelta;
             current = cancel.position;
+            if (current?.status === "active") {
+              netting = await haircutForUnnettedEntry(current, adapter);
+              current = netting.position;
+            }
             if (current?.status !== "active") {
               throw new ManualTradingError("the position closed while its entry was being cancelled; " +
                 "read the position again before selling", 409, "trade_closing");
@@ -1134,28 +1420,51 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
             throw new ManualTradingError("the free balance attributable to this position is 0; " +
               "reconcile the account balance before selling", 409);
           }
-          input.baseQuantity = Math.min(requested + raceDelta, capacity);
-          fullExitPositionId = input.baseQuantity >= current.quantity * (1 - 1e-9) ? target.id : null;
+          const haircut = netting?.sizeCap ?? null;
+          input.baseQuantity = Math.min(requested + raceDelta, capacity, haircut ?? Number.POSITIVE_INFINITY);
+          fullExitPositionId = input.baseQuantity >= current.quantity * (1 - 1e-9) ||
+            (haircut != null && input.baseQuantity >= haircut - QTY_EPSILON) ? target.id : null;
           const base = baseAssetOf(input.symbol);
           if (!full) {
             exitNote = "ENTRY STILL WORKING (partial exit): the entry of this position is still working " +
               `at the exchange and was not cancelled. Its further fills add to position ${target.id}, ` +
               "which stays active with its TP/SL.";
           } else if (raceDelta > QTY_EPSILON) {
-            exitNote = `RACE FILL: ${fmtQty(raceDelta)} ${base} of the entry filled while the Bot ` +
-              `cancelled it for this full exit; this SELL was raised by that amount only ` +
-              `(${fmtQty(requested)} asked, ${fmtQty(input.baseQuantity)} sold).`;
+            // F4: after a FAILED refresh the cancel's reply also carries fills
+            // from before the cancel that the Bot had not booked yet.
+            exitNote = refreshFailed
+              ? `RACE FILL: ${fmtQty(raceDelta)} ${base} of the entry filled before and during the cancel ` +
+                "(the refresh before this exit had failed, so the Bot had not booked them); this SELL was " +
+                `raised by that amount only (${fmtQty(requested)} asked, ${fmtQty(input.baseQuantity)} sold).`
+              : `RACE FILL: ${fmtQty(raceDelta)} ${base} of the entry filled while the Bot ` +
+                `cancelled it for this full exit; this SELL was raised by that amount only ` +
+                `(${fmtQty(requested)} asked, ${fmtQty(input.baseQuantity)} sold).`;
           }
-        } else if (input.positionFull) {
-          // OD-7 with no working entry: everything that remains, capped by I3.
-          const free = adapter.baseFree ? await adapter.baseFree(input.symbol) : Number.POSITIVE_INFINITY;
-          const { capacity } = await manualExitCapacity(current, account.id, free);
-          if (!(capacity > 0)) {
-            throw new ManualTradingError("the free balance attributable to this position is 0; " +
-              "reconcile the account balance before selling", 409);
+          if (netting?.flag) exitNote = [exitNote, netting.flag].filter((note) => note).join(" ");
+        } else if (full) {
+          // F3: the entry is terminal; its fills may still be booked gross.
+          const netting = await haircutForUnnettedEntry(current, adapter);
+          current = netting.position;
+          if (current?.status !== "active") {
+            throw new ManualTradingError("the position changed while its entry was being re-read; " +
+              "read the position again before selling", 409, "trade_closing");
           }
-          input.baseQuantity = Math.min(current.quantity, capacity);
-          fullExitPositionId = target.id;
+          if (input.positionFull) {
+            // OD-7 with no working entry: everything that remains, capped by I3.
+            const free = adapter.baseFree ? await adapter.baseFree(input.symbol) : Number.POSITIVE_INFINITY;
+            const { capacity } = await manualExitCapacity(current, account.id, free);
+            if (!(capacity > 0)) {
+              throw new ManualTradingError("the free balance attributable to this position is 0; " +
+                "reconcile the account balance before selling", 409);
+            }
+            input.baseQuantity = Math.min(current.quantity, capacity, netting.sizeCap ?? Number.POSITIVE_INFINITY);
+            fullExitPositionId = target.id;
+          } else if (netting.sizeCap != null) {
+            // A numeric full SELL: only the haircut changes what was asked.
+            input.baseQuantity = Math.min(requested, netting.sizeCap);
+            fullExitPositionId = target.id;
+          }
+          exitNote = netting.flag;
         }
       }
     }
@@ -1220,10 +1529,14 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
         : describeUncertainFailure(failure),
       completedAt: rejected || failed ? new Date() : null }});
   }
-  if (fullExitPositionId && adapter.lotRules) {
-    // D1/I7: a full exit that leaves only an unsellable remainder closes it.
+  if (fullExitPositionId) {
     try {
-      if (await closeManualDust(fullExitPositionId, await adapter.lotRules(input.symbol),
+      // F3: what a haircut exit deliberately left closes with the position.
+      if (await closeHaircutRemainder(applied, adapter, { origin: "operator" })) {
+        return prisma.manualOrder.findUniqueOrThrow({ where: { id: applied.id } });
+      }
+      // D1/I7: a full exit that leaves only an unsellable remainder closes it.
+      if (adapter.lotRules && await closeManualDust(fullExitPositionId, await adapter.lotRules(input.symbol),
         applied.averageFillPrice, applied.id, { adapter, origin: "operator" })) {
         return prisma.manualOrder.findUniqueOrThrow({ where: { id: applied.id } });
       }
@@ -1382,19 +1695,20 @@ export async function reconcilePendingManualOrders(
  * OD-1 (trace §1.2 item 6): after the reconciler applied a fresh snapshot of a
  * BUY entry whose trade is closed and which still works, the cancel owed by
  * the policy is attempted — the snapshot just applied IS the query-first read.
- * A trade closed by a path that did not engage the policy (or before it
- * existed) engages it here; cancels run under halt and pause alike.
+ * Cancels run under halt and pause alike.
+ *
+ * Review F2 (2026-11-09): only for an entry the policy already marked
+ * (`exitCancelState` non-null). Every path that closes a manual trade marks
+ * it (`markEntryForExitCancel`), so what is left unmarked is a LEGACY entry
+ * whose trade closed before this version. It keeps its
+ * `entry_working_after_exit` flag and is NOT cancelled at boot: changing a
+ * resting order needs an operator action (the cancel route, or C9
+ * `cancelWorkingEntries`). Its later fills stay `late_fill_unprotected`.
  */
 async function finalizeOnReconcile(entry: ManualOrder, adapter: ManualExchangeAdapter): Promise<void> {
   if (entry.side !== "BUY" || !PENDING_STATUSES.includes(entry.status) ||
-      entry.exitCancelState === "failed" || entry.exitCancelState === "done") return;
-  const trade = await prisma.smartTrade.findUnique({ where: { manualOrderId: entry.id } });
-  if (!trade || trade.status === "active") return;
-  if (entry.exitCancelState == null) {
-    const effects: AfterCommit[] = [];
-    await markEntryForExitCancel(prisma, trade.id, entry.id, "automation", effects);
-    for (const effect of effects) await effect();
-  }
+      (entry.exitCancelState !== "pending" && entry.exitCancelState !== "unknown")) return;
+  // `finalizeEntryAfterExit` leaves an entry of a still-active trade to the exit path.
   await finalizeEntryAfterExit(entry.id, adapter, { snapshotApplied: true });
 }
 
@@ -1571,9 +1885,19 @@ export async function listManualState(symbol?: string): Promise<unknown> {
   /*
    * OD-1: a race-fill position from an automated exit is held while halted
    * (the halt stops automated exits). Say so, so it is never read as handled.
+   * Review F1: only those. One from an operator's own full SELL is still
+   * swept while halted, and telling the operator to sell it by hand would
+   * steer them into a second SELL of it.
    */
-  const sweepsWaiting = halt.halted ? positions.filter((p) =>
-    p.status === "active" && p.protectionState === RACE_FILL_SWEEP).length : 0;
+  let sweepsWaiting = 0;
+  if (halt.halted) {
+    const waiting = await prisma.smartTrade.findMany({ where: { source: "manual", status: "active",
+      protectionState: RACE_FILL_SWEEP, ...(pair ? { pair } : {}) }, select: { clientOrderId: true } });
+    for (const position of waiting) {
+      // The poller's own rule (`planRaceFillSweep`): anything not operator-origin is held.
+      if ((await entryOfRaceFillPosition(position))?.exitOrigin !== "operator") sweepsWaiting += 1;
+    }
+  }
   const sweepNote = sweepsWaiting > 0
     ? "race fill awaiting sweep — Bot halted; sell it from the Trade panel (a race fill from an " +
       "automated exit is not sold while the Bot is halted)." : undefined;
