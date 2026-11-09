@@ -734,3 +734,41 @@ test("D2/F9 a strategy BUY whose minimum-notional read fails is rejected and blo
     assert.equal(fresh.status, "ok");
     assert.equal(exchange.submissions.length, 1);
   });
+
+// ── review round 2 (D3 advisory A1): a live order under DRY_RUN ──────────────
+
+test("D2/A1 under DRY_RUN a cancel of an order placed on the exchange is refused, never simulated",
+  async () => {
+    const account = await createAccount();
+    const exchange = fakeBinance();
+    const order = await prisma.manualOrder.create({ data: { requestId: "a1-live", exchangeAccountId: account.id,
+      symbol: "BTCUSDT", side: "BUY", orderType: "LIMIT", quantityType: "quote", requestedQuoteQty: 100,
+      limitPrice: 90, status: "open", clientOrderId: "a1-live-client", exchangeOrderId: "123456789",
+      submittedAt: new Date() } });
+    const dryAdapter = (acc: ExchangeAccount) =>
+      new BinanceManualExchange(acc, { client: exchange.client, dryRun: true });
+    const refusal = await cancelManualOrder(order.id, undefined, dryAdapter)
+      .then(() => null, (error: unknown) => error);
+    assert.ok(refusal instanceof ManualTradingError);
+    assert.equal(refusal.httpStatus, 409);
+    assert.equal((refusal as unknown as { code?: string }).code, "live_order_in_dry_run");
+    const still = await prisma.manualOrder.findUniqueOrThrow({ where: { id: order.id } });
+    assert.equal(still.status, "open", "still working: no fabricated cancel");
+    assert.equal(still.exchangeOrderId, "123456789");
+    assert.equal(still.completedAt, null);
+    assert.equal(exchange.cancels.length, 0);
+
+    // A simulated snapshot never replaces the real exchange id.
+    await manual.applyManualSnapshot(order.id, { exchangeOrderId: "dry-a1-live-client",
+      clientOrderId: "a1-live-client", status: "NEW", executedBaseQuantity: 0, executedQuoteQuantity: 0,
+      averagePrice: null, simulated: true });
+    assert.equal((await prisma.manualOrder.findUniqueOrThrow({ where: { id: order.id } })).exchangeOrderId,
+      "123456789");
+
+    // A dry-run order is still canceled by the dry-run adapter, as before.
+    const dry = await prisma.manualOrder.create({ data: { requestId: "a1-dry", exchangeAccountId: account.id,
+      symbol: "BTCUSDT", side: "BUY", orderType: "LIMIT", quantityType: "quote", requestedQuoteQty: 100,
+      limitPrice: 90, status: "open", clientOrderId: "a1-dry-client", exchangeOrderId: "dry-a1-dry-client" } });
+    assert.equal((await cancelManualOrder(dry.id, undefined, dryAdapter)).status, "canceled");
+  });
+

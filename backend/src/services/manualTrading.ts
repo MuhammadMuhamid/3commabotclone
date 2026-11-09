@@ -136,6 +136,11 @@ function isComplete(status: string): boolean {
   return ["filled", "canceled", "rejected", "failed"].includes(status);
 }
 
+/** True for an exchange order id that came from the exchange, not from a dry-run simulation. */
+function isRealExchangeOrderId(id: string | null | undefined): id is string {
+  return typeof id === "string" && id.length > 0 && !id.startsWith("dry-");
+}
+
 /** Below this, two cumulative quantities are the same quantity. */
 const QTY_EPSILON = 1e-12;
 
@@ -216,6 +221,10 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
     const deltaBase = executedBase - before.filledBaseQty;
     const deltaQuote = Math.max(0, snapshot.executedQuoteQuantity - before.filledQuoteQty);
     const status = manualLifecycleStatus(snapshot.status);
+    // A simulated (`dry-`) id never replaces an id the exchange really assigned.
+    const exchangeOrderId = isRealExchangeOrderId(before.exchangeOrderId) &&
+      !isRealExchangeOrderId(snapshot.exchangeOrderId)
+      ? before.exchangeOrderId : (snapshot.exchangeOrderId || before.exchangeOrderId);
     let protectionState = manualProtectionState(
       before.takeProfitPrice, before.stopLossPrice, executedBase);
     let error: string | null = before.side === "SELL" ? durableFlag(before.error) : null;
@@ -223,7 +232,7 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
     if (before.side === "BUY") {
       const existing = await tx.smartTrade.findUnique({ where: { manualOrderId: before.id } });
       const pricing = { entryPrice: snapshot.averagePrice, currentPrice: snapshot.averagePrice,
-        buyPrice: snapshot.averagePrice, exchangeOrderId: snapshot.exchangeOrderId };
+        buyPrice: snapshot.averagePrice, exchangeOrderId };
       if (!existing) {
         if (executedBase > 0) {
           await tx.smartTrade.create({ data: { source: "manual", exchangeAccountId: before.exchangeAccountId,
@@ -302,7 +311,7 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
     }
 
     return tx.manualOrder.update({ where: { id: orderId }, data: {
-      status, exchangeOrderId: snapshot.exchangeOrderId || before.exchangeOrderId,
+      status, exchangeOrderId,
       filledBaseQty: executedBase,
       filledQuoteQty: snapshot.executedQuoteQuantity,
       averageFillPrice: snapshot.averagePrice, submittedAt: before.submittedAt ?? new Date(),
@@ -685,9 +694,21 @@ export async function cancelManualOrder(
   if (order.orderType !== "LIMIT" || !PENDING_STATUSES.includes(order.status))
     throw new ManualTradingError("only a pending LIMIT order can be canceled", 409);
   assertManualAccountGate(order.exchangeAccount, confirmation);
+  const adapter = adapterFactory(order.exchangeAccount);
+  /*
+   * A dry-run adapter can only SIMULATE a cancel. An order that was placed on
+   * the exchange (a real, non-`dry-` exchange id — e.g. while DRY_RUN was off)
+   * is still working there, so a simulated CANCELED would mark a live order
+   * canceled and leave it untracked. Refuse instead.
+   */
+  const simulated = (adapter as { dryRun?: boolean }).dryRun ?? config.dryRun;
+  if (simulated && isRealExchangeOrderId(order.exchangeOrderId)) {
+    throw new ManualTradingError("This order was placed on the exchange; switch DRY_RUN off to " +
+      "cancel it, or cancel it on the exchange. It is still working.", 409, "live_order_in_dry_run");
+  }
   let snapshot: ManualOrderSnapshot;
   try {
-    snapshot = await adapterFactory(order.exchangeAccount).cancel(order.symbol, order.clientOrderId);
+    snapshot = await adapter.cancel(order.symbol, order.clientOrderId);
   } catch (error) {
     // D2: -2011 and then nothing found by the client id. A coded answer, not a
     // 500; the order stays as recorded and reconciliation resolves it.
