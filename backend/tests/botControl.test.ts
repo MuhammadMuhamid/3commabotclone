@@ -1012,8 +1012,9 @@ test("F9: the control limiter answers 429 code bot_rate_limited, and reads canno
   }
 });
 
-test("F9: index.ts mounts the control limiters and keeps /control/* off the shared apiLimiter", () => {
-  const index = fs.readFileSync(path.join(backendRoot, "src", "index.ts"), "utf8");
+test("F9: the app mounts the control limiters and keeps /control/* off the shared apiLimiter", () => {
+  // The composition moved from index.ts to app.ts (createApp) so tests can drive it.
+  const index = fs.readFileSync(path.join(backendRoot, "src", "app.ts"), "utf8");
   const limiters = index.indexOf('app.use("/api/manual-trading/control", ...createControlRateLimiters())');
   const manual = index.indexOf('"/api/manual-trading",\n');
   assert.ok(limiters > 0 && manual > limiters, "the control limiters are registered first");

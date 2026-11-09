@@ -42,11 +42,48 @@ export interface ErrorBody {
 }
 
 /**
+ * The only facts about a failure that may be logged (X1).
+ *
+ * body-parser attaches the raw request text to its 400 (`err.body`), and V8's
+ * JSON.parse message quotes a slice of the input — so logging the error
+ * object, or even its message, printed exchange API keys, secrets and webhook
+ * secrets to stdout whenever a client sent a truncated body. A Prisma error's
+ * message likewise embeds the query arguments it was given. Neither the
+ * object, its message, its stack nor its `body` is ever logged here: only the
+ * request line, the status, and the error's type and class name.
+ */
+export function describeErrorForLog(err: unknown, req: Request, status: number): string {
+  const type = typeof (err as { type?: unknown } | null)?.type === "string"
+    ? (err as { type: string }).type : "-";
+  const name = err instanceof Error ? err.name : typeof err;
+  return `[error] ${req.method} ${req.path} -> ${status} type=${type} name=${name}`;
+}
+
+/**
+ * The answer for a request body this process could not read. A fixed string
+ * per body-parser type: the parser's own message quotes the input.
+ */
+function bodyErrorMessage(type: string): string | null {
+  switch (type) {
+    case "entity.parse.failed": return "Malformed JSON body";
+    case "entity.too.large": return "Request body too large";
+    case "encoding.unsupported":
+    case "charset.unsupported": return "Unsupported request body encoding";
+    case "request.aborted":
+    case "request.size.invalid":
+    case "stream.encoding.set":
+    case "stream.not.readable": return "Invalid request body";
+    default: return null;
+  }
+}
+
+/**
  * Last middleware in the chain. Every request gets an answer.
  *
  * A 5xx never carries the thrown message or a stack. This process holds
  * decrypted Binance API keys, the database DSN and webhook secrets, and any of
- * those can end up inside an exception string.
+ * those can end up inside an exception string. For the same reason nothing
+ * but `describeErrorForLog` is ever logged (X1).
  */
 export function errorHandler(
   err: unknown,
@@ -73,14 +110,20 @@ export function errorHandler(
     }
   }
 
-  const status = typeof (err as { status?: unknown }).status === "number"
+  const status = typeof (err as { status?: unknown } | null)?.status === "number"
     ? (err as { status: number }).status
     : 500;
 
-  console.error(`[error] ${req.method} ${req.path} -> ${status}`, err);
+  console.error(describeErrorForLog(err, req, status));
 
   if (status >= 500) {
     res.status(status).json({ error: "Internal server error" } satisfies ErrorBody);
+    return;
+  }
+  const type = (err as { type?: unknown } | null)?.type;
+  const bodyMessage = typeof type === "string" ? bodyErrorMessage(type) : null;
+  if (bodyMessage !== null) {
+    res.status(status).json({ error: bodyMessage } satisfies ErrorBody);
     return;
   }
   const message = err instanceof Error && !config.isProduction
