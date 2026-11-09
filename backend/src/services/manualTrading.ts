@@ -70,6 +70,12 @@ export interface SubmitManualOrderInput {
   takeProfitPrice?: number | null;
   stopLossPrice?: number | null;
   positionId?: string;
+  /**
+   * OD-7: sell ALL that remains of `positionId` (plus a race fill, per OD-1),
+   * capped by the free balance attributable to it (I3) and the lot rules. Only
+   * on a SELL with a `positionId`, and never beside a `baseQuantity`.
+   */
+  positionFull?: true;
   mainnetConfirmation?: string;
   /**
    * The Platform's authenticated Shariah decision. `unknown` because it is
@@ -88,11 +94,13 @@ type AdapterFactory = (account: ExchangeAccount) => ManualExchangeAdapter;
 const defaultAdapter: AdapterFactory = (account) => new BinanceManualExchange(account);
 
 /**
- * The adapter the control-plane cancels use (OD-3 `cancelWorkingEntries`, from
- * C9 and the dashboard). A seam in the `tradeExchangeClient` idiom, so a route
- * test can point it at a fake exchange; production never changes it.
+ * The adapter the route-level manual commands use: a submitted order (when the
+ * caller passes none) and the control-plane cancels (OD-3
+ * `cancelWorkingEntries`, from C9 and the dashboard). A seam in the
+ * `tradeExchangeClient` idiom, so a route test can point it at a fake
+ * exchange; production never changes it.
  */
-export const manualControlAdapter: { factory: AdapterFactory } = { factory: defaultAdapter };
+export const manualAdapterSeam: { factory: AdapterFactory } = { factory: defaultAdapter };
 
 export function manualLifecycleStatus(status: ManualOrderSnapshot["status"]): string {
   return ({ NEW: "open", PARTIALLY_FILLED: "partially_filled", FILLED: "filled",
@@ -986,8 +994,14 @@ async function assertSellAssociation(input: SubmitManualOrderInput, account: Exc
   if (input.positionId) {
     const position = manualPositions.find((item) => item.id === input.positionId);
     if (!position) throw new ManualTradingError("manual position not found for this account and symbol", 422);
+    if (input.positionFull && !((input.baseQuantity ?? 0) > 0)) {
+      throw new ManualTradingError("manual position not found for this account and symbol", 422);
+    }
+    // OD-7: never sell more than the selected position — a typed refusal, so
+    // the Platform can show it (and offer the whole position) instead of a 422.
     if ((input.baseQuantity ?? 0) > position.quantity * 1.000000001) {
-      throw new ManualTradingError("sell quantity exceeds the selected manual position", 422);
+      throw new ManualTradingError(`sell quantity exceeds the selected manual position (remaining ` +
+        `${fmtQty(position.quantity)}); sell the whole position instead`, 409, "sell_exceeds_position");
     }
   } else if (manualPositions.length > 0 || automatedPositions.length > 0) {
     throw new ManualTradingError(
@@ -999,7 +1013,7 @@ async function assertSellAssociation(input: SubmitManualOrderInput, account: Exc
 }
 
 export async function submitManualOrder(
-  raw: SubmitManualOrderInput, adapterFactory: AdapterFactory = defaultAdapter
+  raw: SubmitManualOrderInput, adapterFactory: AdapterFactory = (account) => manualAdapterSeam.factory(account)
 ): Promise<ManualOrder> {
   const input = { ...raw, symbol: normalizeSymbol(raw.symbol) };
   const account = await prisma.exchangeAccount.findUnique({ where: { id: input.accountId } });
@@ -1012,7 +1026,12 @@ export async function submitManualOrder(
     throw new ManualTradingError("side must be exactly BUY or SELL", 422);
   if (input.side === "BUY" && (!input.quoteQuantity || input.quoteQuantity <= 0))
     throw new ManualTradingError("BUY requires a positive quote quantity", 422);
-  if (input.side === "SELL" && (!input.baseQuantity || input.baseQuantity <= 0))
+  if (input.positionFull !== undefined && (input.positionFull !== true || input.side !== "SELL" ||
+      !input.positionId || input.baseQuantity !== undefined || input.quoteQuantity !== undefined)) {
+    throw new ManualTradingError(
+      "positionFull must be true, on a SELL with a positionId and no quantity", 422, "invalid_position_full");
+  }
+  if (input.side === "SELL" && !input.positionFull && (!input.baseQuantity || input.baseQuantity <= 0))
     throw new ManualTradingError("SELL requires a positive base quantity", 422);
   if (input.orderType === "LIMIT" && (!input.limitPrice || input.limitPrice <= 0))
     throw new ManualTradingError("LIMIT requires a positive limit price", 422);
@@ -1086,9 +1105,10 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
         current = refresh.position;
         entryWorking = refresh.entryWorking;
       }
-      const requested = input.baseQuantity ?? 0;
+      // OD-7: `positionFull` asks for exactly the refreshed remaining quantity.
+      const requested = input.positionFull ? (current?.quantity ?? 0) : (input.baseQuantity ?? 0);
       if (current?.status === "active" && requested <= current.quantity * 1.000000001) {
-        const full = requested >= current.quantity * (1 - 1e-9);
+        const full = input.positionFull === true || requested >= current.quantity * (1 - 1e-9);
         if (full) {
           if (!acquireTradeClose(target.id)) {
             throw new ManualTradingError("this position is being closed by another exit right now; " +
@@ -1126,10 +1146,22 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
               `cancelled it for this full exit; this SELL was raised by that amount only ` +
               `(${fmtQty(requested)} asked, ${fmtQty(input.baseQuantity)} sold).`;
           }
+        } else if (input.positionFull) {
+          // OD-7 with no working entry: everything that remains, capped by I3.
+          const free = adapter.baseFree ? await adapter.baseFree(input.symbol) : Number.POSITIVE_INFINITY;
+          const { capacity } = await manualExitCapacity(current, account.id, free);
+          if (!(capacity > 0)) {
+            throw new ManualTradingError("the free balance attributable to this position is 0; " +
+              "reconcile the account balance before selling", 409);
+          }
+          input.baseQuantity = Math.min(current.quantity, capacity);
+          fullExitPositionId = target.id;
         }
       }
     }
   }
+  // A `positionFull` whose position is not active here is refused just below
+  // (`manual position not found`); it never reaches the exchange unsized.
   if (input.side === "SELL") await assertSellAssociation(input, account, adapter);
   let order: ManualOrder | null = null;
   if (accountSubmitLocks.has(account.id))

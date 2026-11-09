@@ -481,7 +481,10 @@ test("D1/F1 an over-request (4.0 of a 0.4 position) is still refused while the e
       symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", baseQuantity: 4, positionId: trade.id },
     factory(exchange)).then(() => null, (error: unknown) => error);
     assert.ok(refusal instanceof manual.ManualTradingError);
-    assert.equal(refusal.httpStatus, 422);
+    // OD-7 (2026-11-09): the refusal is now a typed 409, not an untyped 422.
+    assert.equal(refusal.httpStatus, 409);
+    assert.equal(refusal.code, "sell_exceeds_position");
+    assert.equal(exchange.cancels.length, 0, "OD-1: refused before any cancel");
     assert.equal(exchange.submissions.length, 0, "nothing reached the exchange");
     assert.equal(await prisma.manualOrder.count({ where: { side: "SELL" } }), 0, "no order was reserved");
     const untouched = await reload.trade(trade.id);

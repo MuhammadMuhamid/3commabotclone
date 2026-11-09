@@ -63,6 +63,11 @@ const submitSchema = z.object({
   takeProfitPrice: optionalPrice,
   stopLossPrice: optionalPrice,
   positionId: z.string().uuid().optional(),
+  /*
+   * OD-7 (`manualPositionFull.v1`): sell ALL that remains of `positionId`.
+   * Only `true`, only on a SELL with a position, never beside a quantity.
+   */
+  positionFull: z.literal(true).optional(),
   mainnetConfirmation: confirmation,
   /*
    * Optional, and covered by the request HMAC for free: the manual signature is
@@ -74,7 +79,10 @@ const submitSchema = z.object({
    * malformed block must not be able to 400 a SELL.
    */
   shariah: shariahContextSchema,
-}).strict();
+}).strict().refine((v) => v.positionFull === undefined || (v.side === "SELL" && v.positionId !== undefined &&
+  v.baseQuantity === undefined && v.quoteQuantity === undefined), {
+  message: "positionFull must be true, on a SELL with a positionId and no quantity",
+});
 
 function requestId(res: Response): string {
   return String(res.locals.manualRequestId ?? "");

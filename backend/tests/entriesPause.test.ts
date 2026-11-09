@@ -61,9 +61,12 @@ const reconcileStrategy = strategy.reconcilePendingStrategyIntents as unknown as
   (factory: unknown) => Promise<void>;
 
 const CONTROL_SECRET = "9a2f" + "d".repeat(60);
+// Tolerates a build without the seam, so a red run fails per test, not at load.
+const seam = (manual as { manualAdapterSeam?: { factory: Factory } }).manualAdapterSeam ??
+  { factory: null as unknown as Factory };
 const original = {
   dryRun: config.dryRun, manualTradingEnabled: config.manualTradingEnabled,
-  secret: config.manualTradingHmacSecret, factory: manual.manualControlAdapter.factory,
+  secret: config.manualTradingHmacSecret, factory: seam.factory,
   resolve: tradeExchangeClient.resolve,
 };
 config.manualTradingHmacSecret = CONTROL_SECRET;
@@ -85,7 +88,7 @@ after(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   Object.assign(config, { dryRun: original.dryRun, manualTradingEnabled: original.manualTradingEnabled,
     manualTradingHmacSecret: original.secret });
-  manual.manualControlAdapter.factory = original.factory;
+  seam.factory = original.factory;
   tradeExchangeClient.resolve = original.resolve;
   tradeExchangeClient.closeFactory = null;
   await prisma.$disconnect();
@@ -97,7 +100,7 @@ beforeEach(async () => {
   mock.restoreAll();
   config.dryRun = false;
   config.manualTradingEnabled = true;
-  manual.manualControlAdapter.factory = original.factory;
+  seam.factory = original.factory;
   tradeExchangeClient.resolve = original.resolve;
   tradeExchangeClient.closeFactory = null;
   await prisma.botControlCommand.deleteMany();
@@ -462,7 +465,7 @@ test("C9 cancelWorkingEntries (opt-in): each working manual LIMIT BUY is cancell
     const account = await createAccount();
     const exchange = fakeBinance({ cancelFailures: [undefined,
       { error: binanceError("Execution status unknown.", -1007) }] });
-    manual.manualControlAdapter.factory = factory(exchange);
+    seam.factory = factory(exchange);
     const working = [];
     for (const name of ["first", "second"]) {
       working.push(await prisma.manualOrder.create({ data: { requestId: `pause-cancel-${name}`,
@@ -488,7 +491,7 @@ test("C9 cancelWorkingEntries under DRY_RUN never 'cancels' a live order by simu
   quiet();
   const account = await createAccount();
   const exchange = fakeBinance();
-  manual.manualControlAdapter.factory = (acc) =>
+  seam.factory = (acc) =>
     new BinanceManualExchange(acc, { client: exchange.client, dryRun: true });
   const live = await prisma.manualOrder.create({ data: { requestId: "pause-a1", exchangeAccountId: account.id,
     symbol: "BTCUSDT", side: "BUY", orderType: "LIMIT", quantityType: "quote", requestedQuoteQty: 50,

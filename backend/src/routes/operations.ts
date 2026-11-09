@@ -21,7 +21,7 @@ import {
   describeBotRiskState, getBotRiskLimits, haltBotTrading, readBotRiskSnapshot, readEntriesStatus,
   resumeBotTrading, setEntriesPaused, updateBotRiskLimits,
 } from "../services/riskControls.js";
-import { cancelWorkingEntryLimits, manualControlAdapter } from "../services/manualTrading.js";
+import { cancelWorkingEntryLimits, manualAdapterSeam } from "../services/manualTrading.js";
 import { EXCHANGE_STOPS_STATUS, exchangeStopsEnabled } from "../services/exchangeStops.js";
 import { asyncHandler } from "../middleware/errors.js";
 import { prisma } from "../lib/prisma.js";
@@ -219,7 +219,7 @@ operationsRouter.post(
       : await setEntriesPaused({ paused: false, by });
     if (changed) console.warn(`[risk] new entries ${body.paused ? "PAUSED" : "RESUMED"} by ${by}`);
     const canceledEntries = body.paused && body.cancelWorkingEntries
-      ? await cancelWorkingEntryLimits(manualControlAdapter.factory) : undefined;
+      ? await cancelWorkingEntryLimits(manualAdapterSeam.factory) : undefined;
     res.json({
       entries: {
         paused: state.paused, pausedAt: state.pausedAt?.toISOString() ?? null,

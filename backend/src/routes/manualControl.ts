@@ -32,7 +32,7 @@ import {
   dailyLossBreached, describeBotRiskState, getBotRiskLimits, haltBotTrading, readBotHaltState,
   readBotRiskSnapshot, readEntriesStatus, resumeBotTrading, setEntriesPaused, updateBotRiskLimits,
 } from "../services/riskControls.js";
-import { cancelWorkingEntryLimits, manualControlAdapter } from "../services/manualTrading.js";
+import { cancelWorkingEntryLimits, manualAdapterSeam } from "../services/manualTrading.js";
 import { readBotOperationalStatus } from "../services/operationalStatus.js";
 import { readInstallationShariahMode } from "../services/shariah.js";
 import { exchangeStopsEnabled } from "../services/exchangeStops.js";
@@ -59,7 +59,7 @@ const TPSL_POLL_INTERVAL_SEC = 30;
  * backend would accept it (absence = an older Bot: hide or disable it).
  * Additive; other capabilities are appended by their own slices.
  */
-export const BOT_CAPABILITIES: readonly string[] = ["entries.v1"];
+export const BOT_CAPABILITIES: readonly string[] = ["entries.v1", "manualPositionFull.v1"];
 
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const idSchema = z.string().uuid();
@@ -311,7 +311,7 @@ manualControlRouter.post("/entries", asyncHandler(async (req, res) => {
           `channel (actor ${body.actor.platformUserId})`);
       }
       const canceledEntries = body.paused && body.cancelWorkingEntries
-        ? await cancelWorkingEntryLimits(manualControlAdapter.factory) : undefined;
+        ? await cancelWorkingEntryLimits(manualAdapterSeam.factory) : undefined;
       return { body: {
         entries: {
           paused: state.paused,
