@@ -17,11 +17,13 @@
  *
  *   - a MANUAL position is Trading Scene's (U3): it is closed from the Trade
  *     panel's SELL, never through a strategy route;
- *   - Close refuses up front what `processWebhook` would refuse with an
- *     untyped error (paused bot, pair no longer listed) and what it cannot
- *     express (more than one active trade for the bot and pair), and passes
- *     `expectSmartTradeId` so a sibling opened in between is refused, not sold
- *     (F3);
+ *   - a trade whose bot was deleted has no secret and no account (kept);
+ *   - B-SLICE2: Close is TRADE-ID-TARGETED (`operatorTarget`): it sells
+ *     exactly the clicked trade, so a paused bot's trade, a trade whose pair
+ *     was delisted, and one of several sibling trades are each closable on
+ *     their own (the old `bot_paused`, `pair_not_listed` and `ambiguous_trade`
+ *     refusals are gone). Sibling closes get distinct dedupe and intent
+ *     scopes (`op:<tradeId>:<commandKey>`);
  *   - Partial now also resolves prior unresolved strategy SELL intents before
  *     selling, as Close always did (F4, finding 0.8).
  *
@@ -31,7 +33,6 @@
  */
 import type { ExchangeAccount, SignalBot, SmartTrade } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
-import { normalizeSymbol } from "../lib/symbols.js";
 import { acquireTradeClose, isTradeClosing, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import {
   classifyExchangeFailure, clientFromAccount, clientFromEnv, marketSellBase, MinNotionalError, PreWireError,
@@ -104,15 +105,6 @@ function assertActiveStrategyTrade<T extends SmartTrade & { bot: unknown }>(
   }
 }
 
-function listedPairs(bot: SignalBot): string[] {
-  try {
-    const parsed: unknown = JSON.parse(bot.pairs);
-    return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string").map(normalizeSymbol) : [];
-  } catch {
-    return [];
-  }
-}
-
 export type CloseTradeResult = {
   status: "ok" | "ignored_duplicate";
   detail?: unknown;
@@ -129,32 +121,19 @@ export interface TradeExitObserver {
   onAttemptOpened?(attemptId: string): Promise<void> | void;
 }
 
-/** Close one strategy trade at market, on the operator's authority (C6). */
+/**
+ * Close one strategy trade at market, on the operator's authority (C6, and the
+ * dashboard's Close). `commandKey` names the command for the durable intent
+ * scope: the control request id for C6; the dashboard, which has none, uses
+ * its minute bucket, so a double click within the minute is one intent.
+ */
 export async function closeStrategyTrade(
-  tradeId: string, observer: TradeExitObserver = {}
+  tradeId: string, observer: TradeExitObserver = {}, opts: { commandKey?: string } = {}
 ): Promise<CloseTradeResult> {
   const trade = await prisma.smartTrade.findUnique({ where: { id: tradeId }, include: { bot: true } });
   assertActiveStrategyTrade(trade);
   const bot = trade.bot;
-  // `processWebhook` refuses both of these with an untyped error; refusing
-  // first with a code tells the operator why (findings 0.1, 0.2).
-  if (bot.status !== "active") {
-    throw new ControlRefusal(422, "bot_paused",
-      "This trade's bot is paused, and a paused bot's trade cannot be closed here. " +
-      "Start the bot, then close the trade.");
-  }
-  if (!listedPairs(bot).includes(normalizeSymbol(trade.pair))) {
-    throw new ControlRefusal(422, "pair_not_listed",
-      `${trade.pair} is no longer in this bot's pair list, so this trade cannot be closed here.`);
-  }
-  const activeSamePair = await prisma.smartTrade.count({
-    where: { botId: bot.id, pair: trade.pair, status: "active" },
-  });
-  if (activeSamePair !== 1) {
-    throw new ControlRefusal(422, "ambiguous_trade",
-      `This bot has ${activeSamePair} active trades on ${trade.pair}; a Close here cannot target ` +
-      "one of them. Nothing was sold.");
-  }
+  const commandKey = opts.commandKey ?? `dashboard-t${Math.floor(Date.now() / 60_000)}`;
   // BOT-005: informative only; `processWebhook` takes the lock itself.
   if (isTradeClosing(trade.id)) {
     throw new ControlRefusal(409, "trade_closing", "This trade is already being closed. Please wait.");
@@ -167,7 +146,9 @@ export async function closeStrategyTrade(
       { secret: bot.webhookSecret, action: "SELL", symbol: trade.pair, quantity: trade.quantity },
       {
         skipExitCheck: true,
-        expectSmartTradeId: trade.id,
+        // B-SLICE2: exactly this trade, by id (supersedes the F3 refuse-only
+        // `expectSmartTradeId`, which stays for any untargeted caller).
+        operatorTarget: { smartTradeId: trade.id, commandKey },
         clientFactory: tradeExchangeClient.closeFactory ?? undefined,
         // Observation only: records which durable SELL intent this close
         // reserved — before the requested->submitted claim and the wire call —

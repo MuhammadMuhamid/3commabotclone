@@ -608,7 +608,13 @@ async function assertNeverAttemptedMaySubmit(intent: StrategyOrderIntent): Promi
   }
 
   const bot = await prisma.signalBot.findUnique({ where: { id: intent.botId } });
-  if (!bot || bot.status !== "active") throw new Error("Strategy bot is not active");
+  if (!bot) throw new Error("Strategy bot is not active");
+  // S.2: an operator's SELL (`skipExitCheck`, set only by the authenticated
+  // Close) may finish for a paused bot — exits are never trapped. Everything
+  // automated, and every entry, still needs an active bot.
+  if (bot.status !== "active" && !(intent.side === "SELL" && intent.skipExitCheck)) {
+    throw new Error("Strategy bot is not active");
+  }
   if (intent.side === "BUY" && !bot.entryEnabled) throw new Error("Entry orders disabled on this bot");
   if (intent.side === "SELL" && !intent.skipExitCheck && !bot.exitEnabled) {
     throw new Error("Exit orders disabled on this bot");

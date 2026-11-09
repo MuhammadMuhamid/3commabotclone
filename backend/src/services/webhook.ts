@@ -171,13 +171,23 @@ async function assertCanOpenTrade(bot: SignalBot, symbol: string): Promise<void>
 export async function processWebhook(
   body: WebhookBody,
   { skipExitCheck = false, clientFactory = getClient, strategyCrashHooks,
-    platformCorrelation, expectSmartTradeId }: {
+    platformCorrelation, expectSmartTradeId, operatorTarget }: {
     skipExitCheck?: boolean;
     clientFactory?: (bot: SignalBot) => Promise<BinanceClient>;
     strategyCrashHooks?: StrategyCrashHooks;
     platformCorrelation?: { deploymentId: string; orderIntentId: string };
     /** Refuse-only (contract F3): see the check after the active-trade selection. */
     expectSmartTradeId?: string;
+    /**
+     * B-SLICE2 C6 (and the dashboard Close): an OPERATOR's close of exactly
+     * this trade. Honoured only with `skipExitCheck` on a SELL. It selects the
+     * trade by id — never "the newest for the pair" — so a paused bot's trade,
+     * a trade whose pair was delisted, and one of several sibling trades can
+     * each be closed, alone. Its trade-dedupe leg and intent scope name the
+     * trade and the command (`commandKey`: the control request id, or the
+     * dashboard's minute bucket), so sibling closes never collide.
+     */
+    operatorTarget?: { smartTradeId: string; commandKey: string };
   } = {}
 ): Promise<{ status: string; detail?: unknown }> {
   if (isPlaceholderPayload(body)) {
@@ -191,17 +201,25 @@ export async function processWebhook(
 
   const bot = await prisma.signalBot.findUnique({ where: { webhookSecret: secret } });
   if (!bot) throw new Error("Invalid secret");
-  if (bot.status !== "active") throw new Error("Bot is not active");
+  // An operator's targeted close of one existing trade does not need the bot
+  // to be running or the pair to be listed: exits are never trapped (S.2).
+  if (!operatorTarget && bot.status !== "active") throw new Error("Bot is not active");
 
   const symbol = resolveSymbol(body);
-  const allowed = botPairs(bot).map(normalizeSymbol);
-  if (!allowed.includes(symbol)) {
-    throw new Error(`Pair ${symbol} not allowed for this bot`);
+  if (!operatorTarget) {
+    const allowed = botPairs(bot).map(normalizeSymbol);
+    if (!allowed.includes(symbol)) {
+      throw new Error(`Pair ${symbol} not allowed for this bot`);
+    }
   }
 
   if (!body.action) throw new Error("action required");
   const actionRaw = body.action;
   const side = resolveAction(actionRaw);
+  if (operatorTarget && (!skipExitCheck || side !== "sell" || body.dedupe_key !== undefined)) {
+    // Nothing was reserved or logged yet: a misuse is refused before anything.
+    throw new Error("operatorTarget is honoured only for an operator SELL (skipExitCheck, no dedupe_key)");
+  }
   const reservedDedupeKeys: string[] = [];
 
   // Namespace caller keys: TradingView's {{timenow}} can be identical for
@@ -235,7 +253,8 @@ export async function processWebhook(
    * and the leg identity keeps a legitimate TP1-then-TP2 on one candle distinct.
    */
   if (side === "sell") {
-    const tradeKey = tradeEventKey(bot.id, symbol, side, body.exit_leg);
+    const tradeKey = tradeEventKey(bot.id, symbol, side,
+      operatorTarget ? `op:${operatorTarget.smartTradeId}` : body.exit_leg);
     if (!(await reservePersistentDedupe(tradeKey, TRADE_DEDUPE_TTL))) {
       await releasePersistentDedupe(reservedDedupeKeys);
       return { status: "ignored_duplicate" };
@@ -569,10 +588,19 @@ export async function processWebhook(
       }
 
       const client = await clientFactory(bot);
-      let active = await prisma.smartTrade.findFirst({
-        where: { botId: bot.id, pair: symbol, status: "active" },
-        orderBy: { createdAt: "desc" },
-      });
+      let active = operatorTarget
+        // The named trade, and only it — refused, never substituted, if gone.
+        ? await prisma.smartTrade.findFirst({
+          where: { id: operatorTarget.smartTradeId, botId: bot.id, pair: symbol, status: "active" },
+        })
+        : await prisma.smartTrade.findFirst({
+          where: { botId: bot.id, pair: symbol, status: "active" },
+          orderBy: { createdAt: "desc" },
+        });
+      if (operatorTarget && !active) {
+        throw new ControlRefusal(409, "trade_not_active",
+          "This trade is no longer active. Nothing was sold.");
+      }
       /*
        * Contract F3, REFUSE-ONLY: a Close for one specific trade must not sell
        * a different one. The selection above is unchanged; if it did not pick
@@ -633,6 +661,20 @@ export async function processWebhook(
           throw new Error("Trade is already being closed. Please wait.");
         }
         closeLockHeld = active.id;
+        if (operatorTarget) {
+          /*
+           * The targeted close does not share the pair-wide 45 s exit receipt
+           * (its leg names the trade), so it re-reads under the lock: an exit
+           * that finished between the selection above and this lock — a
+           * TradingView SELL, a TP/SL — has closed it, and must not be repeated.
+           */
+          const locked = await prisma.smartTrade.findUnique({ where: { id: active.id } });
+          if (!locked || locked.status !== "active") {
+            throw new ControlRefusal(409, "trade_not_active",
+              "This trade was closed by another exit a moment ago. Nothing was sold.");
+          }
+          active = locked;
+        }
       }
 
       // STALE-SELL GUARD: if the active trade was opened AFTER the last close
@@ -739,7 +781,12 @@ export async function processWebhook(
       if (active) qty = Math.min(qty, active.quantity);
       if (!qty || qty <= 0) throw new Error("No quantity to sell");
 
-      const scope = idempotencyScope(bot.id, symbol, "sell", body.dedupe_key);
+      // S.2: a targeted close's identity names the trade and the command, so
+      // two sibling closes in one minute are two intents and two orders, and a
+      // repeat of the SAME command (same key) is the same intent.
+      const scope = operatorTarget
+        ? `${bot.id}:${symbol}:sell:op:${operatorTarget.smartTradeId}:${operatorTarget.commandKey}`
+        : idempotencyScope(bot.id, symbol, "sell", body.dedupe_key);
       const intent = await reserveStrategyIntent({
         sourceKey: scope,
         webhookLogId: log.id,

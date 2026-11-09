@@ -59,7 +59,7 @@ const TPSL_POLL_INTERVAL_SEC = 30;
  * backend would accept it (absence = an older Bot: hide or disable it).
  * Additive; other capabilities are appended by their own slices.
  */
-export const BOT_CAPABILITIES: readonly string[] = ["entries.v1", "manualPositionFull.v1"];
+export const BOT_CAPABILITIES: readonly string[] = ["entries.v1", "manualPositionFull.v1", "operatorExit.v1"];
 
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const idSchema = z.string().uuid();
@@ -393,9 +393,10 @@ manualControlRouter.post("/trades/:id/close", asyncHandler(async (req, res) => {
   await runAndSend(req, res, { kind: "trade_close", target: `trade:${id}`, params: {}, actor: body.actor },
     // R1: the reserved intent is written onto the command row before the
     // order is sent, so a crash still leaves C8 a pointer to the live order.
+    // B-SLICE2: trade-id-targeted; the request id names this command's intent.
     async (ctx) => ({ body: await closeStrategyTrade(id, {
       onIntentReserved: (intentId) => ctx.recordOrderRef({ intentId }),
-    }) }));
+    }, { commandKey: String(res.locals.manualRequestId ?? "") }) }));
 }));
 
 // ── C7 POST /trades/:id/partial-close ───────────────────────────────────────
