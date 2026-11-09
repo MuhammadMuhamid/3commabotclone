@@ -1075,6 +1075,21 @@ export async function resolveUnresolvedManualExits(positionId: string, adapter: 
   return outcome;
 }
 
+/**
+ * Re-review F3 nit: a full exit whose haircut floors to 0 at the lot (a gross
+ * position under one lot step plus its fee) is refused plainly, not as a 422
+ * "manual position not found". Nothing is placed and nothing untracked is
+ * sold; the netting re-query runs again on the next attempt.
+ */
+function assertHaircutSellable(netting: NettingHaircut | null, position: SmartTrade): void {
+  const sizeCap = netting?.sizeCap;
+  if (sizeCap == null || sizeCap > 0) return;
+  throw new ManualTradingError(`The entry fills of this position are booked gross (their commission could ` +
+    `not be confirmed), and its ${fmtQty(position.quantity)} ${baseAssetOf(position.pair)} less the ` +
+    `${UNNETTED_EXIT_HAIRCUT * 100}% maximum fee floors to 0 at the exchange lot step. Nothing was placed, so ` +
+    "no untracked coin is sold; retry once the entry's fills are confirmed.", 409, "haircut_below_lot");
+}
+
 /** F1: the operator-facing refusal while another exit of the position is unresolved. */
 function exitUnresolvedError(reason: string | undefined): ManualTradingError {
   return new ManualTradingError("Another exit of this position may already be live at the exchange and " +
@@ -1413,6 +1428,7 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
               throw new ManualTradingError("the position closed while its entry was being cancelled; " +
                 "read the position again before selling", 409, "trade_closing");
             }
+            assertHaircutSellable(netting, current);
           }
           const free = adapter.baseFree ? await adapter.baseFree(input.symbol) : Number.POSITIVE_INFINITY;
           const { capacity } = await manualExitCapacity(current, account.id, free);
@@ -1449,6 +1465,7 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
             throw new ManualTradingError("the position changed while its entry was being re-read; " +
               "read the position again before selling", 409, "trade_closing");
           }
+          assertHaircutSellable(netting, current);
           if (input.positionFull) {
             // OD-7 with no working entry: everything that remains, capped by I3.
             const free = adapter.baseFree ? await adapter.baseFree(input.symbol) : Number.POSITIVE_INFINITY;
@@ -1508,8 +1525,15 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
 
   let applied: ManualOrder;
   try {
-    order = await prisma.manualOrder.update({ where: { id: order.id },
+    /*
+     * Re-review: a compare-and-set on `requested`, as the reconciler and the
+     * poller claim. A reconcile tick between the reservation above and here
+     * may already own this row and its one wire call; then nothing is sent
+     * again under the same client order id, and the row is answered as it is.
+     */
+    const claimed = await prisma.manualOrder.updateMany({ where: { id: order.id, status: "requested" },
       data: { status: "submitted", submittedAt: new Date() } });
+    if (claimed.count !== 1) return prisma.manualOrder.findUniqueOrThrow({ where: { id: order.id } });
     applied = await applyManualSnapshot(order.id, await adapter.submit(intentFromOrder(order)), { adapter });
   } catch (error) {
     /*
@@ -1663,13 +1687,16 @@ export async function reconcilePendingManualOrders(
   const orders = await prisma.manualOrder.findMany({ where: { status: { in: PENDING_STATUSES } },
     include: { exchangeAccount: true }, orderBy: { createdAt: "asc" }, take: Math.min(limit, 100) });
   for (const order of orders) {
+    // R1: the close lock a first submission of a SELL takes, held until its snapshot is applied.
+    const claim: ManualReconcileClaim = { now, lock: { positionId: null } };
     try {
       const adapter = adapterFactory(order.exchangeAccount);
-      const step = await reconcileManualOrderStep(order, adapter, defaultFirstSubmitGate, true);
+      const step = await reconcileManualOrderStep(order, adapter, defaultFirstSubmitGate, claim);
       manualLookupFailures.delete(order.id);
       if (step.kind === "snapshot") {
         const applied = await applyManualSnapshot(order.id, step.snapshot, { adapter });
         await finalizeOnReconcile(applied, adapter);
+        await closeReconciledHaircutRemainder(order, applied, adapter, claim.lock);
       } else if (step.kind === "absent") await closeOffAbsentManualOrder(order, now);
     } catch (error) {
       if (error instanceof ManualHaltRefusal && error.terminal) {
@@ -1687,7 +1714,33 @@ export async function reconcilePendingManualOrders(
       }
       await prisma.manualOrder.update({ where: { id: order.id }, data: {
         error: `reconciliation pending: ${error instanceof Error ? error.message : "unknown error"}` }});
+    } finally {
+      if (claim.lock.positionId) releaseTradeClose(claim.lock.positionId);
     }
+  }
+}
+
+/**
+ * Re-review F3 (2026-11-09): a haircut exit whose outcome was uncertain and is
+ * booked here closes what it deliberately left (the presumed commission of
+ * gross entry fills), exactly as `resolveUnresolvedManualExits` does when the
+ * other exit owner books it. Otherwise a later exit of that remainder takes a
+ * second haircut out of the owner's untracked coins. Under the position's
+ * close lock; held by another exit right now, the remainder stays tracked.
+ */
+async function closeReconciledHaircutRemainder(order: ManualOrder, applied: ManualOrder,
+  adapter: ManualExchangeAdapter, lock: { positionId: string | null }): Promise<void> {
+  const positionId = applied.linkedPositionId;
+  if (applied.side !== "SELL" || applied.status !== "filled" || !positionId) return;
+  const own = lock.positionId === positionId;
+  if (!own && !acquireTradeClose(positionId)) return;
+  try {
+    const attempt = await prisma.exchangeOrderAttempt.findUnique({ where: { clientOrderId: applied.clientOrderId } });
+    // The origin from the row as it was: a snapshot overwrites `protectionState`.
+    await closeHaircutRemainder(applied, adapter,
+      { closedReason: attempt?.closedReason, origin: manualOrderOrigin(order) });
+  } finally {
+    if (!own) releaseTradeClose(positionId);
   }
 }
 
@@ -1790,7 +1843,7 @@ export async function reconcileOneManualOrder(
   // The pure form: no compare-and-set and no recording, so a lifecycle check
   // needs no database. The reconciler loop uses the claiming form below.
   try {
-    const step = await reconcileManualOrderStep(order, adapter, assertMayFirstSubmit, false);
+    const step = await reconcileManualOrderStep(order, adapter, assertMayFirstSubmit, null);
     return step.kind === "snapshot" ? step.snapshot : null;
   } catch (error) {
     throw error instanceof ManualLookupError ? error.original : error;
@@ -1804,11 +1857,98 @@ type ManualReconcileStep =
   /** Nothing left to apply: another worker owns it, or a failed submit was recorded. */
   | { kind: "handled" };
 
+/** The reconciler loop's claiming form of a step: its clock, and the close lock a SELL may take (R1). */
+interface ManualReconcileClaim {
+  now: number;
+  /** Set when the step took a position's close lock; the loop releases it after applying the snapshot. */
+  lock: { positionId: string | null };
+}
+
+/**
+ * Re-review R1 (2026-11-09): a `requested` SELL of a tracked position has not
+ * crossed the wire, but its stored quantity is no evidence any more. Another
+ * exit may have closed or reduced the position since it was reserved: the
+ * TP/SL poller (F1 does not see `requested` rows), or the operator under a new
+ * request id. Sent as stored, it is a second wire SELL out of untracked coins.
+ * So before the first submission:
+ *   - position no longer active: compare-and-set `requested` -> `rejected`
+ *     (NEVER SENT) and abandon its exit attempt, if any. The poller re-arms
+ *     its own slot and the operator can re-issue, so no exit is lost;
+ *   - otherwise, under the position's close lock (held elsewhere: not this
+ *     cycle), every other `submitted` SELL of it is resolved query-first
+ *     (still unresolved: not this cycle), and the quantity is capped at what
+ *     the position holds now (the F3 haircut when that is all of a gross
+ *     position) and at what I3 attributes to it.
+ * Returns what to send, or null when nothing may be sent this cycle.
+ */
+async function sizeRequestedManualExit(order: ManualOrder & { linkedPositionId: string },
+  adapter: ManualExchangeAdapter, claim: ManualReconcileClaim):
+  Promise<{ quantity: number; note: string | null } | null> {
+  const positionId = order.linkedPositionId;
+  const neverSent = async (why: string): Promise<null> => {
+    const rejected = await prisma.manualOrder.updateMany({ where: { id: order.id, status: "requested" }, data: {
+      status: "rejected", completedAt: new Date(),
+      error: withDurableFlag(`NEVER SENT: ${why}, so this SELL was not placed (it would have sold coins no ` +
+        "position holds). Re-issue a SELL if one is still wanted.", order.error) } });
+    if (rejected.count === 1) {
+      const attempt = await prisma.exchangeOrderAttempt.findUnique({ where: { clientOrderId: order.clientOrderId } });
+      if (attempt) await abandonOrderAttempt(attempt.id, "NEVER_SENT");
+    }
+    return null;
+  };
+  const closedBy = `position ${positionId} was closed by another exit before this SELL reached the exchange`;
+  let position = await prisma.smartTrade.findUnique({ where: { id: positionId } });
+  if (position?.status !== "active") return neverSent(closedBy);
+  if (!acquireTradeClose(positionId)) return null;
+  claim.lock.positionId = positionId;
+  const prior = await resolveUnresolvedManualExits(positionId, adapter,
+    { now: claim.now, skip: (row) => row.id === order.id });
+  if (prior.blocked) {
+    if (!durableFlag(order.error)) {
+      await prisma.manualOrder.updateMany({ where: { id: order.id, status: "requested" }, data: {
+        error: `reconciliation pending: not sent while another exit of position ${positionId} is ` +
+          `unresolved (${prior.reason})` } });
+    }
+    return null;
+  }
+  position = await prisma.smartTrade.findUnique({ where: { id: positionId } });
+  if (position?.status !== "active") return neverSent(closedBy);
+  const stored = order.requestedBaseQty ?? 0;
+  let cap = position.quantity;
+  let note: string | null = null;
+  if (stored >= position.quantity * (1 - 1e-9)) {
+    // All of what remains: F3 applies to a gross position as on every full exit.
+    const netting = await haircutForUnnettedEntry(position, adapter);
+    const fresh = netting.position;
+    if (fresh?.status !== "active") return neverSent(closedBy);
+    position = fresh;
+    cap = netting.sizeCap ?? fresh.quantity;
+    note = netting.flag;
+  }
+  const free = adapter.baseFree ? await adapter.baseFree(order.symbol) : Number.POSITIVE_INFINITY;
+  const { capacity } = await manualExitCapacity(position, order.exchangeAccountId, free);
+  const quantity = Math.min(stored, cap, capacity);
+  if (!(quantity > 0)) {
+    return neverSent(`nothing of position ${positionId} is attributable to it now (free balance ${free}, ` +
+      `position ${fmtQty(position.quantity)})`);
+  }
+  if (quantity < stored - QTY_EPSILON) {
+    console.error(`[manual-reconcile] ${order.clientOrderId}: the requested SELL of ${fmtQty(stored)} is sent ` +
+      `capped at ${fmtQty(quantity)}: what position ${positionId} holds now and the free balance attributable ` +
+      "to it (I3)");
+  }
+  return { quantity, note };
+}
+
 async function reconcileManualOrderStep(
   order: ManualOrder, adapter: ManualExchangeAdapter,
   assertMayFirstSubmit: (o: ManualOrder) => Promise<unknown>,
-  /** Claim the row (requested -> submitted) before submitting, and record a failed submit. */
-  claim: boolean
+  /**
+   * The loop's form: claim the row (requested -> submitted) before submitting,
+   * size a SELL by its position first (R1), and record a failed submit. Null
+   * is the pure form (no database), which only tests use.
+   */
+  claim: ManualReconcileClaim | null
 ): Promise<ManualReconcileStep> {
   let found: ManualOrderSnapshot | null;
   try {
@@ -1834,17 +1974,27 @@ async function reconcileManualOrderStep(
    */
   await assertMayFirstSubmit(order);
   if (!claim) return { kind: "snapshot", snapshot: await adapter.submit(intentFromOrder(order)) };
+  let intent = intentFromOrder(order);
+  let sized: { quantity: number; note: string | null } | null = null;
+  if (order.side === "SELL" && order.linkedPositionId) {
+    sized = await sizeRequestedManualExit({ ...order, linkedPositionId: order.linkedPositionId }, adapter, claim);
+    if (!sized) return { kind: "handled" };
+    intent = { ...intent, baseQuantity: sized.quantity };
+  }
   /*
    * D1/I6: compare-and-set `requested` -> `submitted` BEFORE the wire call, as
    * `submitManualOrder` and the strategy path do. Two overlapping reconcilers
    * (or the protection poller) can no longer both submit the same row, and a
-   * row that crossed the wire can never again read `requested`.
+   * row that crossed the wire can never again read `requested`. R1: it
+   * records the quantity actually sent.
    */
   const claimed = await prisma.manualOrder.updateMany({ where: { id: order.id, status: "requested" },
-    data: { status: "submitted", submittedAt: new Date() } });
+    data: { status: "submitted", submittedAt: new Date(),
+      ...(sized ? { requestedBaseQty: sized.quantity } : {}),
+      ...(sized?.note ? { error: withDurableFlag(sized.note, order.error) } : {}) } });
   if (claimed.count !== 1) return { kind: "handled" };
   try {
-    return { kind: "snapshot", snapshot: await adapter.submit(intentFromOrder(order)) };
+    return { kind: "snapshot", snapshot: await adapter.submit(intent) };
   } catch (error) {
     await recordManualSubmitFailure(order.id, error);
     return { kind: "handled" };

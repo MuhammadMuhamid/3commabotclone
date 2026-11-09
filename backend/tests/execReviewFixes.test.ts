@@ -16,6 +16,15 @@
  *   F4/F6/F7  the RACE FILL wording after a failed refresh, C0
  *       `entries.uncertainBuyOrders`, and durable flags appended, not replaced.
  *
+ * Re-review of bd2990a:
+ *   R1  a `requested` SELL of a tracked position (never sent) is not
+ *       first-submitted by the reconciler past its position: closed -> rejected
+ *       NEVER SENT; otherwise under the close lock, after the other exits are
+ *       resolved, capped at what the position holds (and I3). Probe P7.
+ *   CAS the submit path's own requested -> submitted is a compare-and-set.
+ *   F3  the reconciler closes a haircut exit's remainder; a haircut that floors
+ *       to 0 is refused 409 `haircut_below_lot`.
+ *
  * The probes of the review (`tmp/review-exec/backend/tests/zz_review_probe.test.ts`)
  * are reused here with the expectation the review asked for.
  * Real services + disposable SQLite + the in-memory fake exchange. No network.
@@ -44,6 +53,7 @@ const { checkManualProtection, PROTECTION_FAILURE_ALERT_CYCLES } =
   await import("../src/services/manualProtection.js");
 const risk = await import("../src/services/riskControls.js");
 const lock = await import("../src/lib/tradeCloseLock.js");
+const { openOrderAttempt } = await import("../src/services/orderAttempt.js");
 
 type Factory = (account: ExchangeAccount) => InstanceType<typeof BinanceManualExchange>;
 const reconcile = manual.reconcilePendingManualOrders as unknown as
@@ -545,3 +555,217 @@ test("F7: the dust note and the SWEEP FAILED hand-off keep the durable flag alre
   assert.match(handed, /^SWEEP FAILED/);
   assert.match(handed, /NETTING UNCONFIRMED/);
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// Re-review R1 — a `requested` SELL is never first-submitted past its position
+// ════════════════════════════════════════════════════════════════════════════
+
+/** A SELL reserved but never sent: a crash between the reservation and its `submitted` update. */
+async function strandedSell(account: ExchangeAccount, positionId: string, quantity: number, tag: string,
+  extra: { requestId?: string; clientOrderId?: string; protectionType?: string; protectionState?: string;
+    createdAt?: Date } = {}) {
+  return prisma.manualOrder.create({ data: { requestId: `rr-${tag}`, exchangeAccountId: account.id,
+    linkedPositionId: positionId, symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", quantityType: "base",
+    requestedBaseQty: quantity, protectionState: "none", clientOrderId: `rr-${tag}-cid`, ...extra } });
+}
+
+test("R1 P7: a `requested` operator SELL (one failed lookup), then the TP poller closes the position -> the reconciler rejects the stale SELL as never sent; one wire SELL; the untracked 5 untouched",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "5.4" });
+    const target = await protectedPosition(account, 0.4);
+    const stale = await strandedSell(account, target.id, 0.4, "p7");
+    const failing = failNextLookups(exchange, 1);
+    await reconcile(factory(exchange)); // the lookup fails: it stays requested
+    failing.restore();
+    assert.equal((await reload.order(stale.id)).status, "requested");
+    exchange.setPrice("111");
+    await poll(factory(exchange)); // the TP exit; F1 does not see a `requested` row
+    assert.equal((await reload.trade(target.id)).status, "closed");
+
+    await reconcile(factory(exchange));
+    assert.equal(sells(exchange).length, 1, "one wire SELL for one 0.4 position");
+    near(exchange.wallet.free, 5.0, "the untracked 5 are untouched");
+    const rejected = await reload.order(stale.id);
+    assert.equal(rejected.status, "rejected");
+    assert.equal(rejected.submittedAt, null, "never sent");
+    assert.match(rejected.error ?? "", /^NEVER SENT: position .* was closed by another exit/);
+    assert.equal(lock.heldLockCount(), 0);
+    await reconcile(factory(exchange));
+    assert.equal(sells(exchange).length, 1);
+  });
+
+test("R1: an automated TP exit held `requested` through a halt while the operator sells the position by hand -> on resume it is rejected, never sent, its attempt abandoned; one wire SELL",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "5.4" });
+    const target = await protectedPosition(account, 0.4);
+    const intentKey = `manual-tp-${target.id}-110`;
+    const attempt = await openOrderAttempt({ intentKey, symbol: "BTCUSDT", side: "SELL", smartTradeId: target.id,
+      origin: "manual-protection", requestedBaseQty: 0.4, closedReason: "manual_take_profit" });
+    const held = await strandedSell(account, target.id, 0.4, "auto", { requestId: `${intentKey}#${attempt.attempt}`,
+      clientOrderId: attempt.clientOrderId, protectionType: "bot-managed", protectionState: "triggered" });
+    await risk.setBotTradingHalted(true, { by: "operator", reason: "re-review" });
+    await reconcile(factory(exchange));
+    assert.equal((await reload.order(held.id)).status, "requested", "an automated exit waits out the halt");
+    const sell = await manual.submitManualOrder({ requestId: "rr-auto-operator", accountId: account.id,
+      symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", positionFull: true, positionId: target.id },
+    factory(exchange));
+    assert.equal(sell.status, "filled");
+    assert.equal((await reload.trade(target.id)).status, "closed");
+
+    await risk.setBotTradingHalted(false, { by: "operator" });
+    await reconcile(factory(exchange));
+    assert.equal(sells(exchange).length, 1, "the held exit never reaches the wire");
+    near(exchange.wallet.free, 5.0, "the untracked 5 are untouched");
+    const rejected = await reload.order(held.id);
+    assert.equal(rejected.status, "rejected");
+    assert.match(rejected.error ?? "", /^NEVER SENT/);
+    assert.equal((await prisma.exchangeOrderAttempt.findUniqueOrThrow({ where: { id: attempt.id } })).status,
+      "abandoned", "the poller's slot re-arms");
+    assert.equal(lock.heldLockCount(), 0);
+  });
+
+test("R1: a `requested` SELL of 0.4 whose position the operator has since reduced to 0.25 -> first-submitted for the 0.25 it still holds; the untracked 5 untouched",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "5.4" });
+    const target = await protectedPosition(account, 0.4);
+    const stale = await strandedSell(account, target.id, 0.4, "cap");
+    const partial = await manual.submitManualOrder({ requestId: "rr-cap-partial", accountId: account.id,
+      symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", baseQuantity: 0.15, positionId: target.id },
+    factory(exchange));
+    assert.equal(partial.status, "filled");
+    near((await reload.trade(target.id)).quantity, 0.25);
+
+    await reconcile(factory(exchange));
+    assert.equal(sells(exchange).length, 2);
+    near(Number(sells(exchange)[1]!.executedQty), 0.25, "capped at what the position holds now");
+    near(exchange.wallet.free, 5.0, "the untracked 5 are untouched");
+    const sent = await reload.order(stale.id);
+    assert.equal(sent.status, "filled");
+    near(sent.requestedBaseQty ?? 0, 0.25, "the durable row says what was sent");
+    assert.equal((await reload.trade(target.id)).status, "closed");
+    assert.equal(lock.heldLockCount(), 0);
+  });
+
+test("R1: while another exit holds the position's close lock a `requested` SELL is not sent; it goes out on the next cycle",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "5.4" });
+    const target = await protectedPosition(account, 0.4);
+    const stale = await strandedSell(account, target.id, 0.4, "busy");
+    assert.ok(lock.acquireTradeClose(target.id));
+    try {
+      await reconcile(factory(exchange));
+    } finally {
+      lock.releaseTradeClose(target.id);
+    }
+    assert.equal(sells(exchange).length, 0, "skipped while another exit owns the position");
+    assert.equal((await reload.order(stale.id)).status, "requested");
+    await reconcile(factory(exchange));
+    assert.equal(sells(exchange).length, 1);
+    near(exchange.wallet.free, 5.0);
+    assert.equal((await reload.order(stale.id)).status, "filled");
+    assert.equal(lock.heldLockCount(), 0);
+  });
+
+test("R1: another SELL of the position left `submitted` and not yet found blocks a `requested` SELL; once it is closed off ABSENT the requested SELL goes out once",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "5.4" });
+    const target = await protectedPosition(account, 0.4);
+    const prior = await strandedSell(account, target.id, 0.4, "prior", { createdAt: new Date(Date.now() - 1_000) });
+    await prisma.manualOrder.update({ where: { id: prior.id }, data: { status: "submitted", submittedAt: new Date() } });
+    const stale = await strandedSell(account, target.id, 0.4, "blocked");
+    await reconcile(factory(exchange));
+    assert.equal(sells(exchange).length, 0, "no SELL while another exit of the position may be live");
+    assert.equal((await reload.order(stale.id)).status, "requested");
+
+    await reconcile(factory(exchange), 100, { now: Date.now() + 61_000 });
+    assert.equal((await reload.order(prior.id)).status, "rejected");
+    assert.equal(sells(exchange).length, 1);
+    near(exchange.wallet.free, 5.0);
+    assert.equal((await reload.order(stale.id)).status, "filled");
+    assert.equal(lock.heldLockCount(), 0);
+  });
+
+test("Re-review advisory: a reconcile tick between the reservation and the submit path's own claim -> that claim is a compare-and-set; one wire SELL under one client order id",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    // Binance may accept a reused client order id once the earlier order FILLED.
+    const exchange = fakeBinance({ freeBase: "5.4", reuseAfterFill: true });
+    const target = await protectedPosition(account, 0.4);
+    const delegate = prisma.manualOrder as unknown as { create: (args: unknown) => Promise<{ requestId: string }> };
+    const create = delegate.create;
+    delegate.create = async (args) => {
+      const row = await create.call(delegate, args);
+      if (row.requestId === "rr-cas") await reconcile(factory(exchange)); // the tick lands here
+      return row;
+    };
+    let sell;
+    try {
+      sell = await manual.submitManualOrder({ requestId: "rr-cas", accountId: account.id, symbol: "BTCUSDT",
+        side: "SELL", orderType: "MARKET", baseQuantity: 0.1, positionId: target.id }, factory(exchange));
+    } finally {
+      delegate.create = create;
+    }
+    assert.equal(sells(exchange).length, 1, "one wire SELL under one client order id");
+    near(exchange.wallet.free, 5.3);
+    assert.equal(sell.status, "filled");
+    near((await reload.trade(target.id)).quantity, 0.3);
+    assert.equal(lock.heldLockCount(), 0);
+  });
+
+test("F3 (re-review): an uncertain haircut exit later booked by the reconciler closes the presumed-commission remainder; a later TP sells nothing",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    // 40.5 BTC booked gross; its haircut exit, floor(40.4595 to the 0.01 lot) = 40.45, FILLED at the
+    // exchange and its reply was lost. The 0.05 left is above the 0.1 % close tolerance of a fill.
+    const exchange = fakeBinance({ freeBase: "5", buyCommissionRate: 0.001, myTradesFails: true,
+      stepSize: "0.01", minQty: "0.01" });
+    const { trade } = await grossEntry(account, exchange, 40.5, "FILLED");
+    const exit = await prisma.manualOrder.create({ data: { requestId: "rr-f3-exit", exchangeAccountId: account.id,
+      linkedPositionId: trade.id, symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", quantityType: "base",
+      requestedBaseQty: 40.45, protectionState: "none", status: "submitted", submittedAt: new Date(),
+      clientOrderId: "rr-f3-exit-cid" } });
+    exchange.seed({ clientOrderId: "rr-f3-exit-cid", orderId: "900001", side: "SELL", type: "MARKET",
+      status: "FILLED", executedQty: "40.45", cummulativeQuoteQty: "4045" });
+
+    await reconcile(factory(exchange));
+    assert.equal((await reload.order(exit.id)).status, "filled");
+    const closed = await reload.trade(trade.id);
+    assert.equal(closed.status, "closed", "the 0.05 left is the presumed commission, not a position");
+    assert.equal(closed.closedReason, "manual_sell");
+    exchange.setPrice("111");
+    await poll(factory(exchange));
+    assert.equal(sells(exchange).length, 0, "nothing is sold out of the untracked coins");
+    near(exchange.wallet.free, 5.0);
+    assert.equal(lock.heldLockCount(), 0);
+  });
+
+test("F3 (re-review nit): a positionFull SELL whose haircut floors to 0 at the lot is refused 409 haircut_below_lot, not 422 'position not found'; nothing placed",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "5.0001", buyCommissionRate: 0.001, myTradesFails: true });
+    const { trade } = await grossEntry(account, exchange, 0.0001, "FILLED");
+    await assert.rejects(manual.submitManualOrder({ requestId: "rr-f3-zero", accountId: account.id,
+      symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", positionFull: true, positionId: trade.id },
+    factory(exchange)), (error: unknown) => {
+      refusal("haircut_below_lot")(error);
+      assert.match((error as Error).message, /floors to 0 at the exchange lot step/);
+      return true;
+    });
+    assert.equal(sells(exchange).length, 0);
+    assert.equal(await prisma.manualOrder.count({ where: { requestId: "rr-f3-zero" } }), 0, "nothing reserved");
+    assert.equal((await reload.trade(trade.id)).status, "active", "still tracked");
+    assert.equal(lock.heldLockCount(), 0);
+  });
