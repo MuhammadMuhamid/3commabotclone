@@ -34,7 +34,7 @@ import { prisma } from "../lib/prisma.js";
 import { normalizeSymbol } from "../lib/symbols.js";
 import { acquireTradeClose, isTradeClosing, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import {
-  clientFromAccount, clientFromEnv, ExchangeError, marketSellBase, MinNotionalError,
+  classifyExchangeFailure, clientFromAccount, clientFromEnv, marketSellBase, MinNotionalError,
   resolveSellQuantity, type BinanceClient,
 } from "./binance.js";
 import { config } from "../config.js";
@@ -361,13 +361,14 @@ export async function partialCloseStrategyTrade(
         explicitClientOrderId: attempt.clientOrderId,
       });
     } catch (error) {
-      // The same split the strategy-intent reconciler draws: a coded exchange
-      // rejection or a minimum-notional refusal placed nothing; anything else
-      // (transport failure, timeout) is an order of unknown outcome.
-      if ((error instanceof ExchangeError && error.code !== undefined) || error instanceof MinNotionalError) {
+      // The shared D2 classifier decides: only a DEFINITE rejection (or a
+      // pre-wire refusal such as minimum notional) placed nothing. A coded but
+      // uncertain answer (-1006/-1007/5xx) or a transport failure is an order
+      // of unknown outcome, reconciled by the attempt's client order id.
+      if (classifyExchangeFailure(error).outcome === "rejected" || error instanceof MinNotionalError) {
         throw new ControlRefusal(422, "exchange_rejected",
           "The exchange rejected this partial close; no order was executed.",
-          error.message);
+          error instanceof Error ? error.message : String(error));
       }
       throw new ControlPending({ attemptId: attempt.id },
         "The partial-close order was submitted and its outcome is not yet known; " +

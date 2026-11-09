@@ -181,6 +181,8 @@ interface FakeExchange { client: BinanceClient; submissions: Record<string, unkn
 function fakeExchange(opts: {
   price?: string;
   failOrders?: boolean;
+  /** Integration: throw this Binance-shaped error from order() instead of filling. */
+  orderError?: () => unknown;
   seed?: { clientOrderId: string; status: string; side?: string }[];
 } = {}): FakeExchange {
   const submissions: Record<string, unknown>[] = [];
@@ -203,6 +205,7 @@ function fakeExchange(opts: {
       submissions.push(payload);
       // A transport failure of unknown outcome: no Binance error code.
       if (opts.failOrders) throw new Error("socket hang up");
+      if (opts.orderError) throw opts.orderError();
       n += 1;
       const cid = String(payload.newClientOrderId ?? "");
       const order = { orderId: `ex-${n}`, clientOrderId: cid, side: payload.side, status: "FILLED",
@@ -829,6 +832,37 @@ test("C7: an order of unknown outcome is 202 pending with the attempt id; C8 rep
   assert.equal((c8.body.live as Record<string, unknown>).kind, "exit_attempt");
   assert.equal((c8.body.live as Record<string, unknown>).outcome, "pending");
   assert.equal(heldLockCount(), 0);
+});
+
+// Integration (exec × cmd): C7 must use the shared D2 classifier. A CODED but
+// uncertain answer (-1007 "execution status unknown") is pending, never
+// "exchange rejected; no order was executed". A definite code stays a refusal.
+test("C7 × D2: a coded uncertain answer (-1007) is 202 pending, not exchange_rejected", async () => {
+  const exchange = fakeExchange({ orderError: () => Object.assign(
+    new Error("Timeout waiting for response from backend server. Send status unknown; execution status unknown."),
+    { code: -1007 }) });
+  useExchange(exchange);
+  const bot = await createBot();
+  const trade = await createTrade(bot);
+  const requestId = newRequestId();
+  const r = await post(`/trades/${trade.id}/partial-close`, { pct: 50, actor: ACTOR }, requestId);
+  assert.equal(r.status, 202, JSON.stringify(r.body));
+  assert.equal(r.body.status, "pending");
+  assert.notEqual(r.body.code, "exchange_rejected");
+  const c8 = await get(`/commands/${requestId}`);
+  assert.equal((c8.body.live as Record<string, unknown>).outcome, "pending");
+  assert.equal(heldLockCount(), 0);
+});
+
+test("C7 × D2: a definite rejection (-2010 insufficient balance) stays 422 exchange_rejected", async () => {
+  const exchange = fakeExchange({ orderError: () => Object.assign(
+    new Error("Account has insufficient balance for requested action."), { code: -2010 }) });
+  useExchange(exchange);
+  const bot = await createBot();
+  const trade = await createTrade(bot);
+  const r = await post(`/trades/${trade.id}/partial-close`, { pct: 50, actor: ACTOR });
+  assert.equal(r.status, 422, JSON.stringify(r.body));
+  assert.equal(r.body.code, "exchange_rejected");
 });
 
 // ════════════════════════════════════════════════════════════════════════════
