@@ -17,6 +17,7 @@ import {
 } from "../services/shariah.js";
 import { SHARIAH_POLICY_VERSION } from "../contract/webhookContract.js";
 import { manualControlRouter } from "./manualControl.js";
+import { manualControlManageRouter } from "./manualControlManage.js";
 
 export const manualTradingRouter = Router();
 /*
@@ -40,6 +41,9 @@ manualTradingRouter.use(requireManualAuth);
  * trading off. See `manualControl.ts`.
  */
 manualTradingRouter.use("/control", manualControlRouter);
+// Contract v2.0 (Slice 2): bots, exchange accounts, enrollment tickets.
+// Same position, same inheritance. See `manualControlManage.ts`.
+manualTradingRouter.use("/control", manualControlManageRouter);
 
 const positive = z.number().finite().positive();
 const optionalPrice = positive.nullable().optional();
