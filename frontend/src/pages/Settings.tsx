@@ -9,7 +9,13 @@ export default function Settings() {
   const [name, setName] = useState("My Binance");
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
-  const [testnet, setTestnet] = useState(false);
+  /*
+   * U5: testnet first. This defaulted to false, so an unticked form created a
+   * MAINNET account — inside an installation that runs on testnet. Mainnet is
+   * now a deliberate choice: untick, then type MAINNET.
+   */
+  const [testnet, setTestnet] = useState(true);
+  const [mainnetConfirmation, setMainnetConfirmation] = useState("");
   const [saving, setSaving] = useState(false);
   const [pushSupported] = useState(() => "serviceWorker" in navigator && "PushManager" in window);
   const [pushConfigured, setPushConfigured] = useState(false);
@@ -76,15 +82,22 @@ export default function Settings() {
     } finally { setPushBusy(false); }
   };
 
+  const mainnetConfirmed = testnet || mainnetConfirmation === "MAINNET";
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!mainnetConfirmed) {
+      toast('Type MAINNET to connect a mainnet (real-money) account.', "error");
+      return;
+    }
     setSaving(true);
     try {
       await api.exchange.create({ name, apiKey, apiSecret, testnet });
       setApiKey("");
       setApiSecret("");
       setName("My Binance");
-      setTestnet(false);
+      setTestnet(true);
+      setMainnetConfirmation("");
       toast("Exchange account connected.", "success");
       load();
     } catch (err) {
@@ -192,7 +205,22 @@ export default function Settings() {
           </div>
         </label>
 
-        <Btn primary type="submit" loading={saving} className="w-full justify-center">
+        {!testnet && (
+          <div className="mb-5 px-3 py-3 rounded-lg bg-[var(--color-danger-dim)] border border-[var(--color-danger)]/30">
+            <p className="text-xs text-[var(--color-danger)] mb-2 leading-relaxed">
+              <strong>Mainnet:</strong> bots using this account place real-money orders on Binance.
+              Type <code>MAINNET</code> to confirm.
+            </p>
+            <Input
+              label="Mainnet confirmation"
+              value={mainnetConfirmation}
+              onChange={setMainnetConfirmation}
+              placeholder="MAINNET"
+            />
+          </div>
+        )}
+
+        <Btn primary type="submit" loading={saving} disabled={!mainnetConfirmed} className="w-full justify-center">
           <Plus size={14} />
           {saving ? "Connecting…" : "Connect Exchange Account"}
         </Btn>

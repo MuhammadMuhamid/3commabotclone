@@ -36,8 +36,13 @@ export default function CreateBot() {
   if (created) {
     // The creation response is the one place the secret is served unprompted:
     // this is the only moment the operator has to copy it out.
-    const entryJson = JSON.stringify(created.entryWebhookJson ?? {}, null, 2);
-    const exitJson  = JSON.stringify(created.exitWebhookJson ?? {}, null, 2);
+    //
+    // U4: there is no entry-signal JSON. Direct TradingView BUY alerts are
+    // disabled — the Platform is the sole BUY authority — so the backend never
+    // sends an entry payload, and rendering one showed an empty `{}` with
+    // instructions for a path that is refused.
+    const exitJson = JSON.stringify(created.exitWebhookJson ?? {}, null, 2);
+    const setup = created.tradingViewSetup;
     return (
       <div className="p-6 max-w-3xl mx-auto">
         {/* Success banner */}
@@ -46,30 +51,32 @@ export default function CreateBot() {
           <div>
             <p className="text-sm font-semibold text-[var(--color-success)]">Bot created!</p>
             <p className="text-xs text-[var(--color-muted)] mt-0.5">
-              Configure your TradingView alerts with the details below.
+              Copy the webhook secret now; afterwards it is shown only on an explicit Reveal.
             </p>
           </div>
         </div>
 
         <Section
           title="Webhook Setup"
-          desc="Copy these into your TradingView alert settings."
+          desc="Entries come from Trading Scene. TradingView may send exit (SELL) alerts only."
           side={<Webhook size={16} className="text-[var(--color-muted)] mt-2" />}
         >
           <CopyField label="Webhook URL" value={created.webhookUrl} />
-          <p className="text-xs text-[var(--color-muted)] mb-5 leading-relaxed">
-            Paste this URL into the <strong className="text-white">Webhook URL</strong> field of your
-            TradingView alert. Set the alert condition to{" "}
-            <strong className="text-white">alert() function calls only</strong>.
-          </p>
+          <CopyField
+            label="Webhook secret — paste into the Trading Scene deployment"
+            value={created.webhookSecret}
+          />
+          {setup && (
+            <p className="text-xs text-[var(--color-muted)] mb-5 leading-relaxed">
+              {setup.note}
+            </p>
+          )}
 
-          <CopyField label="Entry signal JSON (paste into Message field)" value={entryJson} />
-          <p className="text-xs text-[var(--color-muted)] mb-5 leading-relaxed">
-            Use <code className="text-[var(--color-accent)]">{"{{strategy.order.action}}"}</code> for the action and{" "}
-            <code className="text-[var(--color-accent)]">{"{{ticker}}"}</code> for the symbol — TradingView fills these at alert time.
+          <CopyField label="Optional: TradingView exit (SELL) alert message" value={exitJson} />
+          <p className="text-[11px] text-[var(--color-warning)] leading-relaxed">
+            The secret and this payload are the only authentication on the order-placing
+            endpoint. Do not paste them anywhere but your own deployment and alert.
           </p>
-
-          <CopyField label="Exit signal JSON (optional separate alert)" value={exitJson} />
         </Section>
 
         <div className="flex gap-3 justify-end mt-2">

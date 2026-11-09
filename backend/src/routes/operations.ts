@@ -18,8 +18,8 @@ import { Router } from "express";
 import { z } from "zod";
 import { config } from "../config.js";
 import {
-  describeBotRiskState, getBotRiskLimits, readBotRiskSnapshot,
-  setBotTradingHalted, updateBotRiskLimits,
+  describeBotRiskState, getBotRiskLimits, haltBotTrading, readBotRiskSnapshot,
+  resumeBotTrading, updateBotRiskLimits,
 } from "../services/riskControls.js";
 import { EXCHANGE_STOPS_STATUS, exchangeStopsEnabled } from "../services/exchangeStops.js";
 import { asyncHandler } from "../middleware/errors.js";
@@ -33,9 +33,12 @@ const RESUME_CONFIRMATION = "RESUME_TRADING";
 /**
  * The one screen an operator needs.
  *
- * `mode` is the honest three-state answer: DRY_RUN means nothing reaches the
- * exchange, HALTED means orders are refused, LIVE means a webhook will place a
- * real order. It was previously only inferable from `/api/config`.
+ * `mode` is the three-state answer: DRY_RUN means nothing reaches the
+ * exchange, HALTED means the automation is stopped in both directions (signals,
+ * TradingView exits and the TP/SL monitors) while the operator's own exits —
+ * Close, Partial, manual SELL — still pass, LIVE means a webhook will place a
+ * real order. DRY_RUN outranks HALTED in `mode`, so the halt itself is read from
+ * `risk.tradingHalted`, which a dry run does not mask (finding 0.4).
  */
 operationsRouter.get(
   "/status",
@@ -134,9 +137,19 @@ operationsRouter.post(
       res.status(400).json({ error: parsed.error.errors[0]?.message ?? "Invalid request" });
       return;
     }
-    await setBotTradingHalted(true, { reason: parsed.data.reason, by: "operator" });
-    console.error(`[risk] TRADING HALTED by operator: ${parsed.data.reason}`);
-    res.json({ halted: true, reason: parsed.data.reason });
+    // Finding 0.3: an existing halt — above all a daily-loss latch — is kept
+    // and reported, never replaced, so resume still judges the original halt.
+    const { alreadyHalted, state } = await haltBotTrading({ reason: parsed.data.reason, by: "operator" });
+    if (alreadyHalted) {
+      console.warn(`[risk] halt requested while already halted (${state.haltedBy ?? "unknown"}); kept`);
+    } else {
+      console.error(`[risk] TRADING HALTED by operator: ${parsed.data.reason}`);
+    }
+    res.json({
+      halted: true, alreadyHalted,
+      haltedBy: state.haltedBy, reason: state.haltedReason,
+      haltedAt: state.haltedAt?.toISOString() ?? null,
+    });
   })
 );
 
@@ -154,31 +167,21 @@ operationsRouter.post(
       return;
     }
 
-    const before = await getBotRiskLimits();
-    if (!before.tradingHalted) {
+    // The same implementation the Platform's signed resume uses, so the two
+    // can never disagree about when a latched halt may be lifted.
+    const outcome = await resumeBotTrading();
+    if (!outcome.ok) {
+      res.status(409).json({ error: outcome.message, code: outcome.code });
+      return;
+    }
+    if (!outcome.wasHalted) {
       res.json({ halted: false, note: "trading was not halted" });
       return;
     }
-
-    // A latched daily-loss halt is re-checked against live numbers: resuming
-    // straight back into a breached limit would trip again on the next entry.
-    if (before.haltedBy === "daily_loss" && before.maxDailyLossQuote !== null) {
-      const snapshot = await readBotRiskSnapshot(before.dailyLossWindowHours);
-      const loss = -Math.min(0, snapshot.realisedPnlInWindow);
-      if (loss >= before.maxDailyLossQuote) {
-        res.status(409).json({
-          error:
-            `refusing to resume: the rolling ${before.dailyLossWindowHours}h loss ` +
-            `${loss.toFixed(2)} still meets the limit ${before.maxDailyLossQuote.toFixed(2)}. ` +
-            "Raise the limit deliberately, or wait for the window to roll.",
-        });
-        return;
-      }
-    }
-
-    await setBotTradingHalted(false);
-    console.warn(`[risk] trading RESUMED by operator (was: ${before.haltedReason ?? "no reason"})`);
-    res.json({ halted: false, previousReason: before.haltedReason });
+    console.warn(`[risk] trading RESUMED by operator (was: ${outcome.previousReason ?? "no reason"})`);
+    res.json({
+      halted: false, previousHaltedBy: outcome.previousHaltedBy, previousReason: outcome.previousReason,
+    });
   })
 );
 

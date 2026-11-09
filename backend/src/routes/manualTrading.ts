@@ -16,6 +16,7 @@ import {
   readInstallationShariahMode, setInstallationShariahMode, ShariahEnforcementError,
 } from "../services/shariah.js";
 import { SHARIAH_POLICY_VERSION } from "../contract/webhookContract.js";
+import { manualControlRouter } from "./manualControl.js";
 
 export const manualTradingRouter = Router();
 /*
@@ -32,6 +33,13 @@ export const manualTradingRouter = Router();
  */
 manualTradingRouter.use(requireManualTradingFeature);
 manualTradingRouter.use(requireManualAuth);
+/*
+ * The Platform's operator controls (contract v1.2 C0–C8). Mounted after
+ * `requireManualAuth`, so they inherit the HMAC, freshness and single-use
+ * nonce; `/control/*` is control plane, so it stays available with manual
+ * trading off. See `manualControl.ts`.
+ */
+manualTradingRouter.use("/control", manualControlRouter);
 
 const positive = z.number().finite().positive();
 const optionalPrice = positive.nullable().optional();

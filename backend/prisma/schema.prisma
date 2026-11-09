@@ -320,6 +320,47 @@ model ManualCommand {
   updatedAt DateTime @updatedAt
 }
 
+/**
+ * One row per signed Platform control command (`/api/manual-trading/control`).
+ *
+ * The row is CLAIMED before the action runs (insert-first; a duplicate
+ * `requestId` fails on the unique index) and its terminal state is written
+ * when the action ends. A row is never re-run: `processing` answers 409
+ * whatever its age, and a crash that leaves it `processing` is resolved by the
+ * operator issuing a new command with a new request id.
+ *
+ * `commandHash` covers {kind, target, params} and deliberately NOT the actor,
+ * so a retry carrying a fresh step-up timestamp is the same command, while the
+ * same request id with different parameters is refused.
+ *
+ * `pending` means an exchange order was submitted and its outcome is not yet
+ * known; `intentId` / `attemptId` point at the durable order record whose
+ * live state answers the question.
+ *
+ * The actor is a claim signed by the Platform's key, not independent proof.
+ */
+model BotControlCommand {
+  id           String    @id @default(uuid())
+  requestId    String    @unique
+  kind         String
+  target       String
+  commandHash  String
+  actorUserId  String
+  stepUpMethod String
+  stepUpAt     DateTime?
+  status       String    @default("processing")
+  httpStatus   Int?
+  result       String?
+  error        String?
+  code         String?
+  intentId     String?
+  attemptId    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([createdAt])
+}
+
 /** HMAC nonces are persisted so replay protection survives restarts/workers. */
 model ManualNonce {
   nonce     String   @id

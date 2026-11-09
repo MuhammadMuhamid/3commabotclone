@@ -14,6 +14,7 @@ import { authRouter } from "./routes/auth.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { operationsRouter } from "./routes/operations.js";
 import { manualTradingRouter } from "./routes/manualTrading.js";
+import { createControlRateLimiters } from "./routes/manualControl.js";
 import { spotExecutionRouter } from "./routes/spotExecution.js";
 import { derivativeExecutionRouter } from "./routes/derivativeExecution.js";
 import { equityExecutionRouter } from "./routes/equityExecution.js";
@@ -172,7 +173,17 @@ app.post(
 app.use("/api/webhooks", webhookLimiter, webhooksRouter);
 // Separate service-to-service HMAC contract; never accepts strategy body secrets
 // or browser cookies as authentication.
-app.use("/api/manual-trading", apiLimiter, manualTradingRouter);
+//
+// Contract F9: the Platform's operator controls (`/control/*`) get their own
+// limiters and do NOT spend from `apiLimiter`, which manual orders and the
+// Platform's read views share — so that traffic cannot starve a halt. Their
+// 429 carries `code: "bot_rate_limited"`.
+app.use("/api/manual-trading/control", ...createControlRateLimiters());
+app.use(
+  "/api/manual-trading",
+  (req, res, next) => (req.path.startsWith("/control/") ? next() : apiLimiter(req, res, next)),
+  manualTradingRouter
+);
 app.use("/api/spot-execution/v1", apiLimiter, spotExecutionRouter);
 app.use("/api/derivative-execution/v1", apiLimiter, derivativeExecutionRouter);
 app.use("/api/equity-execution/v1", apiLimiter, equityExecutionRouter);

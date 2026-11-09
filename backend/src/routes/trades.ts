@@ -1,47 +1,36 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { acquireTradeClose, isTradeClosing, releaseTradeClose } from "../lib/tradeCloseLock.js";
-import {
-  marketSellBase, resolveSellQuantity, clientFromAccount, clientFromEnv,
-  type BinanceClient,
-} from "../services/binance.js";
-import type { ExchangeAccount } from "@prisma/client";
-import { sendExecutionNotification } from "../services/push.js";
-import { markOrderAttemptSubmitted, openOrderAttempt } from "../services/orderAttempt.js";
-import { applyExitFill, exitAttemptProbe, resolveUnresolvedExitAttempts } from "../services/exitSettlement.js";
-import { config } from "../config.js";
+import { ControlPending, ControlRefusal } from "../services/controlCommands.js";
+import { closeStrategyTrade, partialCloseStrategyTrade } from "../services/tradeExit.js";
 
 export const tradesRouter = Router();
 
-/** The shape the dashboard expects a trade in, after a close changed it. */
-function tradeWithDetail(tradeId: string) {
-  return prisma.smartTrade.findUnique({
-    where: { id: tradeId },
-    include: {
-      bot: { select: { id: true, name: true, exchangeAccount: { select: { name: true } } } },
-      partialCloses: { orderBy: { createdAt: "asc" } },
-    },
-  });
-}
+/*
+ * The exchange-client seam moved with the exit paths to `services/tradeExit.ts`.
+ * Re-exported so existing callers and tests keep one shared object.
+ */
+export { tradeExchangeClient } from "../services/tradeExit.js";
 
 /**
- * How this router obtains an exchange client.
- *
- * A mutable export in the same idiom as `checkTakeProfitStopLoss`'s
- * `resolveClient` option and `reconcilePendingManualOrders`'s `adapterFactory`:
- * an HTTP handler has nowhere to accept an injected dependency, and without a
- * seam the only way to exercise this path is against the real Binance client.
- * Production never reassigns it.
+ * The dashboard's answer for a typed exit outcome. A refusal keeps its code;
+ * its operator `detail` (exchange context) is shown here, on the Bot's own
+ * authenticated dashboard, and never over the Platform control channel.
+ * Anything untyped keeps this route's historical 500 with the message.
  */
-export const tradeExchangeClient = {
-  resolve(bot: { exchangeAccountId: string | null; exchangeAccount: ExchangeAccount | null }):
-  BinanceClient | null {
-    return bot.exchangeAccountId && bot.exchangeAccount
-      ? clientFromAccount(bot.exchangeAccount)
-      : clientFromEnv();
-  },
-};
+function sendExitError(res: Response, e: unknown, fallback: string): void {
+  if (e instanceof ControlRefusal) {
+    res.status(e.status).json({
+      error: e.detail ? `${e.message} (${e.detail})` : e.message, code: e.code,
+    });
+    return;
+  }
+  if (e instanceof ControlPending) {
+    res.status(202).json({ status: "pending", ...e.ref, detail: e.message });
+    return;
+  }
+  res.status(500).json({ error: e instanceof Error ? e.message : fallback });
+}
 
 // Delete a closed trade from history
 tradesRouter.delete("/:id", async (req, res) => {
@@ -87,218 +76,23 @@ tradesRouter.get("/", async (req, res) => {
 
 tradesRouter.post("/:id/close", async (req, res) => {
   try {
-    const trade = await prisma.smartTrade.findUnique({
-      where: { id: req.params.id },
-      include: { bot: true },
-    });
-    if (!trade || trade.status !== "active") {
-      return res.status(400).json({ error: "Trade not active" });
-    }
-    // F5: if the bot was deleted we cannot close via webhook — give clear instructions
-    if (!trade.bot) {
-      return res.status(422).json({
-        error: "This trade's bot was deleted. Close the position directly on Binance.",
-      });
-    }
-    /*
-     * BOT-005: this checked `isTradeClosing` read-only, which reports whether
-     * someone else holds the lock without preventing this path proceeding. A
-     * dashboard close racing the TP/SL monitor issued two market sells.
-     *
-     * `processWebhook` acquires the lock itself for its sell branch, so the
-     * check here is a fast, informative 409 rather than the guarantee — the
-     * guarantee is inside `processWebhook`.
-     */
-    if (isTradeClosing(trade.id)) {
-      return res
-        .status(409)
-        .json({ error: "Trade is already being closed. Please wait." });
-    }
-    const { processWebhook } = await import("../services/webhook.js");
-    const result = await processWebhook(
-      {
-        secret: trade.bot.webhookSecret,
-        action: "SELL",
-        symbol: trade.pair,
-        quantity: trade.quantity,
-      },
-      { skipExitCheck: true }
-    );
-    res.json(result);
+    res.json(await closeStrategyTrade(req.params.id));
   } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : "Close failed" });
+    sendExitError(res, e, "Close failed");
   }
 });
 
 // F4: Sell a percentage of an active trade without closing it entirely
 tradesRouter.post("/:id/partial-close", async (req, res) => {
+  const parsed = z.object({
+    pct: z.number().min(1).max(99, "Cannot exceed 99% — use full close for 100%"),
+  }).safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.errors[0]?.message ?? "Invalid input" });
+  }
   try {
-    const schema = z.object({
-      pct: z.number().min(1).max(99, "Cannot exceed 99% — use full close for 100%"),
-    });
-    const { pct } = schema.parse(req.body);
-
-    const trade = await prisma.smartTrade.findUnique({
-      where: { id: req.params.id },
-      include: { bot: { include: { exchangeAccount: true } } },
-    });
-    if (!trade || trade.status !== "active") {
-      return res.status(400).json({ error: "Trade not active" });
-    }
-    if (!trade.bot) {
-      return res.status(422).json({
-        error: "This trade's bot was deleted. Close the position directly on Binance.",
-      });
-    }
-    /*
-     * BOT-005: hold the lock across the whole read-sell-write sequence, not
-     * just check it. This path reads the quantity, sells, then writes the
-     * reduced quantity back — a TP/SL close landing in between would sell the
-     * same base asset twice and, because a sell is capped against the shared
-     * WALLET balance, could eat another bot's position in the same asset.
-     */
-    if (!acquireTradeClose(trade.id)) {
-      return res.status(409).json({ error: "Trade is being closed. Please wait." });
-    }
-    try {
-    /*
-     * D-9: the halt does NOT refuse this. A scale-out is an operator, on an
-     * authenticated route, reducing a position by hand — and an operator's
-     * exit is never gated by the halt. BOT-P1-2 once added a halt refusal here
-     * to match "every sibling", which made a halted installation impossible to
-     * get out of: the halt latches itself on a daily-loss breach, and the full
-     * Close and manual SELL were refused too. The division is now the
-     * platform's: the halt stops the AUTOMATION in both directions (signals,
-     * the TP/SL monitors), and the operator's own exits — this route, the
-     * dashboard Close and manual SELL — stay open. `evaluateBotRisk` is the
-     * single statement of that rule.
-     *
-     * Everything that makes an exit SAFE still applies below: the close lock,
-     * resolution of any unresolved prior exit, the 99% cap and the wallet cap.
-     */
-    // Resolve client
-    const client = tradeExchangeClient.resolve(trade.bot);
-    if (!client) {
-      return res.status(503).json({ error: "No Binance credentials configured." });
-    }
-
-    /*
-     * BOT-P1-5: a durable exit attempt left unresolved by a crash is the only
-     * surviving evidence that a SELL may already be live at Binance — the
-     * in-process close lock does not survive a restart. Resolving it here, from
-     * current exchange evidence, is what stops this scale-out landing on top of
-     * a TP, SL or earlier partial that was never settled locally.
-     */
-    const resolution = await resolveUnresolvedExitAttempts(
-      trade.id, exitAttemptProbe(client, config.dryRun));
-    if (resolution.blocked) {
-      return res.status(409).json({
-        error: `${trade.pair}: a prior exit has unresolved exchange state — ${resolution.reason}`,
-      });
-    }
-    // A recovered fill has already moved the ledger, so this exit has to be
-    // sized off the position as it stands NOW, never off the stale read above.
-    const current = resolution.reconciled > 0
-      ? await prisma.smartTrade.findUnique({ where: { id: trade.id } })
-      : trade;
-    if (!current || current.status !== "active") {
-      return res.status(409).json({
-        error: "A prior exit was already filled at the exchange and has now been reconciled; " +
-          "it closed this position. No second order was placed.",
-      });
-    }
-
-    // Calculate the precise quantity for this percentage
-    const requestedQty = current.quantity * (pct / 100);
-    const sellQty = await resolveSellQuantity(client, trade.pair, requestedQty);
-
-    /*
-     * BOT-P1-1: the scope used to be `partial:${trade.id}:${pct}` — a pure
-     * function of the position and the percentage, with nothing that
-     * distinguishes one 25% exit from the next one. Two legitimate scale-outs
-     * at the same percentage therefore presented the SAME client order id, and
-     * `marketSellBase`'s duplicate-rejection branch resolved the second order
-     * to the FIRST order's fill: a second PartialClose row carrying the first
-     * sale's revenue, the position reduced twice on paper with nothing sold,
-     * and that fabricated P&L feeding the daily-loss kill switch.
-     *
-     * The durable attempt is the missing identity. A retry or crash recovery of
-     * THIS exit finds the same open attempt and keeps its id, so query-first
-     * recovery still works; a genuinely new exit can only be opened once this
-     * one has settled, and therefore carries a different id.
-     *
-     * BOT-P1-5: it now also carries WHOSE exit it is, so close admission and
-     * restart recovery can find it at all.
-     */
-    const attempt = await openOrderAttempt({
-      intentKey: `partial:${trade.id}:${pct}`, symbol: trade.pair, side: "SELL",
-      smartTradeId: trade.id, origin: "partial", sellPercent: pct,
-      requestedBaseQty: sellQty, closedReason: "partial_close",
-    });
-    // Before the wire call, never after: a null `submittedAt` is what proves to
-    // a later recovery that no order was ever sent under this id.
-    await markOrderAttemptSubmitted(attempt.id, sellQty);
-
-    const orderResult = await marketSellBase(client, trade.pair, sellQty, {
-      explicitClientOrderId: attempt.clientOrderId,
-    });
-
-    /*
-     * BOT-P1-6: the ACTUAL executed quantity is the accounting authority.
-     *
-     * This used to spend `sellQty` — the REQUESTED slice — on the proportional
-     * cost basis, on the reduced position quantity and on `PartialClose.quantity`,
-     * while taking revenue from the real fill. A partial fill therefore removed
-     * base asset from the local position that was never sold, and a zero fill
-     * wrote a `PartialClose` row for a sale that did not happen. The remaining
-     * exposure was wrong from that moment on.
-     *
-     * `applyExitFill` is the single settlement authority shared with the TP/SL
-     * monitor and with restart recovery, so the same fill produces the same
-     * final state whichever path discovers it — and the compare-and-set that
-     * settles the attempt inside its transaction is what makes it exactly once.
-     */
-    const applied = await applyExitFill(attempt, orderResult);
-    if (!applied) {
-      return res.status(409).json({
-        error: "This partial exit has already been recorded; no second sale was made.",
-      });
-    }
-    if (applied.executedQty <= 0) {
-      // Nothing was sold, so nothing was booked. Truthful beats tidy.
-      return res.status(200).json({
-        partial: null,
-        trade: await tradeWithDetail(trade.id),
-        requestedQty: sellQty,
-        executedQty: 0,
-        detail: `${trade.pair}: the exchange filled none of the requested ${sellQty}; ` +
-          `the position is unchanged (${orderResult.exchangeStatus ?? "no fill"}).`,
-      });
-    }
-    const partial = applied.partial;
-    const updatedTrade = await tradeWithDetail(trade.id);
-
-    void sendExecutionNotification({
-      side: "sell", symbol: trade.pair, quantity: orderResult.executedQty,
-      quoteAmount: orderResult.cummulativeQuoteQty, price: orderResult.avgPrice,
-      orderId: orderResult.orderId, pnlPct: applied.pnlPct,
-    }).catch((e) => console.error("Partial-close notification failed", e));
-
-    // Requested and executed stay distinguishable on the wire: `partial.quantity`
-    // is what actually sold, `requestedQty` is what was asked for.
-    res.json({
-      partial, trade: updatedTrade,
-      requestedQty: sellQty, executedQty: applied.executedQty,
-    });
-    } finally {
-      // A leaked lock makes the trade permanently uncloseable, which is worse
-      // than the double sell it prevents.
-      releaseTradeClose(trade.id);
-    }
+    res.json(await partialCloseStrategyTrade(req.params.id, parsed.data.pct));
   } catch (e) {
-    if (e instanceof z.ZodError) {
-      return res.status(400).json({ error: e.errors[0]?.message ?? "Invalid input" });
-    }
-    res.status(500).json({ error: e instanceof Error ? e.message : "Partial close failed" });
+    sendExitError(res, e, "Partial close failed");
   }
 });

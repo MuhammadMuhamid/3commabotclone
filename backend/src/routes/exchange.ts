@@ -27,7 +27,17 @@ exchangeRouter.post("/", async (req, res) => {
       name: z.string().min(1),
       apiKey: z.string().min(1),
       apiSecret: z.string().min(1),
-      testnet: z.boolean().optional(),
+      /*
+       * U5: REQUIRED. It used to be optional and default to false, so any
+       * client that omitted it created a MAINNET account — inside an
+       * installation whose process default is testnet. The choice of network
+       * is now always explicit; the dashboard asks for a typed confirmation
+       * before it sends `false`.
+       */
+      testnet: z.boolean({
+        required_error: "testnet is required: true for Binance testnet, false for mainnet",
+        invalid_type_error: "testnet must be true or false",
+      }),
     });
     // Refuse to persist a live exchange credential when key material is
     // missing or unusable. `assertConfig()` already prevents the server from
@@ -48,7 +58,7 @@ exchangeRouter.post("/", async (req, res) => {
         name: body.name,
         apiKeyEnc: encrypt(body.apiKey),
         apiSecretEnc: encrypt(body.apiSecret),
-        testnet: body.testnet ?? false,
+        testnet: body.testnet,
       },
     });
     res.status(201).json({

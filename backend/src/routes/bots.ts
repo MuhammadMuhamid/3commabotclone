@@ -6,6 +6,7 @@ import { config } from "../config.js";
 import { formatInvestmentLabel, INVESTMENT_UNITS } from "../lib/investment.js";
 import { sumMoney } from "../lib/money.js";
 import { readBotStats } from "../services/botView.js";
+import { asyncHandler } from "../middleware/errors.js";
 
 export const botsRouter = Router();
 
@@ -347,12 +348,88 @@ botsRouter.patch("/:id", async (req, res) => {
   res.json(mapBot(bot));
 });
 
-botsRouter.delete("/:id", async (req, res) => {
-  // F5: Deleting a bot now nullifies SmartTrade.botId (onDelete: SetNull) so
-  // historical trade data is preserved. botName on each trade retains the name.
-  await prisma.signalBot.delete({ where: { id: req.params.id } });
-  res.status(204).send();
+/** The strategy-intent states that may still reach, or already be at, the exchange. */
+const UNRESOLVED_INTENT_STATUSES = ["requested", "submitted"];
+
+/** Unresolved strategy order intents for one bot (requested or submitted). */
+export function countUnresolvedBotIntents(botId: string): Promise<number> {
+  return prisma.strategyOrderIntent.count({
+    where: { botId, status: { in: UNRESOLVED_INTENT_STATUSES } },
+  });
+}
+
+/**
+ * Put a bot in a TARGET state — not a toggle, so a retried or doubled request
+ * converges instead of cancelling itself out (contract C5).
+ *
+ * One conditional write: it changes the row only when the status differs, and
+ * reports whether it did. `null` means no such bot.
+ */
+export async function setBotStatus(
+  id: string, status: "active" | "paused"
+): Promise<{ changed: boolean } | null> {
+  const updated = await prisma.signalBot.updateMany({
+    where: { id, status: { not: status } },
+    data: { status },
+  });
+  if (updated.count === 1) return { changed: true };
+  const exists = await prisma.signalBot.findUnique({ where: { id }, select: { id: true } });
+  return exists ? { changed: false } : null;
+}
+
+type DeleteBotOutcome =
+  | { deleted: true }
+  | { deleted: false; status: 404 | 409; code?: string; error: string };
+
+const openTradesRefusal = (n: number): DeleteBotOutcome => ({
+  deleted: false, status: 409, code: "bot_has_open_trades",
+  error: `Cannot delete: this bot has ${n} active trade(s). Close them first, ` +
+    "or they would lose take-profit/stop-loss protection and could no longer be closed here.",
 });
+
+botsRouter.delete("/:id", asyncHandler(async (req, res) => {
+  /*
+   * Finding 0.7: a bot's open trades must not be orphaned. Deleting the bot
+   * sets `SmartTrade.botId` to null, and a bot-less trade is skipped by the
+   * TP/SL monitor and cannot be closed or partially closed from here — its
+   * protection disappears silently. An unresolved order intent may still be
+   * placed, or already be live, on the bot's behalf. Close (or let settle)
+   * first; history of closed trades is still preserved (F5, onDelete SetNull).
+   *
+   * Atomic (review A1): the delete itself is one conditional statement that
+   * matches only while the bot has NO active trade, so a trade opened after
+   * the checks cannot be orphaned; the intent check runs in the same
+   * transaction (intents carry a bare `botId`, not a relation).
+   */
+  const id = String(req.params.id);
+  const outcome = await prisma.$transaction(async (tx): Promise<DeleteBotOutcome> => {
+    const activeTrades = await tx.smartTrade.count({ where: { botId: id, status: "active" } });
+    if (activeTrades > 0) return openTradesRefusal(activeTrades);
+    const unresolvedIntents = await tx.strategyOrderIntent.count({
+      where: { botId: id, status: { in: UNRESOLVED_INTENT_STATUSES } },
+    });
+    if (unresolvedIntents > 0) {
+      return {
+        deleted: false, status: 409, code: "bot_has_unresolved_intents",
+        error: `Cannot delete: this bot has ${unresolvedIntents} order(s) whose exchange outcome ` +
+          "is still being reconciled. Wait for them to settle, then delete.",
+      };
+    }
+    const removed = await tx.signalBot.deleteMany({
+      where: { id, smartTrades: { none: { status: "active" } } },
+    });
+    if (removed.count === 1) return { deleted: true };
+    // Nothing matched: either there is no such bot, or a trade opened since.
+    const exists = await tx.signalBot.findUnique({ where: { id }, select: { id: true } });
+    if (!exists) return { deleted: false, status: 404, error: "Not found" };
+    return openTradesRefusal(await tx.smartTrade.count({ where: { botId: id, status: "active" } }));
+  });
+  if (!outcome.deleted) {
+    res.status(outcome.status).json({ error: outcome.error, ...(outcome.code ? { code: outcome.code } : {}) });
+    return;
+  }
+  res.status(204).send();
+}));
 
 botsRouter.post("/:id/toggle", async (req, res) => {
   const bot = await prisma.signalBot.findUnique({ where: { id: req.params.id } });
