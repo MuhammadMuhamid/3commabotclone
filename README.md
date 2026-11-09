@@ -714,6 +714,37 @@ this check has not classified `BACKWARD_COMPATIBLE`.
 `docs/OPERATIONS.md` §7 for the full reasoning and the scenario-specific
 rollback order (bad Platform only / bad Bot only / full paired rollback).
 
+### Realization contract v2 (OD-5): rollout and Platform rollback
+
+Contract v2 adds the order's `environment` (DRY_RUN | TESTNET | MAINNET |
+UNKNOWN) to each realization event. Rollout is **Platform first**:
+
+1. Deploy a Platform that accepts v2. Its acknowledged ingest answers then
+   carry `capabilities: ["realization.v2"]`; the Bot records that
+   (`PlatformCapability`) on the next delivered batch.
+2. Set `REALIZATION_CONTRACT_V2_ENABLED=true` on the Bot. Events persisted
+   from then on are v2 — only while the capability is recorded. Earlier rows
+   keep their v1 payload forever (payloads are immutable and hashed).
+
+**Rolling the Platform back to a v1-only build** needs no Bot action:
+
+- the first v2 batch the old Platform refuses with a definitive 4xx (not
+  401/403/429, not a 5xx or transport failure) clears the capability, and
+  every event persisted afterwards is v1 again;
+- stored v2 rows are **held aside**, never rewritten (the Platform may
+  already hold their hash): due v1 rows are always delivered first, and the
+  oldest due v2 batch is retried only when no v1 row is due, paced by the
+  rows' own backoff (at most once an hour after a few attempts). They show
+  as `pending` with the Platform's refusal in `lastError`;
+- when the Platform is upgraded again, its next acknowledged answer lists
+  `realization.v2` and the held rows drain in order;
+- optionally set `REALIZATION_CONTRACT_V2_ENABLED=false` for the duration,
+  so no new v2 row is created between the rollback and the first refusal.
+
+Do **not** roll the *Bot* back past this version while v2 rows exist: an
+older Bot's integrity check cannot read them and marks them `integrity_error`
+(`scripts/release.sh rollback-check` reports any non-delivered row).
+
 ## Security notes
 
 - **Never commit `backend/.env` or `*.db`** — both are gitignored. The database holds

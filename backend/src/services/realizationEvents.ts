@@ -142,8 +142,12 @@ export async function persistStrategyRealization(
 
 /**
  * OD-5: remember the capabilities of the Platform's last acknowledged ingest
- * answer. `realization.v2` present -> row upserted; absent (an old or
- * rolled-back Platform) -> row removed, so new events go back to v1.
+ * answer. `realization.v2` present -> row upserted; absent -> row removed, so
+ * new events go back to v1.
+ *
+ * An acknowledgement is not the only way the row goes away: a rolled-back
+ * (v1-only) Platform never acknowledges a v2 batch, so a definitive refusal
+ * of a v2 batch clears it too (`clearCapabilityOnRefusal`, review fix 1).
  */
 export async function recordPlatformCapabilities(capabilities: unknown, now = new Date()): Promise<void> {
   const listed = Array.isArray(capabilities)
@@ -164,6 +168,38 @@ export async function recordPlatformCapabilities(capabilities: unknown, now = ne
   }
 }
 
+/**
+ * Review fix 1 (OD-5 rollback): a definitive refusal of a v2 batch means the
+ * Platform no longer accepts v2 — it was rolled back after advertising it.
+ * Forget the capability so every event persisted from now on is v1, which
+ * every Platform version accepts. "Definitive" = an HTTP 4xx answer, except
+ * 401/403 (channel authentication, which says nothing about the shape) and
+ * 429 (not a refusal). Transport failures and 5xx change nothing. A v2-capable
+ * Platform that refused for another reason re-advertises the capability on
+ * its next acknowledged answer, so the cost is at most a few v1 events.
+ */
+export function isDefinitiveRefusal(status: number | null): boolean {
+  return status !== null && status >= 400 && status < 500 && ![401, 403, 429].includes(status);
+}
+
+async function clearCapabilityOnRefusal(status: number): Promise<void> {
+  try {
+    await prisma.platformCapability.deleteMany({ where: { name: REALIZATION_CAPABILITY_V2 } });
+    console.warn(`[realization] the Platform refused a contract v2 batch (${status}); realization.v2 cleared, ` +
+      "new events use v1. Held v2 events are retried under their own backoff.");
+  } catch (error) {
+    console.error(`[realization] capability not cleared name=${error instanceof Error ? error.name : "unknown"}`);
+  }
+}
+
+/**
+ * The top-level `"contractVersion":2` of a canonical (sorted, compact) v2
+ * payload. A string value cannot contain it unescaped, and no nested object
+ * has that key, so it selects exactly the v2 rows. It is a scheduling hint
+ * only: batching still uses the version parsed from each verified payload.
+ */
+export const V2_PAYLOAD_MARKER = '"contractVersion":2';
+
 const retryDelayMs = (attempts: number): number =>
   Math.min(60 * 60_000, 30_000 * (2 ** Math.min(7, Math.max(0, attempts))));
 
@@ -178,11 +214,25 @@ export async function deliverPendingRealizations(
   now = new Date()
 ): Promise<RealizationDeliveryResult> {
   if (!config.realizationDeliveryEnabled) return { attempted: 0, delivered: 0 };
-  const rows = await prisma.realizationEvent.findMany({
-    where: { deliveryStatus: "pending", nextAttemptAt: { lte: now } },
-    orderBy: [{ eventTime: "asc" }, { id: "asc" }],
-    take: REALIZATION_BATCH_MAX,
-  });
+  /*
+   * Review fix 1: while the Platform is not known to accept v2 (no
+   * capability row), v2 rows are HELD ASIDE so they can never seize the
+   * outbox: due v1 rows always go first; only when no v1 row is due is the
+   * oldest due v2 batch tried — a bounded probe, paced by the rows' own
+   * backoff (≤ 1 per hour once backed off). Stored payloads are never
+   * rewritten (a Platform may already hold a v2 row's hash). Once an
+   * acknowledged answer lists realization.v2 again, the held rows drain in
+   * normal order.
+   */
+  const due = { deliveryStatus: "pending", nextAttemptAt: { lte: now } };
+  const page = { orderBy: [{ eventTime: "asc" as const }, { id: "asc" as const }], take: REALIZATION_BATCH_MAX };
+  const capable = await prisma.platformCapability.findUnique({ where: { name: REALIZATION_CAPABILITY_V2 } }) !== null;
+  let rows = capable
+    ? await prisma.realizationEvent.findMany({ where: due, ...page })
+    : await prisma.realizationEvent.findMany({ where: { ...due, NOT: { payload: { contains: V2_PAYLOAD_MARKER } } }, ...page });
+  if (!capable && rows.length === 0) {
+    rows = await prisma.realizationEvent.findMany({ where: { ...due, payload: { contains: V2_PAYLOAD_MARKER } }, ...page });
+  }
   if (rows.length === 0) return { attempted: 0, delivered: 0 };
   /*
    * A batch and every event in it share one contract version (OD-5). The
@@ -220,6 +270,7 @@ export async function deliverPendingRealizations(
   const signature = signManualRequest(config.realizationHmacSecret, {
     method: "POST", path: INGEST_PATH, timestamp, nonce, requestId, body,
   });
+  let answerStatus: number | null = null;
   try {
     const response = await fetchImpl(config.realizationPlatformUrl, {
       method: "POST",
@@ -229,6 +280,7 @@ export async function deliverPendingRealizations(
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(10_000),
     });
+    answerStatus = response.status;
     let accepted: string[] = [];
     let capabilities: unknown;
     if (response.ok) {
@@ -253,6 +305,7 @@ export async function deliverPendingRealizations(
         lastError: null } });
     return { attempted: rows.length, delivered: valid.length };
   } catch (error) {
+    if (batchVersion === 2 && isDefinitiveRefusal(answerStatus)) await clearCapabilityOnRefusal(answerStatus!);
     // Keep operational logs to identities/status; never dump accounting bodies.
     for (const { row } of valid) {
       const attempts = row.attempts + 1;

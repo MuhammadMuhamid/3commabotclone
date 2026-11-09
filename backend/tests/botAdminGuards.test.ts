@@ -299,3 +299,60 @@ test("X6: rotation is refused while an exit is unresolved or a realization is pe
   assert.notEqual(rotated.webhookSecret, bot.webhookSecret);
   assert.match(rotated.webhookSecret, /^[0-9a-f]{48}$/);
 });
+
+// ── Review fixes 2, 6, 7 ────────────────────────────────────────────────────
+
+/** Run `fn` with prisma.$transaction replaced; always restored. */
+async function withTransaction(replacement: (original: typeof prisma.$transaction) => unknown, fn: () => Promise<void>) {
+  const original = prisma.$transaction;
+  (prisma as unknown as { $transaction: unknown }).$transaction = replacement(original);
+  try { await fn(); } finally {
+    (prisma as unknown as { $transaction: unknown }).$transaction = original;
+  }
+}
+
+test("review fix 2 (X6): the pending-work counts and the rotation compare-and-set run in one transaction", async () => {
+  const { rotateWebhookSecret } = await import("../src/services/botAdmin.js");
+  const bot = await storedBot();
+  let transactions = 0;
+  await withTransaction((original) => (...args: unknown[]) => {
+    transactions += 1;
+    return (original as (...a: unknown[]) => unknown).apply(prisma, args);
+  }, async () => {
+    const rotated = await rotateWebhookSecret(bot.id);
+    assert.notEqual(rotated.webhookSecret, bot.webhookSecret);
+  });
+  assert.equal(transactions, 1, "rotation is one transaction, not check-then-act autocommits");
+});
+
+test("review fix 6: a SQLite transaction conflict is a typed 409 bot_busy_retry, not a masked 500", async () => {
+  const { Prisma } = await import("@prisma/client");
+  const { rotateWebhookSecret } = await import("../src/services/botAdmin.js");
+  const a = await account();
+  const bot = await storedBot();
+  const conflicts: Array<() => Error> = [
+    () => new Prisma.PrismaClientKnownRequestError("Transaction failed due to a write conflict or a deadlock",
+      { code: "P2034", clientVersion: "test" }),
+    () => new Prisma.PrismaClientUnknownRequestError("SqliteFailure: database is locked", { clientVersion: "test" }),
+  ];
+  for (const conflict of conflicts) {
+    await withTransaction(() => async () => { throw conflict(); }, async () => {
+      const edit = await call("PATCH", `/api/bots/${bot.id}`, { exchangeAccountId: a.id });
+      assert.equal(edit.status, 409, JSON.stringify(edit.body));
+      assert.equal(edit.body.code, "bot_busy_retry");
+      const removed = await call("DELETE", `/api/bots/${bot.id}`);
+      assert.equal(removed.status, 409);
+      assert.equal(removed.body.code, "bot_busy_retry");
+      await assert.rejects(rotateWebhookSecret(bot.id), { code: "bot_busy_retry", status: 409 });
+    });
+  }
+  assert.ok(await prisma.signalBot.findUnique({ where: { id: bot.id } }), "nothing changed");
+});
+
+test("review fix 7: the control view shows only the last four characters of the webhook secret", async () => {
+  const { getBotConfigView } = await import("../src/services/botAdmin.js");
+  const bot = await storedBot();
+  const view = await getBotConfigView(bot.id);
+  assert.equal(view?.webhookSecretMasked, `••••${bot.webhookSecret.slice(-4)}`);
+  assert.equal(view?.webhookSecretMasked.includes(bot.webhookSecret.slice(0, 4)), false);
+});

@@ -30,7 +30,9 @@ const { canonicalJson, canonicalPath } = await import("../src/services/manualAut
 const { decrypt } = await import("../src/lib/crypto.js");
 const { signAccess } = await import("../src/lib/jwt.js");
 const { enrollmentProbeClient } = await import("../src/services/enrollmentProbe.js");
-const { enrollmentMintLimit, enrollmentMintLimiter } = await import("../src/routes/manualControlManage.js");
+const {
+  enrollmentMintLimit, enrollmentMintActorLimiter, enrollmentMintIpLimiter,
+} = await import("../src/routes/manualControlManage.js");
 
 const CONTROL_SECRET = "9e4b" + "d".repeat(60);
 const RETURN_URL = "https://platform.example/bot/accounts";
@@ -39,12 +41,12 @@ const original = {
   enabled: config.enrollmentEnabled, returnUrl: config.platformReturnUrl,
   secret: config.manualTradingHmacSecret, manual: config.manualTradingEnabled,
   encryptionKey: config.encryptionKey, fromKeys: enrollmentProbeClient.fromKeys,
-  mintMax: enrollmentMintLimit.max,
+  mintLimit: { ...enrollmentMintLimit },
 };
 config.manualTradingHmacSecret = CONTROL_SECRET;
 config.manualTradingEnabled = false;
 config.platformReturnUrl = RETURN_URL;
-enrollmentMintLimit.max = 10_000;
+Object.assign(enrollmentMintLimit, { perActor: 10_000, perIp: 10_000 });
 
 let server: Server;
 let baseUrl = "";
@@ -69,7 +71,7 @@ after(async () => {
     encryptionKey: original.encryptionKey,
   });
   enrollmentProbeClient.fromKeys = original.fromKeys;
-  enrollmentMintLimit.max = original.mintMax;
+  Object.assign(enrollmentMintLimit, original.mintLimit);
   await prisma.$disconnect();
   fs.rmSync(testDb, { force: true });
   fs.rmSync(`${testDb}-journal`, { force: true });
@@ -130,8 +132,8 @@ async function control(method: "GET" | "POST", p: string, body?: unknown, reques
     body: text ? JSON.parse(text) as Record<string, unknown> : {} };
 }
 
-async function mint(input: Record<string, unknown>, requestId?: string) {
-  return control("POST", "/exchange-enrollments", { ...input, actor: ACTOR }, requestId);
+async function mint(input: Record<string, unknown>, requestId?: string, actor: unknown = ACTOR) {
+  return control("POST", "/exchange-enrollments", { ...input, actor }, requestId);
 }
 
 function ticketOf(enrollUrl: unknown): string {
@@ -248,17 +250,39 @@ test("C17: rule refusals — create needs testnet+name, mainnet needs MAINNET, r
   assert.equal((await mint({ purpose: "create", testnet: true, name: "x", botId: acct.id })).status, 400);
 });
 
-test("C17: ticket minting has its own budget (429 bot_rate_limited)", async () => {
-  for (const key of ["127.0.0.1", "::ffff:127.0.0.1", "::1"]) enrollmentMintLimiter.resetKey(key);
-  enrollmentMintLimit.max = 2;
+test("C17 (review fix 5): the mint budget is per operator, a refused body spends none of it, and a coarse per-IP ceiling holds", async () => {
+  const actorOf = (n: number) => ({ ...ACTOR, platformUserId: `00000000-0000-4000-8000-0000000001${String(n).padStart(2, "0")}` });
+  const resetAll = () => {
+    for (const ip of ["127.0.0.1", "::ffff:127.0.0.1", "::1"]) enrollmentMintIpLimiter.resetKey(ip);
+    for (let i = 1; i <= 4; i += 1) enrollmentMintActorLimiter.resetKey(`actor:${actorOf(i).platformUserId}`);
+  };
+  resetAll();
+  Object.assign(enrollmentMintLimit, { perActor: 2, perIp: 10_000 });
   try {
-    assert.equal((await mint({ purpose: "create", testnet: true, name: "a" })).status, 201);
-    assert.equal((await mint({ purpose: "create", testnet: true, name: "b" })).status, 201);
-    const third = await mint({ purpose: "create", testnet: true, name: "c" });
+    assert.equal((await mint({ purpose: "create", testnet: true, name: "a" }, undefined, actorOf(1))).status, 201);
+    assert.equal((await mint({ purpose: "create", testnet: true, name: "b" }, undefined, actorOf(1))).status, 201);
+    const third = await mint({ purpose: "create", testnet: true, name: "c" }, undefined, actorOf(1));
     assert.equal(third.status, 429);
     assert.equal(third.body.code, "bot_rate_limited");
+    assert.equal((await mint({ purpose: "create", testnet: true, name: "d" }, undefined, actorOf(2))).status, 201,
+      "another operator keeps their own budget");
+    for (let i = 0; i < 3; i += 1) {
+      assert.equal((await mint({ purpose: "create", testnet: true }, undefined, actorOf(3))).status, 400);
+    }
+    assert.equal((await mint({ purpose: "create", testnet: true, name: "e" }, undefined, actorOf(3))).status, 201,
+      "400s spent nothing of that operator's budget");
+
+    resetAll();
+    Object.assign(enrollmentMintLimit, { perActor: 10_000, perIp: 3 });
+    for (let i = 0; i < 3; i += 1) {
+      assert.equal((await mint({ purpose: "create", testnet: true, name: `f${i}` }, undefined, actorOf(4))).status, 201);
+    }
+    const ceiling = await mint({ purpose: "create", testnet: true, name: "g" }, undefined, actorOf(2));
+    assert.equal(ceiling.status, 429, "the per-IP ceiling still bounds the whole channel");
+    assert.equal(ceiling.body.code, "bot_rate_limited");
   } finally {
-    enrollmentMintLimit.max = 10_000;
+    Object.assign(enrollmentMintLimit, { perActor: 10_000, perIp: 10_000 });
+    resetAll();
   }
 });
 
@@ -524,4 +548,37 @@ test("CORS stays Bot-origin only: a preflight from another origin gets no allow-
     "access-control-request-headers": "content-type",
   } });
   assert.notEqual(response.headers.get("access-control-allow-origin"), "https://mytradingview.example");
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Review fix 3: every refused key submission is counted exactly once
+// ════════════════════════════════════════════════════════════════════════════
+
+test("review fix 3: two concurrent wrong submissions both count; the next one fails the enrollment", async () => {
+  const { enrollmentId, cookie } = await openSession({ purpose: "create", testnet: true, name: "x" });
+  // Both requests read the session before either probe answers (a barrier of two).
+  let arrived = 0;
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  enrollmentProbeClient.fromKeys = () => ({
+    accountInfo: async () => {
+      arrived += 1;
+      if (arrived === 2) release();
+      await barrier;
+      return { canTrade: false, permissions: ["SPOT"] };
+    },
+    apiPermission: async () => ({}),
+  });
+  const body = { apiKey: KEY, apiSecret: SECRET };
+  const [a, b] = await Promise.all([browser("/keys", body, { cookie }), browser("/keys", body, { cookie })]);
+  assert.equal(a.status, 422);
+  assert.equal(b.status, 422);
+  const row = await prisma.exchangeEnrollment.findUniqueOrThrow({ where: { id: enrollmentId } });
+  assert.equal(row.attempts, 2, "a compare-and-set increment: neither refusal is lost");
+  assert.equal(row.status, "opened");
+  useProbe({ account: { canTrade: false, permissions: ["SPOT"] } });
+  const third = await browser("/keys", body, { cookie });
+  assert.equal(third.status, 422);
+  assert.equal(third.body.returnUrl, `${RETURN_URL}?enrollment=${enrollmentId}&status=failed`);
+  assert.equal((await prisma.exchangeEnrollment.findUniqueOrThrow({ where: { id: enrollmentId } })).status, "failed");
 });

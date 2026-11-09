@@ -17,7 +17,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import type { SignalBot } from "@prisma/client";
+import { Prisma, type SignalBot } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { formatInvestmentLabel } from "../lib/investment.js";
 import { platformWebhookIdentity } from "../contract/realizationEventContract.js";
@@ -90,6 +90,32 @@ function normalizePairs(pairs: string[]): string[] {
 
 function invalid(message: string): ControlRefusal {
   return new ControlRefusal(400, "invalid_request", message);
+}
+
+/**
+ * Review fix 6: SQLite reports a concurrent writer inside an interactive
+ * transaction as a write conflict, a lock timeout or "database is locked".
+ * Those are retryable and nothing was written, so they become one typed 409
+ * instead of a masked 500.
+ */
+export function isTransactionConflict(error: unknown): boolean {
+  if (error instanceof Prisma.PrismaClientKnownRequestError && ["P2034", "P2028", "P1008"].includes(error.code)) {
+    return true;
+  }
+  if (error instanceof Prisma.PrismaClientKnownRequestError
+      || error instanceof Prisma.PrismaClientUnknownRequestError) {
+    return /database is locked|SQLITE_BUSY|write conflict|deadlock/i.test(error.message);
+  }
+  return false;
+}
+
+export const BOT_BUSY_MESSAGE =
+  "This bot changed while the request ran (another write was in progress); nothing was changed. Retry.";
+
+/** Rethrow a transaction conflict as the typed 409; anything else unchanged. */
+function rethrowConflict(error: unknown): never {
+  if (isTransactionConflict(error)) throw new ControlRefusal(409, "bot_busy_retry", BOT_BUSY_MESSAGE);
+  throw error;
 }
 
 function checkName(name: string): string {
@@ -342,48 +368,52 @@ export async function updateBot(id: string, body: BotPatchInput): Promise<Signal
     data.maxActiveSmartTrades = body.maxActiveSmartTrades;
   }
 
-  return prisma.$transaction(async (tx) => {
-    if (accountChanged) {
-      const [active, unresolved] = await Promise.all([
-        tx.smartTrade.count({ where: { botId: id, status: "active" } }),
-        tx.strategyOrderIntent.count({ where: { botId: id, status: { in: UNRESOLVED_INTENT_STATUSES } } }),
-      ]);
-      if (active > 0 || unresolved > 0) {
-        throw new ControlRefusal(409, "bot_has_open_trades",
-          `Cannot change the exchange account: this bot has ${active} active trade(s) and ` +
-          `${unresolved} order(s) still being reconciled. Their exits must go to the account ` +
-          "that holds them. Close them (or let them settle) first.");
+  try {
+    return await prisma.$transaction(async (tx) => {
+      if (accountChanged) {
+        const [active, unresolved] = await Promise.all([
+          tx.smartTrade.count({ where: { botId: id, status: "active" } }),
+          tx.strategyOrderIntent.count({ where: { botId: id, status: { in: UNRESOLVED_INTENT_STATUSES } } }),
+        ]);
+        if (active > 0 || unresolved > 0) {
+          throw new ControlRefusal(409, "bot_has_open_trades",
+            `Cannot change the exchange account: this bot has ${active} active trade(s) and ` +
+            `${unresolved} order(s) still being reconciled. Their exits must go to the account ` +
+            "that holds them. Close them (or let them settle) first.");
+        }
       }
-    }
-    if (removedPairs.length > 0) {
-      const [active, unresolved] = await Promise.all([
-        tx.smartTrade.count({ where: { botId: id, status: "active", pair: { in: removedPairs } } }),
-        tx.strategyOrderIntent.count({ where: {
-          botId: id, symbol: { in: removedPairs }, status: { in: UNRESOLVED_INTENT_STATUSES },
-        } }),
-      ]);
-      if (active > 0 || unresolved > 0) {
-        throw new ControlRefusal(409, "pair_has_open_trades",
-          `Cannot remove ${removedPairs.join(", ")}: this bot has ${active} active trade(s) or ` +
-          `${unresolved} unresolved order(s) on it. Close them first; removing the pair would ` +
-          "make them unclosable from here.");
+      if (removedPairs.length > 0) {
+        const [active, unresolved] = await Promise.all([
+          tx.smartTrade.count({ where: { botId: id, status: "active", pair: { in: removedPairs } } }),
+          tx.strategyOrderIntent.count({ where: {
+            botId: id, symbol: { in: removedPairs }, status: { in: UNRESOLVED_INTENT_STATUSES },
+          } }),
+        ]);
+        if (active > 0 || unresolved > 0) {
+          throw new ControlRefusal(409, "pair_has_open_trades",
+            `Cannot remove ${removedPairs.join(", ")}: this bot has ${active} active trade(s) or ` +
+            `${unresolved} unresolved order(s) on it. Close them first; removing the pair would ` +
+            "make them unclosable from here.");
+        }
       }
-    }
-    // Conditional on the same facts, so a trade opened since the counts loses.
-    const guard = accountChanged
-      ? { smartTrades: { none: { status: "active" } } }
-      : removedPairs.length > 0
-        ? { smartTrades: { none: { status: "active", pair: { in: removedPairs } } } }
-        : {};
-    const updated = await tx.signalBot.updateMany({ where: { id, ...guard }, data });
-    if (updated.count !== 1) {
-      const still = await tx.signalBot.findUnique({ where: { id }, select: { id: true } });
-      if (!still) throw new ControlRefusal(404, "bot_not_found", "Bot not found.");
-      throw new ControlRefusal(409, accountChanged ? "bot_has_open_trades" : "pair_has_open_trades",
-        "A trade was opened while this edit was being applied; nothing was changed. Retry after it closes.");
-    }
-    return tx.signalBot.findUniqueOrThrow({ where: { id } });
-  });
+      // Conditional on the same facts, so a trade opened since the counts loses.
+      const guard = accountChanged
+        ? { smartTrades: { none: { status: "active" } } }
+        : removedPairs.length > 0
+          ? { smartTrades: { none: { status: "active", pair: { in: removedPairs } } } }
+          : {};
+      const updated = await tx.signalBot.updateMany({ where: { id, ...guard }, data });
+      if (updated.count !== 1) {
+        const still = await tx.signalBot.findUnique({ where: { id }, select: { id: true } });
+        if (!still) throw new ControlRefusal(404, "bot_not_found", "Bot not found.");
+        throw new ControlRefusal(409, accountChanged ? "bot_has_open_trades" : "pair_has_open_trades",
+          "A trade was opened while this edit was being applied; nothing was changed. Retry after it closes.");
+      }
+      return tx.signalBot.findUniqueOrThrow({ where: { id } });
+    });
+  } catch (error) {
+    rethrowConflict(error);
+  }
 }
 
 // ── Delete ──────────────────────────────────────────────────────────────────
@@ -407,27 +437,32 @@ const openTradesRefusal = (n: number): DeleteBotOutcome => ({
  * the same transaction (intents carry a bare `botId`, not a relation).
  */
 export async function deleteBotGuarded(id: string): Promise<DeleteBotOutcome> {
-  return prisma.$transaction(async (tx): Promise<DeleteBotOutcome> => {
-    const activeTrades = await tx.smartTrade.count({ where: { botId: id, status: "active" } });
-    if (activeTrades > 0) return openTradesRefusal(activeTrades);
-    const unresolvedIntents = await tx.strategyOrderIntent.count({
-      where: { botId: id, status: { in: UNRESOLVED_INTENT_STATUSES } },
+  try {
+    return await prisma.$transaction(async (tx): Promise<DeleteBotOutcome> => {
+      const activeTrades = await tx.smartTrade.count({ where: { botId: id, status: "active" } });
+      if (activeTrades > 0) return openTradesRefusal(activeTrades);
+      const unresolvedIntents = await tx.strategyOrderIntent.count({
+        where: { botId: id, status: { in: UNRESOLVED_INTENT_STATUSES } },
+      });
+      if (unresolvedIntents > 0) {
+        return {
+          deleted: false, status: 409, code: "bot_has_unresolved_intents",
+          error: `Cannot delete: this bot has ${unresolvedIntents} order(s) whose exchange outcome ` +
+            "is still being reconciled. Wait for them to settle, then delete.",
+        };
+      }
+      const removed = await tx.signalBot.deleteMany({
+        where: { id, smartTrades: { none: { status: "active" } } },
+      });
+      if (removed.count === 1) return { deleted: true };
+      const exists = await tx.signalBot.findUnique({ where: { id }, select: { id: true } });
+      if (!exists) return { deleted: false, status: 404, code: "bot_not_found", error: "Not found" };
+      return openTradesRefusal(await tx.smartTrade.count({ where: { botId: id, status: "active" } }));
     });
-    if (unresolvedIntents > 0) {
-      return {
-        deleted: false, status: 409, code: "bot_has_unresolved_intents",
-        error: `Cannot delete: this bot has ${unresolvedIntents} order(s) whose exchange outcome ` +
-          "is still being reconciled. Wait for them to settle, then delete.",
-      };
-    }
-    const removed = await tx.signalBot.deleteMany({
-      where: { id, smartTrades: { none: { status: "active" } } },
-    });
-    if (removed.count === 1) return { deleted: true };
-    const exists = await tx.signalBot.findUnique({ where: { id }, select: { id: true } });
-    if (!exists) return { deleted: false, status: 404, code: "bot_not_found", error: "Not found" };
-    return openTradesRefusal(await tx.smartTrade.count({ where: { botId: id, status: "active" } }));
-  });
+  } catch (error) {
+    if (isTransactionConflict(error)) return { deleted: false, status: 409, code: "bot_busy_retry", error: BOT_BUSY_MESSAGE };
+    throw error;
+  }
 }
 
 // ── Rotate the webhook secret (X6) ──────────────────────────────────────────
@@ -443,35 +478,51 @@ export async function deleteBotGuarded(id: string): Promise<DeleteBotOutcome> {
  * pending realization event carries the current secret's identity.
  */
 export async function rotateWebhookSecret(id: string): Promise<SignalBot> {
-  const bot = await prisma.signalBot.findUnique({ where: { id } });
-  if (!bot) throw new ControlRefusal(404, "bot_not_found", "Bot not found.");
-  const [unresolvedSells, pendingEvents] = await Promise.all([
-    prisma.strategyOrderIntent.count({ where: {
-      botId: id, side: "SELL", status: { in: UNRESOLVED_INTENT_STATUSES },
-    } }),
-    prisma.realizationEvent.count({ where: {
-      deliveryStatus: "pending", payload: { contains: platformWebhookIdentity(bot.webhookSecret) },
-    } }),
-  ]);
-  if (unresolvedSells > 0 || pendingEvents > 0) {
-    throw new ControlRefusal(409, "realizations_pending",
-      `Cannot rotate yet: ${unresolvedSells} exit order(s) are still being reconciled and ` +
-      `${pendingEvents} realization(s) are waiting to reach Trading Scene under the current ` +
-      "secret. Rotating now would break their provenance. Retry once they settle.");
+  // Review fix 2: the counts and the compare-and-set are ONE transaction, so
+  // a SELL reserved under the old secret cannot slip in between them (on
+  // SQLite the concurrent writer waits or fails rather than interleaving).
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const bot = await tx.signalBot.findUnique({ where: { id } });
+      if (!bot) throw new ControlRefusal(404, "bot_not_found", "Bot not found.");
+      const unresolvedSells = await tx.strategyOrderIntent.count({ where: {
+        botId: id, side: "SELL", status: { in: UNRESOLVED_INTENT_STATUSES },
+      } });
+      const pendingEvents = await tx.realizationEvent.count({ where: {
+        deliveryStatus: "pending", payload: { contains: platformWebhookIdentity(bot.webhookSecret) },
+      } });
+      if (unresolvedSells > 0 || pendingEvents > 0) {
+        throw new ControlRefusal(409, "realizations_pending",
+          `Cannot rotate yet: ${unresolvedSells} exit order(s) are still being reconciled and ` +
+          `${pendingEvents} realization(s) are waiting to reach Trading Scene under the current ` +
+          "secret. Rotating now would break their provenance. Retry once they settle.");
+      }
+      // Compare-and-set on the old secret: a concurrent rotation cannot be lost silently.
+      const updated = await tx.signalBot.updateMany({
+        where: { id, webhookSecret: bot.webhookSecret },
+        data: { webhookSecret: generateWebhookSecret() },
+      });
+      if (updated.count !== 1) {
+        throw new ControlRefusal(409, "rotation_conflict",
+          "The secret changed while this rotation ran; nothing further was changed. Read the bot again.");
+      }
+      return tx.signalBot.findUniqueOrThrow({ where: { id } });
+    });
+  } catch (error) {
+    rethrowConflict(error);
   }
-  // Compare-and-set on the old secret: a concurrent rotation cannot be lost silently.
-  const updated = await prisma.signalBot.updateMany({
-    where: { id, webhookSecret: bot.webhookSecret },
-    data: { webhookSecret: generateWebhookSecret() },
-  });
-  if (updated.count !== 1) {
-    throw new ControlRefusal(409, "rotation_conflict",
-      "The secret changed while this rotation ran; nothing further was changed. Read the bot again.");
-  }
-  return prisma.signalBot.findUniqueOrThrow({ where: { id } });
 }
 
 // ── The control-plane projection ───────────────────────────────────────────
+
+/**
+ * Review fix 7: the control-plane view (stored in command results for replay
+ * and C8) carries only the last four characters — enough to recognise a
+ * secret, nothing of the rest. The Classic dashboard keeps `maskSecret`.
+ */
+export function maskSecretLast4(secret: string): string {
+  return secret.length > 4 ? `••••${secret.slice(-4)}` : "••••";
+}
 
 export function maskSecret(secret: string): string {
   if (secret.length <= 8) return "*".repeat(secret.length);
@@ -546,7 +597,7 @@ export async function getBotConfigView(id: string): Promise<BotConfigView | null
     exchangeAccount: bot.exchangeAccount
       ? { id: bot.exchangeAccount.id, name: bot.exchangeAccount.name, testnet: bot.exchangeAccount.testnet }
       : null,
-    webhookSecretMasked: maskSecret(bot.webhookSecret),
+    webhookSecretMasked: maskSecretLast4(bot.webhookSecret),
     webhookPath: WEBHOOK_PATH,
     activeTrades,
     unresolvedIntents,

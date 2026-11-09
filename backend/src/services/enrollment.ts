@@ -173,6 +173,29 @@ export async function enrollmentMeta(row: ExchangeEnrollment): Promise<Enrollmen
   };
 }
 
+/**
+ * Review fix 3: count one refused key submission, exactly once, with a
+ * compare-and-set on the current count (a concurrent sibling cannot make a
+ * refusal vanish). Returns true when this refusal failed the enrollment. If a
+ * sibling already failed or completed the session, says so.
+ */
+async function countKeyRefusal(id: string, code: string, now: Date): Promise<boolean> {
+  for (let tries = 0; tries < 5; tries += 1) {
+    const current = await prisma.exchangeEnrollment.findUnique({ where: { id }, select: { status: true, attempts: true } });
+    if (current?.status === "failed") return true;
+    if (!current || current.status !== "opened") throw sessionInvalid();
+    const attempts = current.attempts + 1;
+    const failedNow = attempts >= ENROLLMENT_MAX_KEY_ATTEMPTS;
+    const counted = await prisma.exchangeEnrollment.updateMany({
+      where: { id, status: "opened", attempts: current.attempts },
+      data: { attempts, outcome: `refused:${code}`, ...(failedNow ? { status: "failed", completedAt: now } : {}) },
+    });
+    if (counted.count === 1) return failedNow;
+  }
+  throw new ControlRefusal(409, "enrollment_busy",
+    "Another submission for this enrollment is being checked. Wait a moment, then try again.");
+}
+
 /** A refusal that also ended the enrollment for good (the Platform sees `failed`). */
 export class EnrollmentEnded extends ControlRefusal {}
 
@@ -252,13 +275,7 @@ export async function submitEnrollmentKeys(row: ExchangeEnrollment, body: KeysBo
   const probe = await probeExchangeKeys({ apiKey: body.apiKey, apiSecret: body.apiSecret }, testnet);
   if (!probe.ok) {
     if (probe.keysAtFault) {
-      const attempts = row.attempts + 1;
-      const failedNow = attempts >= ENROLLMENT_MAX_KEY_ATTEMPTS;
-      await prisma.exchangeEnrollment.updateMany({
-        where: { id: row.id, status: "opened" },
-        data: { attempts, outcome: `refused:${probe.code}`,
-          ...(failedNow ? { status: "failed", completedAt: now } : {}) },
-      });
+      const failedNow = await countKeyRefusal(row.id, probe.code, now);
       if (failedNow) {
         throw new EnrollmentEnded(probe.status, probe.code,
           `${probe.message} This enrollment has now failed; start again from Trading Scene.`);
