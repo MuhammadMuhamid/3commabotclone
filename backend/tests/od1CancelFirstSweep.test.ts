@@ -710,6 +710,29 @@ test("OD-1 case 13: two finalizers at once (boot + interval) issue at most one c
     near(race[0]!.quantity, 0.15);
   });
 
+test("OD-1 case 13b: a finalizer that starts while another's cancel is still in flight does not cancel again (deterministic)",
+  async () => {
+    quiet();
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "0.4" });
+    const { cid } = await closeWithUnknownCancel(account, exchange);
+    const cancelsBefore = exchange.cancels.length;
+    exchange.fill(cid, "0.55", "55", "PARTIALLY_FILLED");
+    // Hold every cancel on the wire long enough for a second finalizer to read the
+    // entry after the first one's claim and before its cancel result is applied.
+    const client = exchange.client as unknown as { cancelOrder: (args: { origClientOrderId: string }) => Promise<unknown> };
+    const realCancel = client.cancelOrder.bind(client);
+    client.cancelOrder = async (args) => { await new Promise((r) => setTimeout(r, 80)); return realCancel(args); };
+    const first = reconcile(factory(exchange));
+    await new Promise((r) => setTimeout(r, 20));
+    const second = reconcile(factory(exchange));
+    await Promise.allSettled([first, second]);
+    assert.equal(exchange.cancels.length - cancelsBefore, 1, "one effective cancel");
+    const race = await racePositions(account);
+    assert.equal(race.length, 1);
+    near(race[0]!.quantity, 0.15);
+  });
+
 // ── case 14: restart ────────────────────────────────────────────────────────
 
 function restart(spec: Record<string, unknown>): { submissions: number; lookups: number } {

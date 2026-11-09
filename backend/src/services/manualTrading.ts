@@ -893,6 +893,26 @@ export async function cancelWorkingEntryForExit(position: SmartTrade, adapter: M
  */
 export async function finalizeEntryAfterExit(entryId: string, adapter: ManualExchangeAdapter,
   opts: { snapshotApplied?: boolean } = {}): Promise<ExitCancelOutcome | "lookup_failed"> {
+  // One finalizer per entry at a time in this process. The attempt CAS alone
+  // stops two finalizers claiming the SAME attempt, but a second finalizer that
+  // reads the entry after the first one's claim and before its cancel is applied
+  // would claim the NEXT attempt and cancel again (CI flake of OD-1 case 13).
+  // That second cancel moves no money (-2011, then a query), but it spends an
+  // attempt and can raise ENTRY CANCEL FAILED early. Boot and interval
+  // reconcilers share this process, so an in-process guard is sufficient.
+  if (finalizingEntries.has(entryId)) return "skipped";
+  finalizingEntries.add(entryId);
+  try {
+    return await finalizeEntryAfterExitOnce(entryId, adapter, opts);
+  } finally {
+    finalizingEntries.delete(entryId);
+  }
+}
+
+const finalizingEntries = new Set<string>();
+
+async function finalizeEntryAfterExitOnce(entryId: string, adapter: ManualExchangeAdapter,
+  opts: { snapshotApplied?: boolean }): Promise<ExitCancelOutcome | "lookup_failed"> {
   const entry = await prisma.manualOrder.findUnique({ where: { id: entryId } });
   if (!entry || entry.side !== "BUY" || !["pending", "unknown"].includes(entry.exitCancelState ?? "")) {
     return "skipped";
