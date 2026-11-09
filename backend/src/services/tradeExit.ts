@@ -346,7 +346,7 @@ export async function partialCloseStrategyTrade(
       // and typed; the raw text stays on the Bot side as detail.
       if (error instanceof PreWireError) {
         throw new ControlRefusal(422, "not_executed",
-          "No order was sent: the wallet's free balance is below what this partial close would sell.",
+          "No order was sent: this partial close is below the exchange's minimum lot size, or more than the wallet's free balance.",
           error.message);
       }
       throw error;
