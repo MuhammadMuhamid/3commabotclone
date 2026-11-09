@@ -12,10 +12,14 @@
  * entry here (bot-exec adds `entries.v1`, `operatorExit.v1`,
  * `manualPositionFull.v1`).
  */
+import { config } from "../config.js";
+
 export function buildControlCapabilities(): string[] {
   const capabilities = [
     "bots.v1",     // C10–C14: create, read, edit, delete, rotate-secret
     "accounts.v1", // C15, C16, C19: list, delete, balance
   ];
+  // C17/C18 + /enroll: only while ENROLLMENT_ENABLED (the public routes 404 otherwise).
+  if (config.enrollmentEnabled) capabilities.push("enroll.v1");
   return capabilities;
 }

@@ -660,3 +660,45 @@ model ExchangeOrderAttempt {
   @@index([intentKey, status])
   @@index([smartTradeId, status])
 }
+
+/**
+ * OD-4: one exchange-key enrollment (create / replace an account's keys) or
+ * one webhook-secret reveal, carried out on the Bot's own origin.
+ *
+ * The Platform mints it over the signed control channel (C17) after a fresh
+ * step-up; the browser receives the ticket only in a URL fragment. The ticket
+ * and the session token are stored as SHA-256 hashes, are single-use (status
+ * compare-and-set), and live at most five minutes each. Purpose, network,
+ * account, bot and name come only from this row — never from the browser.
+ *
+ * status: issued -> opened (ticket exchanged for a session) -> completed |
+ * failed; "expired" is derived from the clocks when read.
+ */
+model ExchangeEnrollment {
+  id               String    @id @default(uuid())
+  ticketHash       String    @unique
+  /// create | replace | reveal_webhook
+  purpose          String
+  /// replace: the target; create: the account created on completion.
+  accountId        String?
+  /// reveal_webhook: the bot whose secret is shown.
+  botId            String?
+  testnet          Boolean?
+  name             String?
+  actorUserId      String
+  stepUpMethod     String
+  status           String    @default("issued")
+  expiresAt        DateTime
+  openedAt         DateTime?
+  sessionHash      String?   @unique
+  sessionExpiresAt DateTime?
+  /// Refused key submissions in this session (bounded; the third fails it).
+  attempts         Int       @default(0)
+  completedAt      DateTime?
+  outcome          String?
+  keyHint          String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([status, expiresAt])
+}

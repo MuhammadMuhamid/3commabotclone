@@ -31,8 +31,9 @@ import { equityExecutionRouter } from "./routes/equityExecution.js";
 import { traditionalExecutionRouter } from "./routes/traditionalExecution.js";
 import { requireAuth } from "./middleware/requireAuth.js";
 import { errorHandler, notFoundHandler } from "./middleware/errors.js";
+import { createEnrollRouter, type EnrollRouterLimits } from "./routes/enroll.js";
 
-export function createApp(): Express {
+export function createApp(opts: { enrollLimits?: EnrollRouterLimits } = {}): Express {
   const app = express();
 
   // ─── Trust nginx proxy (needed so rate-limiting reads real client IP) ─────────
@@ -73,6 +74,13 @@ export function createApp(): Express {
 
   // ─── Cookie parsing ───────────────────────────────────────────────────────────
   app.use(cookieParser());
+
+  // ─── OD-4 public enrollment routes ───────────────────────────────────────────
+  // BEFORE the global parsers below: these routes read their bodies with their
+  // own 4 kb parser and answer parse errors themselves, without logging (X1),
+  // and check Origin / Sec-Fetch-Site / Content-Type before reading anything.
+  // Authorized by the enrollment ticket/session only — never the dashboard JWT.
+  app.use("/api/enroll", createEnrollRouter(opts.enrollLimits));
 
   // ─── Body parsing — strict per-route limits ───────────────────────────────────
   // Webhooks need only ~200 bytes; keep other routes tight too.

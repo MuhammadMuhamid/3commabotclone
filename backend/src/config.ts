@@ -133,10 +133,33 @@ export const config = {
   realizationPlatformUrl: process.env.REALIZATION_PLATFORM_URL ?? "",
   realizationHmacSecret: process.env.REALIZATION_HMAC_SECRET ?? "",
 
+  /*
+   * OD-4: exchange-key enrollment and webhook-secret reveal on the Bot's own
+   * origin (`/enroll`, `/api/enroll/*`), opened by a single-use ticket the
+   * Platform mints over the signed control channel (C17). Off by default:
+   * while false the public routes answer 404 and C0 does not list `enroll.v1`.
+   */
+  enrollmentEnabled: process.env.ENROLLMENT_ENABLED === "true",
+  /**
+   * The ONLY place the enrollment page sends the browser back to, with
+   * `?enrollment=<id>&status=ok|failed` appended. Never taken from a request.
+   * Must be an absolute HTTPS URL without a query or fragment.
+   */
+  platformReturnUrl: process.env.PLATFORM_RETURN_URL ?? "",
+
   vapidPublicKey: process.env.VAPID_PUBLIC_KEY ?? "",
   vapidPrivateKey: process.env.VAPID_PRIVATE_KEY ?? "",
   vapidSubject: process.env.VAPID_SUBJECT ?? "mailto:alerts@localhost",
 };
+
+/** The Bot's public origin (scheme://host[:port]): the enrollment page's only allowed Origin. */
+export function botPublicOrigin(): string {
+  try {
+    return new URL(config.publicUrl).origin;
+  } catch {
+    return "";
+  }
+}
 
 /** Every problem found, so an operator fixes the whole file in one pass. */
 export function collectConfigErrors(): string[] {
@@ -226,6 +249,24 @@ export function collectConfigErrors(): string[] {
     }
   }
 
+  if (config.enrollmentEnabled) {
+    const loopbackHttp = (url: URL) =>
+      url.protocol === "http:" && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname);
+    try {
+      const url = new URL(config.publicUrl);
+      if (url.protocol !== "https:" && !loopbackHttp(url)) throw new Error();
+    } catch {
+      errors.push("PUBLIC_URL must be the Bot's HTTPS origin when ENROLLMENT_ENABLED=true (the enrollment page and its Origin check use it)");
+    }
+    try {
+      const url = new URL(config.platformReturnUrl);
+      if ((url.protocol !== "https:" && !loopbackHttp(url)) || url.username || url.password
+          || url.search || url.hash) throw new Error();
+    } catch {
+      errors.push("PLATFORM_RETURN_URL must be an absolute HTTPS URL with no query or fragment when ENROLLMENT_ENABLED=true");
+    }
+  }
+
   const vapidCount = [config.vapidPublicKey, config.vapidPrivateKey].filter(Boolean).length;
   if (vapidCount === 1) {
     errors.push("VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY must be configured together");
@@ -262,6 +303,8 @@ export function collectConfigErrors(): string[] {
     ["TRADITIONAL_PAPER_EXECUTION_ENABLED", /^(true|false)$/],
     ["IBKR_PAPER_GATEWAY_ENABLED", /^(true|false)$/],
     ["SECURE_COOKIES", /^(true|false)$/],
+    ["ENROLLMENT_ENABLED", /^(true|false)$/],
+    ["REALIZATION_CONTRACT_V2_ENABLED", /^(true|false)$/],
   ];
   for (const [name, accepted] of booleanFlags) {
     const raw = process.env[name];

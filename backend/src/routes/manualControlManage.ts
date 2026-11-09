@@ -23,6 +23,7 @@
  * `services/botAdmin.ts` and `services/exchangeAccounts.ts`.
  */
 import { Router, type Response } from "express";
+import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { asyncHandler } from "../middleware/errors.js";
 import { ControlRefusal } from "../services/controlCommands.js";
@@ -33,6 +34,10 @@ import {
 import {
   deleteExchangeAccountGuarded, listExchangeAccounts, readAccountBalance,
 } from "../services/exchangeAccounts.js";
+import {
+  mintAnswerForStorage, mintEnrollment, readEnrollmentStatus,
+} from "../services/enrollment.js";
+import { accountNameSchema } from "../services/exchangeAccounts.js";
 import { actorSchema, parseBody, pathId, refuse, runAndSend } from "./manualControl.js";
 
 export const manualControlManageRouter = Router();
@@ -180,4 +185,76 @@ manualControlManageRouter.get("/exchange-accounts/:id/balance", asyncHandler(asy
     if (sendReadRefusal(res, error)) return;
     throw error;
   }
+}));
+
+// ── C17 POST /exchange-enrollments ──────────────────────────────────────────
+
+/**
+ * Ticket minting has its own budget on top of the control write limiter:
+ * 5 per 10 minutes (trace §4.2). Mutable only so tests can widen it.
+ */
+export const enrollmentMintLimit = { windowMs: 10 * 60_000, max: 5 };
+export const enrollmentMintLimiter = rateLimit({
+  windowMs: enrollmentMintLimit.windowMs,
+  limit: () => enrollmentMintLimit.max,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many enrollment links requested; nothing was issued. Retry shortly.",
+    code: "bot_rate_limited" },
+});
+
+const mintSchema = z.object({
+  purpose: z.enum(["create", "replace", "reveal_webhook"]),
+  accountId: z.string().uuid().optional(),
+  botId: z.string().uuid().optional(),
+  testnet: z.boolean().optional(),
+  name: accountNameSchema.optional(),
+  mainnetConfirmation: z.literal("MAINNET").optional(),
+  actor: actorSchema,
+}).strict().superRefine((b, ctx) => {
+  const fail = (message: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+  if (b.purpose === "create") {
+    if (b.testnet === undefined || b.name === undefined) fail("create needs testnet and name");
+    if (b.accountId !== undefined || b.botId !== undefined) fail("create takes no accountId or botId");
+  } else if (b.purpose === "replace") {
+    if (b.accountId === undefined) fail("replace needs accountId");
+    if (b.name !== undefined || b.botId !== undefined) fail("replace takes no name or botId");
+  } else {
+    if (b.botId === undefined) fail("reveal_webhook needs botId");
+    if (b.accountId !== undefined || b.name !== undefined || b.testnet !== undefined
+        || b.mainnetConfirmation !== undefined) {
+      fail("reveal_webhook takes only botId");
+    }
+  }
+});
+
+manualControlManageRouter.post("/exchange-enrollments", enrollmentMintLimiter, asyncHandler(async (req, res) => {
+  const body = parseBody(mintSchema, req, res);
+  if (!body) return;
+  const { actor, ...input } = body;
+  // Never cache an answer that can carry a bearer ticket.
+  res.setHeader("Cache-Control", "no-store");
+  await runAndSend(req, res, {
+    kind: "enrollment_create",
+    target: input.purpose === "reveal_webhook" ? `bot:${input.botId}`
+      : input.purpose === "replace" ? `account:${input.accountId}` : "account:new",
+    params: input,
+    actor,
+    // X2: the ticket lives only in this live answer's enrollUrl.
+    persistResult: mintAnswerForStorage,
+  }, async () => {
+    const answer = await mintEnrollment(input, actor);
+    console.warn(`[audit] enrollment ${answer.enrollmentId} (${input.purpose}) issued by the Platform control channel`);
+    return { httpStatus: 201, body: answer };
+  });
+}));
+
+// ── C18 GET /exchange-enrollments/:id ───────────────────────────────────────
+
+manualControlManageRouter.get("/exchange-enrollments/:id", asyncHandler(async (req, res) => {
+  const id = pathId(req, res);
+  if (!id) return;
+  const status = await readEnrollmentStatus(id);
+  if (!status) { refuse(res, 404, "enrollment_not_found", "No enrollment with this id."); return; }
+  res.json(status);
 }));
