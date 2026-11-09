@@ -127,11 +127,14 @@ export function Input({
   min,
   step,
   right,
+  autoComplete,
 }: {
   label: string;
   value: string;
   onChange?: (v: string) => void;
   type?: string;
+  /** e.g. "off" for credential fields that must never be offered back by autofill. */
+  autoComplete?: string;
   readOnly?: boolean;
   hint?: string;
   placeholder?: string;
@@ -153,6 +156,8 @@ export function Input({
           min={min}
           step={step}
           placeholder={placeholder}
+          autoComplete={autoComplete}
+          spellCheck={autoComplete === "off" ? false : undefined}
           onChange={(e) => onChange?.(e.target.value)}
           className="w-full bg-[var(--color-panel-2)] border border-[var(--color-border)] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-[var(--color-accent)] focus:ring-1 focus:ring-[var(--color-accent)]/30 transition-all placeholder:text-[var(--color-muted)]"
         />

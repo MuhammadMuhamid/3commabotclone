@@ -16,7 +16,12 @@
  *     for the operator to read (C0/C8) and re-issue under a new request id;
  *   - the terminal state is written before the response is sent;
  *   - an order whose outcome is unknown is stored `pending` with the durable
- *     intent or attempt id, and is reported from that record's live state.
+ *     intent or attempt id, and is reported from that record's live state;
+ *   - X2: a command whose live answer carries a secret (a new webhook secret,
+ *     an enrollment ticket) stores and replays only `persistResult(body)`, a
+ *     non-secret projection. The secret exists in exactly one place: the one
+ *     live response. A lost response is recovered by a new command, never by
+ *     a replay or a C8 read.
  */
 import { createHash } from "node:crypto";
 import { Prisma, type BotControlCommand } from "@prisma/client";
@@ -57,7 +62,10 @@ export class ControlPending extends Error {
 export type ControlKind =
   | "halt" | "resume" | "risk_limits" | "bot_status" | "trade_close" | "trade_partial_close"
   // OD-3 C9: pause / resume new entries (target state).
-  | "entries";
+  | "entries"
+  // Slice 2 (contract v2.0, C10–C17)
+  | "bot_create" | "bot_update" | "bot_delete" | "bot_rotate_secret"
+  | "account_delete" | "enrollment_create";
 
 export interface ControlActor {
   platformUserId: string;
@@ -91,6 +99,10 @@ const INTERNAL_FAILURE: Terminal = {
   error: "Internal server error", code: "internal_error",
 };
 
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
+}
+
 function classify(error: unknown, kind: ControlKind, requestId: string): Terminal {
   if (error instanceof ControlRefusal) {
     return {
@@ -103,9 +115,10 @@ function classify(error: unknown, kind: ControlKind, requestId: string): Termina
     const body = { status: "pending", ...error.ref, detail: error.message };
     return { status: "pending", httpStatus: 202, body, ...error.ref };
   }
-  // Masked, as every 5xx is (`middleware/errors.ts`). Logged without the
-  // request body, which is never attached to these errors.
-  console.error(`[control] ${kind} ${requestId} failed`, error);
+  // Masked, as every 5xx is (`middleware/errors.ts`). X1: only the error's
+  // class name is logged — a Prisma error's message embeds the query's
+  // arguments, which for a bot create or rotate include the webhook secret.
+  console.error(`[control] ${kind} ${requestId} failed name=${errorName(error)}`);
   return INTERNAL_FAILURE;
 }
 
@@ -197,6 +210,10 @@ export interface ControlContext {
  * `action` returns the success body, or throws `ControlRefusal` /
  * `ControlPending`. Anything else it throws becomes a masked 500, stored as
  * `failed` with code `internal_error`.
+ *
+ * `persistResult` (X2) maps the live body to what is stored and replayed. It
+ * must drop every secret the live body carries. If it throws, nothing is
+ * stored (`result` null) — never the unprojected body.
  */
 export async function runControlCommand(
   input: {
@@ -205,6 +222,7 @@ export async function runControlCommand(
     target: string;
     params: unknown;
     actor: ControlActor;
+    persistResult?: (body: unknown) => unknown;
   },
   action: (ctx: ControlContext) => Promise<{ httpStatus?: number; body: unknown }>
 ): Promise<ControlResponse> {
@@ -236,7 +254,8 @@ export async function runControlCommand(
       } catch (error) {
         // Losing the pointer only makes C8 less informative; it must never
         // stop or alter the order path it observes.
-        console.error(`[control] ${input.kind} ${input.requestId}: order reference not recorded`, error);
+        console.error(`[control] ${input.kind} ${input.requestId}: order reference not recorded ` +
+          `name=${errorName(error)}`);
       }
     },
   };
@@ -248,6 +267,14 @@ export async function runControlCommand(
   } catch (error) {
     outcome = classify(error, input.kind, input.requestId);
   } finally {
+    let stored: string | null = null;
+    if (outcome.status !== "failed") {
+      try {
+        stored = JSON.stringify(input.persistResult ? input.persistResult(outcome.body) : outcome.body);
+      } catch {
+        stored = null; // X2: never fall back to the unprojected (secret-bearing) body
+      }
+    }
     // F6(b): the terminal row is written before anything is sent. If this
     // write itself fails the row stays `processing`, which is the fail-safe
     // direction: it is never run again.
@@ -256,7 +283,7 @@ export async function runControlCommand(
       data: {
         status: outcome.status,
         httpStatus: outcome.httpStatus,
-        result: outcome.status === "failed" ? null : JSON.stringify(outcome.body),
+        result: stored,
         error: outcome.error ?? null,
         code: outcome.code ?? null,
         // Never erase a reference recorded while the action ran.

@@ -85,6 +85,18 @@ export function clientFromAccount(account: ExchangeAccount): BinanceClient {
   });
 }
 
+/**
+ * A client from keys that are NOT stored — the OD-4 enrollment probe checks
+ * submitted keys with it (read-only calls) before anything is encrypted.
+ */
+export function clientFromKeys(keys: { apiKey: string; apiSecret: string }, testnet: boolean): BinanceClient {
+  return Binance({
+    apiKey: keys.apiKey,
+    apiSecret: keys.apiSecret,
+    httpBase: testnet ? "https://testnet.binance.vision" : undefined,
+  });
+}
+
 export function clientFromEnv(): BinanceClient | null {
   if (!config.binanceApiKey || !config.binanceApiSecret) return null;
   return Binance({

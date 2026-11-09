@@ -215,8 +215,11 @@ test("U5: an explicit testnet flag is honoured either way", async () => {
     { name: "testnet", apiKey: "fixture-key", apiSecret: "fixture-secret", testnet: true });
   assert.equal(testnet.status, 201);
   assert.equal(testnet.body.testnet, true);
+  // Slice 2: mainnet also needs the typed confirmation, now verified by the server
+  // (botAdminGuards.test.ts covers its refusal).
   const mainnet = await call("POST", "/api/exchange-accounts",
-    { name: "mainnet", apiKey: "fixture-key", apiSecret: "fixture-secret", testnet: false });
+    { name: "mainnet", apiKey: "fixture-key", apiSecret: "fixture-secret", testnet: false,
+      mainnetConfirmation: "MAINNET" });
   assert.equal(mainnet.status, 201);
   assert.equal(mainnet.body.testnet, false);
   // The response never carries key material.

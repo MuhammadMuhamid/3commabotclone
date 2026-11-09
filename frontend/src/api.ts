@@ -386,7 +386,10 @@ export const api = {
   exchange: {
     list:    ()                    => request<ExchangeAccount[]>("/api/exchange-accounts"),
     // U5: `testnet` is required — the API refuses an account with no explicit network.
-    create:  (body: { name: string; apiKey: string; apiSecret: string; testnet: boolean }) =>
+    // A mainnet account also needs `mainnetConfirmation: "MAINNET"`, verified by the server.
+    create:  (body: {
+      name: string; apiKey: string; apiSecret: string; testnet: boolean; mainnetConfirmation?: string;
+    }) =>
       request<ExchangeAccount>("/api/exchange-accounts", { method: "POST", body: JSON.stringify(body) }),
     balance: (id: string)          => request<{ usdt: number }>(`/api/exchange-accounts/${id}/balance`),
     // F1: total account value across all assets at live Binance prices

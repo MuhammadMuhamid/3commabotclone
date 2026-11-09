@@ -43,6 +43,7 @@ import {
   type ControlActor, type ControlContext, type ControlKind,
 } from "../services/controlCommands.js";
 import { countUnresolvedBotIntents, setBotStatus } from "./bots.js";
+import { buildControlCapabilities } from "../services/controlCapabilities.js";
 
 export const manualControlRouter = Router();
 
@@ -54,17 +55,12 @@ export const BOT_HALT_POLICY =
 /** `startInterval("tpsl", 30_000, …)` in index.ts. */
 const TPSL_POLL_INTERVAL_SEC = 30;
 
-/**
- * B-CAP: what this Bot can do, so the Platform shows a feature only when its
- * backend would accept it (absence = an older Bot: hide or disable it).
- * Additive; other capabilities are appended by their own slices.
- */
-export const BOT_CAPABILITIES: readonly string[] = ["entries.v1", "manualPositionFull.v1", "operatorExit.v1"];
-
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const idSchema = z.string().uuid();
 
-const actorSchema = z.object({
+// Exported for the Slice 2 routes (`manualControlManage.ts`), so every control
+// command validates the actor, the body and the path id identically.
+export const actorSchema = z.object({
   platformUserId: z.string().uuid(),
   stepUp: z.object({
     method: z.enum(["totp", "password"]),
@@ -120,12 +116,12 @@ const partialSchema = z.object({
   actor: actorSchema,
 }).strict();
 
-function refuse(res: Response, status: number, code: string, error: string): void {
+export function refuse(res: Response, status: number, code: string, error: string): void {
   res.status(status).json({ error, code });
 }
 
 /** Parse a body, or answer 400 with a code and return null. */
-function parseBody<T extends z.ZodTypeAny>(schema: T, req: Request, res: Response): z.infer<T> | null {
+export function parseBody<T extends z.ZodTypeAny>(schema: T, req: Request, res: Response): z.infer<T> | null {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
     refuse(res, 400, "invalid_request", parsed.error.errors[0]?.message ?? "invalid request body");
@@ -134,15 +130,19 @@ function parseBody<T extends z.ZodTypeAny>(schema: T, req: Request, res: Respons
   return parsed.data as z.infer<T>;
 }
 
-function pathId(req: Request, res: Response): string | null {
+export function pathId(req: Request, res: Response): string | null {
   const parsed = idSchema.safeParse(req.params.id);
   if (!parsed.success) { refuse(res, 400, "invalid_id", "the id in the path is not a valid id"); return null; }
   return parsed.data;
 }
 
-async function runAndSend(
+export async function runAndSend(
   req: Request, res: Response,
-  command: { kind: ControlKind; target: string; params: unknown; actor: ControlActor },
+  command: {
+    kind: ControlKind; target: string; params: unknown; actor: ControlActor;
+    /** X2: what is stored and replayed instead of a secret-bearing live body. */
+    persistResult?: (body: unknown) => unknown;
+  },
   action: (ctx: ControlContext) => Promise<{ httpStatus?: number; body: unknown }>
 ): Promise<void> {
   const outcome = await runControlCommand(
@@ -232,7 +232,8 @@ export async function readControlStatus() {
     manual: { enabled: config.manualTradingEnabled, mainnetEnabled: config.mainnetManualTradingEnabled },
     // OD-3: independent of `halt` and of the daily-loss latch.
     entries,
-    capabilities: [...BOT_CAPABILITIES],
+    // B-CAP: the Platform shows a feature only when its capability is listed.
+    capabilities: buildControlCapabilities(),
     version: operational.service.version,
     time: new Date().toISOString(),
   };

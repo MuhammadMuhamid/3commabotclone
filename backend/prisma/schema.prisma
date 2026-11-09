@@ -14,6 +14,9 @@ model ExchangeAccount {
   marketType   String      @default("spot")
   apiKeyEnc    String
   apiSecretEnc String
+  /// Last four characters of the API key (C15). Null for accounts stored
+  /// before the column existed; never backfilled by decrypting.
+  keyHint      String?
   testnet      Boolean     @default(false)
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
@@ -453,6 +456,10 @@ model StrategyOrderIntent {
   /// distinct, so they never collide with each other.
   authorizationNonceHash String? @unique
   skipExitCheck     Boolean  @default(false)
+  /// OD-5: where this order was routed when it was reserved — DRY_RUN,
+  /// TESTNET or MAINNET — from the same inputs that choose the endpoint.
+  /// Null on intents reserved before the column existed (read as UNKNOWN).
+  executionEnvironment String?
   smartTradeId      String?
   status            String   @default("requested")
   exchangeOrderId   String?
@@ -678,4 +685,57 @@ model ExchangeOrderAttempt {
   @@unique([intentKey, attempt])
   @@index([intentKey, status])
   @@index([smartTradeId, status])
+}
+
+/**
+ * OD-4: one exchange-key enrollment (create / replace an account's keys) or
+ * one webhook-secret reveal, carried out on the Bot's own origin.
+ *
+ * The Platform mints it over the signed control channel (C17) after a fresh
+ * step-up; the browser receives the ticket only in a URL fragment. The ticket
+ * and the session token are stored as SHA-256 hashes, are single-use (status
+ * compare-and-set), and live at most five minutes each. Purpose, network,
+ * account, bot and name come only from this row — never from the browser.
+ *
+ * status: issued -> opened (ticket exchanged for a session) -> completed |
+ * failed; "expired" is derived from the clocks when read.
+ */
+model ExchangeEnrollment {
+  id               String    @id @default(uuid())
+  ticketHash       String    @unique
+  /// create | replace | reveal_webhook
+  purpose          String
+  /// replace: the target; create: the account created on completion.
+  accountId        String?
+  /// reveal_webhook: the bot whose secret is shown.
+  botId            String?
+  testnet          Boolean?
+  name             String?
+  actorUserId      String
+  stepUpMethod     String
+  status           String    @default("issued")
+  expiresAt        DateTime
+  openedAt         DateTime?
+  sessionHash      String?   @unique
+  sessionExpiresAt DateTime?
+  /// Refused key submissions in this session (bounded; the third fails it).
+  attempts         Int       @default(0)
+  completedAt      DateTime?
+  outcome          String?
+  keyHint          String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([status, expiresAt])
+}
+
+/**
+ * OD-5: a capability the Platform advertised in its LAST acknowledged
+ * realization-ingest answer (`capabilities: [...]`). A row exists while the
+ * latest acknowledgement listed it; an acknowledgement without it deletes the
+ * row, so a rolled-back Platform stops receiving the newer shape.
+ */
+model PlatformCapability {
+  name   String   @id
+  seenAt DateTime
 }
