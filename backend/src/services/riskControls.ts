@@ -223,21 +223,138 @@ export async function getBotRiskLimits(): Promise<BotRiskLimits> {
   };
 }
 
+/** The halt as stored, including when it began. */
+export interface BotHaltState {
+  halted: boolean;
+  haltedBy: HaltSource | null;
+  haltedReason: string | null;
+  haltedAt: Date | null;
+}
+
+export async function readBotHaltState(): Promise<BotHaltState> {
+  const row = await prisma.riskControl.findUnique({ where: { id: SINGLETON_ID } });
+  return {
+    halted: row?.tradingHalted ?? false,
+    haltedBy: (row?.haltedBy as HaltSource | null | undefined) ?? null,
+    haltedReason: row?.haltedReason ?? null,
+    haltedAt: row?.haltedAt ?? null,
+  };
+}
+
+/**
+ * Halt trading, but NEVER replace a halt that is already in force.
+ *
+ * Finding 0.3: this used to overwrite `haltedBy` and the reason. Resume
+ * re-checks the rolling loss only for a `daily_loss` halt, so halting an
+ * installation that the daily-loss limit had already latched, then resuming,
+ * skipped that re-check entirely. The first halt's source, reason and time are
+ * what an operator needs to see, and what resume must judge.
+ *
+ * The write is one conditional statement (`tradingHalted = false` in the
+ * WHERE), so two halts racing each other cannot both win.
+ */
+export async function haltBotTrading(
+  opts: { reason?: string; by?: HaltSource } = {}
+): Promise<{ alreadyHalted: boolean; state: BotHaltState }> {
+  // The singleton may not exist yet; create it un-halted so the conditional
+  // write below is the only statement that can set the halt.
+  await prisma.riskControl.upsert({
+    where: { id: SINGLETON_ID }, create: { id: SINGLETON_ID }, update: {},
+  });
+  const claimed = await prisma.riskControl.updateMany({
+    where: { id: SINGLETON_ID, tradingHalted: false },
+    data: {
+      tradingHalted: true,
+      haltedReason: opts.reason ?? null,
+      haltedBy: opts.by ?? null,
+      haltedAt: new Date(),
+    },
+  });
+  return { alreadyHalted: claimed.count === 0, state: await readBotHaltState() };
+}
+
 export async function setBotTradingHalted(
   halted: boolean,
   opts: { reason?: string; by?: HaltSource } = {}
 ): Promise<void> {
-  const data = {
-    tradingHalted: halted,
-    haltedReason: halted ? (opts.reason ?? null) : null,
-    haltedBy: halted ? (opts.by ?? null) : null,
-    haltedAt: halted ? new Date() : null,
-  };
+  if (halted) {
+    // Every halt writer — operator and automatic latch alike — keeps an
+    // existing halt rather than replacing it (finding 0.3).
+    await haltBotTrading(opts);
+    return;
+  }
+  const data = { tradingHalted: false, haltedReason: null, haltedBy: null, haltedAt: null };
   await prisma.riskControl.upsert({
     where: { id: SINGLETON_ID },
     create: { id: SINGLETON_ID, ...data },
     update: data,
   });
+}
+
+export type ResumeOutcome =
+  | {
+    ok: true;
+    /** False when nothing was halted; nothing was changed. */
+    wasHalted: boolean;
+    previousHaltedBy: HaltSource | null;
+    previousReason: string | null;
+  }
+  | { ok: false; code: "still_breached" | "halt_changed"; message: string };
+
+/**
+ * Lift the halt — the one implementation behind the dashboard's
+ * `/api/ops/resume` and the Platform's signed control resume.
+ *
+ * A latched daily-loss halt is re-checked against live numbers first:
+ * resuming straight back into a breached limit would trip again on the next
+ * entry. (Lowering or disabling `maxDailyLossQuote` makes it resumable; that
+ * is the existing, deliberate policy.)
+ *
+ * The clear is a compare-and-set on the halt that was inspected, so a halt
+ * that changed in between — a new latch, a new reason — is never lifted on the
+ * strength of a check made against the old one.
+ */
+export async function resumeBotTrading(): Promise<ResumeOutcome> {
+  const before = await readBotHaltState();
+  if (!before.halted) {
+    return { ok: true, wasHalted: false, previousHaltedBy: null, previousReason: null };
+  }
+  const limits = await getBotRiskLimits();
+  if (before.haltedBy === "daily_loss" && limits.maxDailyLossQuote !== null) {
+    const snapshot = await readBotRiskSnapshot(limits.dailyLossWindowHours);
+    const loss = -Math.min(0, snapshot.realisedPnlInWindow);
+    if (loss >= limits.maxDailyLossQuote) {
+      return {
+        ok: false,
+        code: "still_breached",
+        message:
+          `refusing to resume: the rolling ${limits.dailyLossWindowHours}h loss ` +
+          `${loss.toFixed(2)} still meets the limit ${limits.maxDailyLossQuote.toFixed(2)}. ` +
+          "Raise the limit deliberately, or wait for the window to roll.",
+      };
+    }
+  }
+  // Matched on the source and reason (plain strings, robust to how a restored
+  // row encodes its timestamp). A halt cannot be replaced while it stands, so
+  // these only change if the halt was lifted and a new one set in between.
+  const cleared = await prisma.riskControl.updateMany({
+    where: {
+      id: SINGLETON_ID, tradingHalted: true,
+      haltedBy: before.haltedBy, haltedReason: before.haltedReason,
+    },
+    data: { tradingHalted: false, haltedReason: null, haltedBy: null, haltedAt: null },
+  });
+  if (cleared.count !== 1) {
+    return {
+      ok: false,
+      code: "halt_changed",
+      message: "The halt changed while it was being lifted; read the status again before resuming.",
+    };
+  }
+  return {
+    ok: true, wasHalted: true,
+    previousHaltedBy: before.haltedBy, previousReason: before.haltedReason,
+  };
 }
 
 export async function updateBotRiskLimits(patch: {

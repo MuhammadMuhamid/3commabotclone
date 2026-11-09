@@ -119,7 +119,17 @@ export async function reserveManualNonce(
  */
 const CONTROL_PLANE_PATHS = new Set(["/shariah-enforcement"]);
 
+/**
+ * The Platform's operator controls (status, halt/resume, risk limits, bot
+ * start/stop, strategy-trade Close/Partial, command status) are control plane
+ * for the same reason: an operator who turned manual ORDERS off must still be
+ * able to see and halt the Bot. Anchored prefix on the router-relative path,
+ * so only `/control/...` matches — not `/controlx` or `/x/control/`.
+ */
+const CONTROL_PLANE_PREFIX = "/control/";
+
 export function isManualControlPlanePath(path: string): boolean {
+  if (path.startsWith(CONTROL_PLANE_PREFIX)) return true;
   return CONTROL_PLANE_PATHS.has(path.replace(/\/+$/, "") || "/");
 }
 
@@ -151,7 +161,7 @@ export async function requireManualAuth(req: Request, res: Response, next: NextF
    * failure instead of believing the floor was armed.
    */
   if (!isUsableManualControlSecret(config.manualTradingHmacSecret)) {
-    res.status(503).json({ error: "manual control secret is not configured" });
+    res.status(503).json({ error: "manual control secret is not configured", code: "channel_not_configured" });
     return;
   }
   const result = verifyManualRequest({
@@ -164,15 +174,23 @@ export async function requireManualAuth(req: Request, res: Response, next: NextF
     signature: req.header(HEADER_SIGNATURE),
     body: req.method === "GET" || req.method === "HEAD" ? undefined : req.body,
   });
+  /*
+   * Typed codes, so the Platform can tell a CHANNEL failure (wrong key, clock
+   * skew, replay) apart from a business refusal that happens to share a status
+   * — a 409 here is a replayed nonce, a 409 from a route is a refusal.
+   */
   if (!result.ok) {
-    res.status(result.status).json({ error: result.error });
+    res.status(result.status).json({ error: result.error, code: "auth" });
     return;
   }
   const reserved = await reserveManualNonce(result.nonce, result.expiresAt, {
     prune: async (before) => { await prisma.manualNonce.deleteMany({ where: { expiresAt: { lt: before } } }); },
     create: async (nonce, expiresAt) => { await prisma.manualNonce.create({ data: { nonce, expiresAt } }); },
   });
-  if (!reserved) { res.status(409).json({ error: "manual command nonce was already used" }); return; }
+  if (!reserved) {
+    res.status(409).json({ error: "manual command nonce was already used", code: "nonce_replay" });
+    return;
+  }
   res.locals.manualRequestId = result.requestId;
   next();
 }

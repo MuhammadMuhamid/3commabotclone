@@ -126,28 +126,37 @@ export default function EditBot() {
         >
           <CopyField label="Webhook URL" value={saved.webhookUrl} />
 
-          {revealed?.entryWebhookJson ? (
+          {/*
+            U4 / finding 0.6: gate on what the backend actually returns. It
+            never sends an entry payload (direct TradingView BUYs are disabled),
+            so waiting for one meant Reveal showed nothing and the secret could
+            not be recovered from the UI at all.
+          */}
+          {revealed?.exitWebhookJson ? (
             <>
               <CopyField
-                label="Entry signal JSON"
-                value={JSON.stringify(revealed.entryWebhookJson, null, 2)}
+                label="Webhook secret — as configured in the Trading Scene deployment"
+                value={revealed.webhookSecret}
               />
-              {revealed.exitWebhookJson && (
-                <CopyField
-                  label="Exit signal JSON"
-                  value={JSON.stringify(revealed.exitWebhookJson, null, 2)}
-                />
+              <CopyField
+                label="Optional: TradingView exit (SELL) alert message"
+                value={JSON.stringify(revealed.exitWebhookJson, null, 2)}
+              />
+              {revealed.tradingViewSetup && (
+                <p className="text-[11px] text-[var(--color-muted)] leading-relaxed">
+                  {revealed.tradingViewSetup.note}
+                </p>
               )}
               <p className="text-[11px] text-[var(--color-warning)] leading-relaxed">
-                These payloads contain the webhook secret — the only
-                authentication on the order-placing endpoint. Do not paste them
-                anywhere but your own TradingView alert.
+                The secret and this payload are the only authentication on the
+                order-placing endpoint. Do not paste them anywhere but your own
+                deployment and TradingView alert.
               </p>
             </>
           ) : (
             <div>
               <Btn onClick={reveal} disabled={revealing}>
-                {revealing ? "Loading…" : "Reveal signal JSON"}
+                {revealing ? "Loading…" : "Reveal webhook secret"}
               </Btn>
               <p className="text-[11px] text-[var(--color-muted)] mt-2 leading-relaxed">
                 The secret is masked by default and served only when you ask for

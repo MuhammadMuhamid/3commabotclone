@@ -37,6 +37,7 @@ import {
   admitSpotEntry, noteSpotExit, readShariahContext, ShariahEnforcementError,
   shariahScopeForBot,
 } from "./shariah.js";
+import { ControlRefusal } from "./controlCommands.js";
 
 const DEDUPE_TTL = 120_000;
 /** Blocks a second buy/sell for same bot+pair within this window (TV order-fill duplicate guard) */
@@ -170,11 +171,13 @@ async function assertCanOpenTrade(bot: SignalBot, symbol: string): Promise<void>
 export async function processWebhook(
   body: WebhookBody,
   { skipExitCheck = false, clientFactory = getClient, strategyCrashHooks,
-    platformCorrelation }: {
+    platformCorrelation, expectSmartTradeId }: {
     skipExitCheck?: boolean;
     clientFactory?: (bot: SignalBot) => Promise<BinanceClient>;
     strategyCrashHooks?: StrategyCrashHooks;
     platformCorrelation?: { deploymentId: string; orderIntentId: string };
+    /** Refuse-only (contract F3): see the check after the active-trade selection. */
+    expectSmartTradeId?: string;
   } = {}
 ): Promise<{ status: string; detail?: unknown }> {
   if (isPlaceholderPayload(body)) {
@@ -570,6 +573,19 @@ export async function processWebhook(
         where: { botId: bot.id, pair: symbol, status: "active" },
         orderBy: { createdAt: "desc" },
       });
+      /*
+       * Contract F3, REFUSE-ONLY: a Close for one specific trade must not sell
+       * a different one. The selection above is unchanged; if it did not pick
+       * the trade the caller named (a sibling opened since the caller's check,
+       * or the named trade closed meanwhile), stop here — before the close
+       * lock, the intent and any order. This never selects a trade and never
+       * bypasses a check.
+       */
+      if (expectSmartTradeId !== undefined && active?.id !== expectSmartTradeId) {
+        throw new ControlRefusal(422, "ambiguous_trade",
+          "The trade to close is no longer the only active trade for this bot and pair, " +
+          "or it is no longer active. Nothing was sold.");
+      }
       if (!active && !skipExitCheck) {
         throw new Error(`No active SmartTrade for ${symbol}`);
       }

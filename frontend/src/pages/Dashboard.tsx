@@ -16,6 +16,11 @@ import { startDashboardPolling } from "../dashboardPolling";
 
 type BotFilter = "all" | "active" | "stopped";
 
+/** What a Bot halt does — the policy, stated as the contract states it (F2). */
+const HALT_POLICY =
+  "While the Bot is halted, TP/SL protection is not checked and TradingView exits are refused; " +
+  "your own SELL / Close / Partial still work.";
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function fmtUsdt(n: number, digits = 4) {
@@ -248,6 +253,12 @@ function PartialCloseModal({
     setBusy(true);
     try {
       const result = await api.trades.partialClose(trade.id, pct);
+      if ("status" in result) {
+        // Submitted, outcome not yet known: never announced as sold or failed.
+        toast(result.detail, "info");
+        onDone();
+        return;
+      }
       // BOT-P1-6: report what the exchange actually filled, not what was asked
       // for. A zero fill sold nothing and must never be announced as executed.
       if (result.executedQty > 0) {
@@ -454,7 +465,10 @@ function BotRow({
 
   const remove = async () => {
     // F5: inform user that trade history is preserved
-    if (!confirm(`Delete "${b.name}"?\n\nHistorical trade data will be preserved in your Trade History.`)) return;
+    if (!confirm(
+      `Delete "${b.name}"?\n\nHistorical trade data will be preserved in your Trade History. ` +
+      "A bot with active trades or orders still being reconciled cannot be deleted: close them first."
+    )) return;
     setBusy(true);
     try {
       await api.bots.remove(b.id);
@@ -582,8 +596,19 @@ function TradeRow({
     if (!confirm("Close this trade at market price?")) return;
     setBusy(true);
     try {
-      await api.trades.close(t.id);
-      toast("Trade closed", "success");
+      const result = await api.trades.close(t.id);
+      const warning = (result.detail as { warning?: string } | undefined)?.warning;
+      if (result.status === "pending") {
+        toast("Close submitted; the outcome is not known yet and is being reconciled.", "info");
+      } else if (result.status === "ignored_duplicate") {
+        // Only when an earlier exit already closed the position. A recent exit
+        // that left it open is refused (409 exit_recent) and shown as an error.
+        toast("No new order was placed: an earlier exit already closed this position.", "info");
+      } else if (warning) {
+        toast(warning, "info");
+      } else {
+        toast("Trade closed", "success");
+      }
       onClose();
     } catch (e) {
       toast(e instanceof Error ? e.message : "Close failed", "error");
@@ -672,7 +697,20 @@ function TradeRow({
         </td>
         {/* Actions */}
         <td className="p-3 pr-4 text-right">
-          {tab === "active" ? (
+          {tab === "active" && t.source === "manual" ? (
+            /*
+             * U3: a manual position was opened from Trading Scene and is
+             * closed from its Trade panel (SELL), which keeps the manual
+             * ledger and its TP/SL correct. The Bot refuses Close / Partial
+             * for it, so they are not offered.
+             */
+            <span
+              className="text-[10px] text-[var(--color-muted)]"
+              title="Opened from Trading Scene. Close it from the Trading Scene Trade panel (SELL)."
+            >
+              Managed in Trading Scene
+            </span>
+          ) : tab === "active" ? (
             <div className="flex items-center gap-1.5 justify-end">
               {/* F4: Partial close */}
               <Btn
@@ -812,8 +850,13 @@ function ExchangeBadge({ exchange }: {
   );
 }
 
-function OpsBadge({ mode, reason }: {
+function OpsBadge({ mode, halted, reason }: {
   mode: "DRY_RUN" | "HALTED" | "LIVE" | "UNKNOWN";
+  /**
+   * Read from `risk.tradingHalted`, not from `mode`: DRY_RUN outranks HALTED in
+   * `mode`, and production runs DRY_RUN, so a halt was invisible (0.4).
+   */
+  halted: boolean;
   reason: string | null;
 }) {
   const styles: Record<typeof mode, string> = {
@@ -833,14 +876,27 @@ function OpsBadge({ mode, reason }: {
     : mode === "DRY_RUN" ? "Orders are simulated — nothing reaches the exchange"
     : mode === "LIVE" ? "A webhook will place a REAL Binance Spot order"
     : "Could not read the trading mode from the server";
+  const haltTitle = `Trading is halted${reason ? `: ${reason}` : ""}. ${HALT_POLICY}`;
   return (
-    <span
-      title={title}
-      aria-label={title}
-      className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border font-medium ${styles[mode]}`}
-    >
-      <Zap size={11} aria-hidden="true" />{label[mode]}
-    </span>
+    <>
+      <span
+        title={title}
+        aria-label={title}
+        className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border font-medium ${styles[mode]}`}
+      >
+        <Zap size={11} aria-hidden="true" />{label[mode]}
+      </span>
+      {/* A dry-run Bot can be halted too: shown alongside DRY RUN, never hidden by it. */}
+      {halted && mode !== "HALTED" && (
+        <span
+          title={haltTitle}
+          aria-label={haltTitle}
+          className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border font-medium ${styles.HALTED}`}
+        >
+          <ShieldAlert size={11} aria-hidden="true" />HALTED
+        </span>
+      )}
+    </>
   );
 }
 
@@ -853,6 +909,8 @@ export default function Dashboard() {
   const [accounts, setAccounts]     = useState<ExchangeAccount[]>([]);
   const [opsMode, setOpsMode]       = useState<"DRY_RUN" | "HALTED" | "LIVE" | "UNKNOWN">("UNKNOWN");
   const [haltReason, setHaltReason] = useState<string | null>(null);
+  // The halt itself, independent of DRY_RUN (finding 0.4). Null = unknown.
+  const [halted, setHalted]         = useState<boolean | null>(null);
   const [exchange, setExchange] = useState<{
     envTestnet: boolean;
     accounts: { id: string; name: string; testnet: boolean }[];
@@ -879,10 +937,11 @@ export default function Dashboard() {
 
   /** BOT-011: halt or resume all trading, with the confirmation the API requires. */
   const toggleHalt = async () => {
-    if (opsMode === "HALTED") {
+    if (halted) {
       if (!confirm(
-        "Resume trading?\n\nThis re-arms real order flow. If the halt was " +
-        "latched by a risk limit, the API will refuse until that limit is clear."
+        "Resume trading?\n\nThis re-arms the automation: signals, TradingView exits and " +
+        "the TP/SL monitors. If the halt was latched by the daily-loss limit, the API " +
+        "will refuse until that limit is clear."
       )) return;
       setHaltBusy(true);
       try {
@@ -897,8 +956,9 @@ export default function Dashboard() {
       return;
     }
     const reason = prompt(
-      "Halt ALL trading.\n\nEvery entry and exit will be refused until you " +
-      "resume. Give a reason so the halt is explicable later:"
+      "Halt the Bot's automation.\n\n" +
+      "Signals and new entries are refused until you resume. " + HALT_POLICY + "\n\n" +
+      "Give a reason so the halt is explicable later:"
     );
     if (reason === null) return;
     if (reason.trim().length < 3) {
@@ -907,8 +967,13 @@ export default function Dashboard() {
     }
     setHaltBusy(true);
     try {
-      await api.ops.halt(reason.trim());
-      toast("Trading halted", "success");
+      const result = await api.ops.halt(reason.trim());
+      toast(
+        result.alreadyHalted
+          ? `Already halted${result.haltedBy ? ` (${result.haltedBy})` : ""}; the existing halt was kept`
+          : "Trading halted",
+        result.alreadyHalted ? "info" : "success"
+      );
       await load(true);
     } catch (e) {
       toast(e instanceof Error ? e.message : "Could not halt", "error");
@@ -935,6 +1000,7 @@ export default function Dashboard() {
       setAccounts(accs);
       setOpsMode(ops ? ops.mode : "UNKNOWN");
       setHaltReason(ops?.risk.haltedReason ?? null);
+      setHalted(ops?.risk.tradingHalted ?? null);
       setExchange(ops?.exchange ?? null);
       setProtectiveOrders(ops?.protectiveOrders ?? null);
       setLoadError(null);
@@ -977,20 +1043,25 @@ export default function Dashboard() {
             LIVE means a webhook places a real order. Previously only DRY RUN
             was shown, and a halt did not exist to be shown.
           */}
-          <OpsBadge mode={opsMode} reason={haltReason} />
+          <OpsBadge mode={opsMode} halted={halted === true} reason={haltReason} />
           <ExchangeBadge exchange={exchange} />
-          {opsMode !== "DRY_RUN" && (
+          {/*
+            Finding 0.4: shown in DRY_RUN too. A halt gates a dry run exactly as
+            it gates a live one, and production runs DRY_RUN. Hidden only while
+            the halt state is unknown.
+          */}
+          {halted !== null && (
             <Btn
               small
               onClick={toggleHalt}
               disabled={haltBusy}
               className={
-                opsMode === "HALTED"
+                halted
                   ? "text-[var(--color-success)] border-[var(--color-success)]/30 bg-[var(--color-success-dim)]"
                   : "text-[var(--color-danger)] border-[var(--color-danger)]/30 bg-[var(--color-danger-dim)]"
               }
             >
-              {opsMode === "HALTED" ? "Resume trading" : "Halt all trading"}
+              {halted ? "Resume trading" : "Halt trading"}
             </Btn>
           )}
           <button
@@ -1013,6 +1084,17 @@ export default function Dashboard() {
         <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-[var(--color-danger-dim)] border border-[var(--color-danger)]/30 text-[var(--color-danger)] text-sm">
           <X size={15} className="flex-shrink-0" />
           {loadError}
+        </div>
+      )}
+
+      {/* The halt, stated where it cannot be missed, whatever the dry-run setting (0.4) */}
+      {halted && (
+        <div className="flex items-start gap-3 px-4 py-3 rounded-xl bg-[var(--color-danger-dim)] border border-[var(--color-danger)]/30 text-xs text-[var(--color-danger)]">
+          <ShieldAlert size={14} className="flex-shrink-0 mt-0.5" aria-hidden="true" />
+          <span>
+            <span className="font-semibold">Bot halted{haltReason ? `: ${haltReason}` : ""}. </span>
+            {HALT_POLICY}
+          </span>
         </div>
       )}
 

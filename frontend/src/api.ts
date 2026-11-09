@@ -104,9 +104,14 @@ export type SignalBot = {
   webhookSecret: string;
   secretRevealed: boolean;
   webhookUrl: string;
-  /** Present only in a revealed response — these embed the secret. */
-  entryWebhookJson?: object;
+  /**
+   * Present only in a revealed response — it embeds the secret. There is no
+   * entry payload: direct TradingView BUY alerts are disabled, and the
+   * Platform is the sole BUY authority (U4).
+   */
   exitWebhookJson?: object;
+  /** The backend's TradingView guidance, including the exit-only note. */
+  tradingViewSetup?: { webhookUrl: string; alertCondition: string; message: string; note: string };
   entryEnabled: boolean;
   entryVolumePct: number;
   entryOrderType: string;
@@ -143,6 +148,11 @@ export type SmartTrade = {
   id: string;
   botId: string | null;
   botName: string;
+  /**
+   * `manual` positions were opened from Trading Scene and are closed from its
+   * Trade panel; the Bot refuses Close / Partial for them (U3).
+   */
+  source?: "strategy" | "manual";
   pair: string;
   direction: string;
   status: string;
@@ -268,14 +278,20 @@ export const api = {
         time: string;
       }>("/api/ops/status"),
 
+    // An existing halt is kept and reported (`alreadyHalted`), never replaced.
     halt: (reason: string) =>
-      request<{ halted: true; reason: string }>("/api/ops/halt", {
+      request<{
+        halted: true; alreadyHalted: boolean; haltedBy: string | null;
+        reason: string | null; haltedAt: string | null;
+      }>("/api/ops/halt", {
         method: "POST",
         body: JSON.stringify({ confirmation: "HALT_TRADING", reason }),
       }),
 
     resume: () =>
-      request<{ halted: false; previousReason?: string | null; note?: string }>("/api/ops/resume", {
+      request<{
+        halted: false; previousHaltedBy?: string | null; previousReason?: string | null; note?: string;
+      }>("/api/ops/resume", {
         method: "POST",
         body: JSON.stringify({ confirmation: "RESUME_TRADING" }),
       }),
@@ -305,7 +321,16 @@ export const api = {
       if (botId) params.set("botId", botId);
       return request<SmartTrade[]>(`/api/trades?${params}`);
     },
-    close:  (id: string) => request(`/api/trades/${id}/close`, { method: "POST" }),
+    /**
+     * `pending` (HTTP 202) means the order was submitted and its outcome is not
+     * known yet — never report it as closed. `ignored_duplicate` placed no new
+     * order because an earlier exit already closed the position; a recent exit
+     * that left it open is a 409 `exit_recent` error instead. A
+     * `detail.warning` means it executed but a later check failed.
+     */
+    close:  (id: string) =>
+      request<{ status: "ok" | "ignored_duplicate" | "pending"; detail?: unknown }>(
+        `/api/trades/${id}/close`, { method: "POST" }),
     remove: (id: string) => request<void>(`/api/trades/${id}`, { method: "DELETE" }),
     // F4: sell a percentage of an active trade
     // BOT-P1-6: `executedQty` is what actually sold and `requestedQty` what was
@@ -313,10 +338,12 @@ export const api = {
     // when nothing executed — there is no PartialClose row for a sale that did
     // not happen.
     partialClose: (id: string, pct: number) =>
+      // A 202 `pending` means the order was submitted and its outcome is not
+      // known yet; it is reconciled from the exchange, never re-sent.
       request<{
         partial: PartialClose | null; trade: SmartTrade;
         requestedQty: number; executedQty: number; detail?: string;
-      }>(
+      } | { status: "pending"; attemptId: string; detail: string }>(
         `/api/trades/${id}/partial-close`,
         { method: "POST", body: JSON.stringify({ pct }) }
       ),
@@ -324,7 +351,8 @@ export const api = {
 
   exchange: {
     list:    ()                    => request<ExchangeAccount[]>("/api/exchange-accounts"),
-    create:  (body: { name: string; apiKey: string; apiSecret: string; testnet?: boolean }) =>
+    // U5: `testnet` is required — the API refuses an account with no explicit network.
+    create:  (body: { name: string; apiKey: string; apiSecret: string; testnet: boolean }) =>
       request<ExchangeAccount>("/api/exchange-accounts", { method: "POST", body: JSON.stringify(body) }),
     balance: (id: string)          => request<{ usdt: number }>(`/api/exchange-accounts/${id}/balance`),
     // F1: total account value across all assets at live Binance prices
