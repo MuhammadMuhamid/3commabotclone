@@ -171,6 +171,25 @@ test("D2 classifier: one whitelist of definite rejections; everything else is un
     "duplicate");
 });
 
+test("D2/OD-1 cancel classifier: -2011 -> query; the definite whitelist -> not cancelled; everything else -> unknown",
+  () => {
+    const classify = (binance as unknown as {
+      classifyCancelFailure?: (error: unknown) => { outcome: string };
+    }).classifyCancelFailure;
+    assert.equal(typeof classify, "function", "binance.ts exports classifyCancelFailure");
+    const outcome = (error: unknown) => classify!(error).outcome;
+    assert.equal(outcome(binanceError("Unknown order sent.", -2011)), "query");
+    for (const code of [-1002, -1003, -1015, -1021, -1022, -1100, -1131, -2014, -2015]) {
+      assert.equal(outcome(binanceError("refused", code)), "not_canceled", `${code}: not processed`);
+    }
+    assert.equal(outcome(htmlStatusError(429)), "not_canceled");
+    for (const error of [binanceError("x", -1006), binanceError("x", -1007), binanceError("x", -1000),
+      binanceError("x", -2013), htmlStatusError(502), fetchFailed(), timeoutError(), new Error("?"),
+      binanceError("Duplicate order sent.", -2010)]) {
+      assert.equal(outcome(error), "unknown", "a cancel that may have been applied is never assumed either way");
+    }
+  });
+
 // ── 2. every manual submit path, for every uncertain answer ──────────────────
 
 const MANUAL_PATHS = [

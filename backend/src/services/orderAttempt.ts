@@ -56,10 +56,11 @@ export interface OpenAttemptInput {
  *
  * Recovery dispatches on this: `tpsl` and `partial` settle through the shared
  * position-accounting authority in `exitSettlement.ts`, while
- * `manual-protection` is booked by the manual `ManualOrder` lifecycle and must
- * never be applied twice by a second resolver.
+ * `manual-protection` and `manual-sweep` (OD-1: the SELL of a race-fill
+ * position) are booked by the manual `ManualOrder` lifecycle and must never be
+ * applied twice by a second resolver.
  */
-export type ExitAttemptOrigin = "tpsl" | "partial" | "manual-protection";
+export type ExitAttemptOrigin = "tpsl" | "partial" | "manual-protection" | "manual-sweep";
 
 /**
  * The attempt that currently owns `intentKey`, creating the next one when the

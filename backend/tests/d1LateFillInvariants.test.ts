@@ -1,8 +1,10 @@
 /**
  * D1 — a manual LIMIT entry that is still working when its position exits.
  *
- * Policy-neutral invariants only (cancel-first versus track-separately is the
- * owner's decision, and nothing here cancels or protects a remainder):
+ * The invariants hold under the owner's policy, OD-1 option C (cancel the
+ * working entry first, then sweep a race fill — see od1CancelFirstSweep.test.ts).
+ * The tests that pinned the interim rule (a late fill became an unprotected
+ * position the operator had to sell) were flipped to option C on 2026-11-09:
  *
  *   I1  a closed trade is never reactivated by an entry snapshot;
  *   I2  snapshots apply as monotonic deltas (duplicates/reorders change nothing);
@@ -14,7 +16,8 @@
  *   I6  a protection exit is `submitted` before the wire and queried before any
  *       resubmission;
  *   I7  a remainder below the exchange minimum closes as dust;
- *   I8  before a TP/SL or full manual exit, a working entry is refreshed first.
+ *   I8  before a TP/SL or full manual exit, a working entry is refreshed (now:
+ *       cancelled) first.
  *
  * Real services + disposable SQLite + the in-memory fake exchange. No network.
  */
@@ -121,16 +124,22 @@ function wireSells(exchange: FakeBinance) {
 const near = (actual: number, expected: number) =>
   assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
 
-// ── I1 / I4: the audit's D1, inverted ───────────────────────────────────────
+// ── I1 / I4: the audit's D1, inverted (option C) ────────────────────────────
+
+const unknownCancel = () => ({ error: binanceError("Execution status unknown.", -1007) });
 
 for (const leg of [
   { name: "TP", price: "111", reason: "manual_take_profit" },
   { name: "SL", price: "89", reason: "manual_stop_loss" },
 ]) {
-  test(`D1 partial -> ${leg.name} exit -> TRUE late fill: the closed trade stays closed and the late 0.6 is flagged, unprotected and sellable`,
-    async () => {
+  test(`D1 partial -> ${leg.name} exit -> TRUE late fill (the pre-cancel's outcome was unknown): the closed trade stays closed and the late 0.6 is its own race-fill position, swept (option C)`,
+    async (t) => {
+      t.mock.method(console, "error", () => undefined);
       const account = await createAccount();
-      const exchange = fakeBinance({ freeBase: "0.4" });
+      // The pre-cancel is unknown and both reads after it fail, so the exit
+      // sells what is known and the late fill is learned only afterwards.
+      const exchange = fakeBinance({ freeBase: "0.4", cancelFailures: [unknownCancel()],
+        lookupFailures: [new Error("socket hang up"), new Error("socket hang up")] });
       const { entry, trade, cid } = await workingEntry(account, exchange);
       exchange.setPrice(leg.price);
       await checkManualProtection(factory(exchange));
@@ -156,32 +165,45 @@ for (const leg of [
       near(late[0]!.quantity, 0.6);
       assert.equal(late[0]!.manualTpPrice, null, "no TP/SL is silently attached");
       assert.equal(late[0]!.manualSlPrice, null);
-      assert.equal(late[0]!.protectionState, "late_fill_unprotected");
+      assert.equal(late[0]!.protectionState, "race_fill_sweep", "option C: swept, not left to the operator");
 
       const flagged = await reload.order(entry.id);
       assert.equal(flagged.status, "filled");
-      assert.match(flagged.error ?? "", /LATE FILL/);
-      assert.match(flagged.error ?? "", /NOT protected by TP\/SL/);
+      assert.match(flagged.error ?? "", /^RACE FILL/);
+      assert.match(flagged.error ?? "", /no TP\/SL/);
       near(after.quantity + late[0]!.quantity, flagged.filledBaseQty);
 
-      // Nothing auto-protects the late quantity, whatever the price does.
+      // Option C: the poller sells it (sweep), whatever the price does.
       exchange.setPrice(leg.price);
       await checkManualProtection(factory(exchange));
-      assert.equal(wireSells(exchange).length, 1);
-
-      // It is exitable through the supported manual SELL route.
-      const sell = await submitManualOrder({ requestId: `d1-late-sell-${leg.name}`, accountId: account.id,
-        symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", baseQuantity: 0.6,
-        positionId: late[0]!.id }, factory(exchange));
-      assert.equal(sell.status, "filled");
-      assert.equal((await reload.trade(late[0]!.id)).status, "closed");
+      assert.equal(wireSells(exchange).length, 2);
+      near(Number(wireSells(exchange)[1]!.executedQty), 0.6);
+      const swept = await reload.trade(late[0]!.id);
+      assert.equal(swept.status, "closed");
+      assert.equal(swept.closedReason, "entry_race_fill_swept");
       assert.equal((await reload.trade(trade.id)).status, "closed");
     });
 }
 
+test("D1 a legacy late-fill position (interim rule, before OD-1) stays unprotected, unswept and exitable by a manual SELL",
+  async () => {
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "0.6", price: "111" });
+    const late = await prisma.smartTrade.create({ data: { source: "manual", exchangeAccountId: account.id,
+      botName: "Manual (late fill)", pair: "BTCUSDT", status: "active", quantity: 0.6, quoteSpent: 60,
+      clientOrderId: "legacy-entry:late:1", protectionState: "late_fill_unprotected" } });
+    await checkManualProtection(factory(exchange));
+    assert.equal(wireSells(exchange).length, 0, "nothing auto-sells a legacy late fill");
+    const sell = await submitManualOrder({ requestId: "d1-late-sell-legacy", accountId: account.id,
+      symbol: "BTCUSDT", side: "SELL", orderType: "MARKET", baseQuantity: 0.6, positionId: late.id },
+    factory(exchange));
+    assert.equal(sell.status, "filled");
+    assert.equal((await reload.trade(late.id)).status, "closed");
+  });
+
 // ── I1 / I2 / I5: the unchanged snapshot re-read after the exit ─────────────
 
-test("D1 the reconciler re-reading an unchanged partial after a TP exit resurrects nothing, and the working entry is flagged",
+test("D1 the reconciler re-reading an unchanged partial after a TP exit resurrects nothing, and the entry is now CANCELLED (option C), not flagged",
   async () => {
     const account = await createAccount();
     const exchange = fakeBinance({ freeBase: "0.4" });
@@ -198,14 +220,17 @@ test("D1 the reconciler re-reading an unchanged partial after a TP exit resurrec
     assert.equal((await latePositions(account)).length, 0, "no fill, no late position");
     assert.equal(wireSells(exchange).length, 1);
 
-    const working = await reload.order(entry.id);
-    assert.equal(working.status, "partially_filled");
-    assert.equal(working.protectionState, "entry_working_after_exit");
-    assert.match(working.error ?? "", /ENTRY STILL WORKING/);
+    const canceled = await reload.order(entry.id);
+    assert.equal(canceled.status, "canceled", "cancelled before the exit");
+    assert.equal(canceled.exitCancelState, "done");
+    assert.equal(canceled.error, null, "nothing left working, nothing to flag");
+    assert.equal(exchange.cancels.length, 1);
 
-    // The operator can still cancel it through the existing route.
-    const canceled = await cancelManualOrder(entry.id, undefined, factory(exchange));
-    assert.equal(canceled.status, "canceled");
+    // Nothing is left for the operator's cancel route to cancel.
+    const refusal = await cancelManualOrder(entry.id, undefined, factory(exchange))
+      .then(() => null, (error: unknown) => error);
+    assert.ok(refusal instanceof manual.ManualTradingError);
+    assert.equal(refusal.httpStatus, 409);
     assert.equal((await reload.trade(trade.id)).status, "closed");
   });
 
@@ -236,9 +261,12 @@ test("D1/I8 snapshot says 0.4 but the exchange has 1.0 filled: the SL exit sells
   });
 
 test("D1/I8 a failed entry refresh never blocks protection: the exit uses the known quantity and is flagged",
-  async () => {
+  async (t) => {
+    t.mock.method(console, "error", () => undefined);
     const account = await createAccount();
-    const exchange = fakeBinance({ freeBase: "0.4", lookupFailures: [new Error("socket hang up")] });
+    // Option C: the refresh is the fallback of a pre-cancel that did not settle the entry.
+    const exchange = fakeBinance({ freeBase: "0.4", cancelFailures: [unknownCancel()],
+      lookupFailures: [new Error("socket hang up")] });
     const { trade } = await workingEntry(account, exchange);
     exchange.setPrice("111");
     await checkManualProtection(factory(exchange));
@@ -247,53 +275,59 @@ test("D1/I8 a failed entry refresh never blocks protection: the exit uses the kn
     assert.match(exit.error ?? "", /ENTRY REFRESH FAILED/);
   });
 
-// ── fill during cancellation ────────────────────────────────────────────────
+// ── fill during cancellation (option C) ─────────────────────────────────────
 
-test("D1 a fill that lands during the cancel, after the TP closed the trade, is a flagged late fill",
+test("D1 a fill that lands during the pre-exit cancel is sold by the same TP exit (option C), not left as a late fill",
   async () => {
     const account = await createAccount();
     const exchange = fakeBinance({ freeBase: "0.4" });
-    const { entry, trade, cid } = await workingEntry(account, exchange);
+    const { entry, trade } = await workingEntry(account, exchange);
+    exchange.fillBeforeCancel({ executedQty: "0.7", quote: "70" });
     exchange.setPrice("111");
     await checkManualProtection(factory(exchange));
-    exchange.fill(cid, "0.7", "70", "PARTIALLY_FILLED");
-    const canceled = await cancelManualOrder(entry.id, undefined, factory(exchange));
+    assert.equal(wireSells(exchange).length, 1);
+    near(Number(wireSells(exchange)[0]!.executedQty), 0.7);
+    assert.equal((await reload.trade(trade.id)).status, "closed");
+    assert.equal((await latePositions(account)).length, 0);
+    const canceled = await reload.order(entry.id);
     assert.equal(canceled.status, "canceled");
-    assert.equal((await reload.trade(trade.id)).status, "closed");
-    const late = await latePositions(account);
-    assert.equal(late.length, 1);
-    near(late[0]!.quantity, 0.3);
-    assert.match((await reload.order(entry.id)).error ?? "", /LATE FILL/);
+    assert.match(canceled.error ?? "", /^RACE FILL/);
   });
 
-test("D1 cancel -2011 because the fill won: the FILLED answer after the exit is a flagged late fill",
+test("D1 cancel -2011 because the fill won before the exit: the FILLED answer is sold by the exit (option C)",
   async () => {
+    const account = await createAccount();
+    const exchange = fakeBinance({ freeBase: "1" });
+    const { entry, trade, cid } = await workingEntry(account, exchange);
+    exchange.fill(cid, "1", "100", "FILLED");
+    exchange.setPrice("111");
+    await checkManualProtection(factory(exchange));
+    assert.equal((await reload.order(entry.id)).status, "filled");
+    near(Number(wireSells(exchange)[0]!.executedQty), 1);
+    assert.equal((await reload.trade(trade.id)).status, "closed");
+    assert.equal((await latePositions(account)).length, 0);
+  });
+
+test("D1 cancel rejected (-2011, then not found): the pre-cancel flags it without blocking the exit; the operator route still answers a coded refusal",
+  async (t) => {
+    t.mock.method(console, "error", () => undefined);
     const account = await createAccount();
     const exchange = fakeBinance({ freeBase: "0.4" });
     const { entry, trade, cid } = await workingEntry(account, exchange);
+    exchange.book.delete(cid);
     exchange.setPrice("111");
     await checkManualProtection(factory(exchange));
-    exchange.fill(cid, "1", "100", "FILLED");
-    const result = await cancelManualOrder(entry.id, undefined, factory(exchange));
-    assert.equal(result.status, "filled");
+    assert.equal((await reload.trade(trade.id)).status, "closed", "the exit was not blocked");
+    const flagged = await reload.order(entry.id);
+    assert.equal(flagged.exitCancelState, "failed");
+    assert.match(flagged.error ?? "", /^ENTRY CANCEL FAILED/);
+    const refusal = await cancelManualOrder(entry.id, undefined, factory(exchange))
+      .then(() => null, (error: unknown) => error);
+    assert.ok(refusal instanceof manual.ManualTradingError);
+    assert.equal((refusal as unknown as { code?: string }).code, "order_not_found_at_exchange");
+    assert.equal((await reload.order(entry.id)).status, "partially_filled");
     assert.equal((await reload.trade(trade.id)).status, "closed");
-    near((await latePositions(account))[0]!.quantity, 0.6);
   });
-
-test("D1 cancel rejected (-2011, then not found): a coded refusal, no state regression", async () => {
-  const account = await createAccount();
-  const exchange = fakeBinance({ freeBase: "0.4" });
-  const { entry, trade, cid } = await workingEntry(account, exchange);
-  exchange.setPrice("111");
-  await checkManualProtection(factory(exchange));
-  exchange.book.delete(cid);
-  const refusal = await cancelManualOrder(entry.id, undefined, factory(exchange))
-    .then(() => null, (error: unknown) => error);
-  assert.ok(refusal instanceof manual.ManualTradingError);
-  assert.equal((refusal as unknown as { code?: string }).code, "order_not_found_at_exchange");
-  assert.equal((await reload.order(entry.id)).status, "partially_filled");
-  assert.equal((await reload.trade(trade.id)).status, "closed");
-});
 
 // ── I2: duplicate and reordered snapshots ───────────────────────────────────
 
@@ -341,10 +375,13 @@ test("D1/I2 duplicate, reordered and corrective snapshots change only what is ne
 // ── isolation ───────────────────────────────────────────────────────────────
 
 test("D1 account and symbol isolation: a late fill on account A touches nothing on B or on ETHUSDT",
-  async () => {
+  async (t) => {
+    t.mock.method(console, "error", () => undefined);
     const accountA = await createAccount();
     const accountB = await createAccount();
-    const exchangeA = fakeBinance({ freeBase: "0.4" });
+    // A's pre-cancel is unknown and its reads fail, so the late fill is learned after the close.
+    const exchangeA = fakeBinance({ freeBase: "0.4", cancelFailures: [unknownCancel()],
+      lookupFailures: [new Error("socket hang up"), new Error("socket hang up")] });
     const exchangeB = fakeBinance({ freeBase: "1" });
     const { trade: tradeA, cid } = await workingEntry(accountA, exchangeA);
     const tradeB = await prisma.smartTrade.create({ data: { source: "manual", exchangeAccountId: accountB.id,

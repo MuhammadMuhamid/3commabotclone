@@ -3,9 +3,10 @@ import { Prisma, type ExchangeAccount, type ManualOrder, type SmartTrade } from 
 import { config } from "../config.js";
 import { prisma } from "../lib/prisma.js";
 import { normalizeSymbol, parsePair } from "../lib/symbols.js";
+import { acquireTradeClose, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import { canonicalJson } from "../contract/realizationEventContract.js";
 import {
-  classifyExchangeFailure, clientOrderId, describeUncertainFailure, floorToStep,
+  classifyCancelFailure, classifyExchangeFailure, clientOrderId, describeUncertainFailure, floorToStep,
 } from "./binance.js";
 import {
   BinanceManualExchange, type ManualExchangeAdapter, type ManualLotRules, type ManualOrderIntent,
@@ -152,12 +153,31 @@ export const LATE_FILL_UNPROTECTED = "late_fill_unprotected";
 export const DUST_CLOSED_REASON = "dust_below_exchange_minimum";
 
 /**
+ * OD-1 (owner-approved option C): a position holding fills of an entry that
+ * landed after its trade closed, while the cancel-first policy was engaged.
+ * Unlike `late_fill_unprotected`, the protection poller SELLS it ("sweep").
+ */
+export const RACE_FILL_SWEEP = "race_fill_sweep";
+/** OD-1: the closedReason of a race-fill position the sweep sold. */
+export const RACE_FILL_SWEPT_REASON = "entry_race_fill_swept";
+/** OD-1: cancels per entry under the policy (pre-exit and finalizer together). */
+export const EXIT_CANCEL_MAX_ATTEMPTS = 5;
+/** OD-1: the attempt after which an unconfirmed cancel is called out (and again at the maximum). */
+export const EXIT_CANCEL_ALERT_AT = 3;
+
+/** Who decided an exit, for the OD-1 sweep's halt rule. */
+export type ExitOrigin = "automation" | "operator";
+
+/**
  * Operator-facing flags written to `ManualOrder.error`. A later snapshot clears
  * a transient note ("reconciliation pending ...") but must never erase one of
  * these: they record something the operator has to act on.
  */
 const DURABLE_FLAG_PREFIXES = [
   "LATE FILL", "LATE SELL FILL", "ENTRY STILL WORKING", "ENTRY REFRESH FAILED", "DUST",
+  // OD-1 / X7
+  "RACE FILL", "ENTRY CANCEL PENDING", "ENTRY CANCEL FAILED", "ENTRY CANCELED AFTER EXIT",
+  "SWEEP FAILED", "NETTING UNCONFIRMED",
 ];
 
 function durableFlag(error: string | null): string | null {
@@ -176,8 +196,32 @@ function entryWorkingMessage(tradeId: string, filledBase: number, symbol: string
     "through the cancel route if you do not want them.";
 }
 
-/** Effects that must not run inside the ledger transaction (logs, push). */
-type AfterCommit = () => void;
+/** OD-1: the trade closed while its entry is still working; the Bot owes a cancel. */
+function entryCancelPendingMessage(tradeId: string, filledBase: number, symbol: string): string {
+  return `ENTRY CANCEL PENDING: position ${tradeId} was closed while this LIMIT BUY was still ` +
+    `working at the exchange (${fmtQty(filledBase)} ${baseAssetOf(symbol)} filled so far). The Bot ` +
+    "is cancelling the remainder. Until the exchange confirms the cancel, further fills can still " +
+    "land: any that do are tracked as a separate race-fill position, which has no TP/SL and which " +
+    "the Bot sells automatically.";
+}
+
+function entryCanceledAfterExitMessage(tradeId: string, filledBase: number, symbol: string): string {
+  return `ENTRY CANCELED AFTER EXIT: the remainder of this LIMIT BUY was cancelled after its ` +
+    `position ${tradeId} closed; ${fmtQty(filledBase)} ${baseAssetOf(symbol)} filled in total.`;
+}
+
+/** A note that only describes a still-working entry, and so ends with it. */
+function isWorkingNote(error: string | null): boolean {
+  return error != null &&
+    (error.startsWith("ENTRY STILL WORKING") || error.startsWith("ENTRY CANCEL PENDING"));
+}
+
+/**
+ * Effects that must not run inside the ledger transaction (logs, push, and the
+ * OD-1 inline cancel attempt, which talks to the exchange). Run in order after
+ * the commit; an async one is awaited.
+ */
+type AfterCommit = () => void | Promise<void>;
 
 /**
  * Apply one authoritative exchange snapshot and update the canonical SmartTrade ledger.
@@ -190,20 +234,32 @@ type AfterCommit = () => void;
  *       re-read-unchanged snapshot changes nothing, and a partial exit taken
  *       while the entry is still working is never undone;
  *   I4  a BUY fill that lands after its trade closed is recorded, flagged and
- *       kept sellable as its own unprotected position; a SELL fill that lands
- *       after its position closed is flagged instead of silently dropped;
+ *       kept sellable as its own position; a SELL fill that lands after its
+ *       position closed is flagged instead of silently dropped;
  *   I5  an entry still working when its trade closes is flagged.
+ *
+ * OD-1 (owner-approved option C, cancel first then sweep): when the trade
+ * closes while its entry still works, the entry is marked for a cancel
+ * (`markEntryForExitCancel`), and a fill that still lands afterwards becomes a
+ * `race_fill_sweep` position the protection poller sells. With `adapter`, one
+ * cancel attempt runs right after the commit; without it, the reconciler owes it.
+ *
+ * X7: a terminal BUY whose fills were booked GROSS (the trades lookup failed)
+ * still accepts the later NETTED figure for the same fills, and the downward
+ * correction reduces whichever ledger holds them — never anything else.
  */
-export async function applyManualSnapshot(orderId: string, snapshot: ManualOrderSnapshot): Promise<ManualOrder> {
+export async function applyManualSnapshot(orderId: string, snapshot: ManualOrderSnapshot,
+  options: { adapter?: ManualExchangeAdapter } = {}): Promise<ManualOrder> {
   const afterCommit: AfterCommit[] = [];
   const result = await prisma.$transaction(async (tx) => {
     const before = await tx.manualOrder.findUnique({ where: { id: orderId } });
     if (!before) throw new ManualTradingError("manual order not found", 404);
+    const nettingCorrection = isNettingCorrection(before, snapshot);
     // Cancel/reconcile requests can overlap after obtaining their exchange
     // snapshots. Do not let the slower, older response regress terminal truth
     // or cumulative fills. Equal quote fill is intentionally accepted because
     // a later trades lookup can correct BUY net base commission downward.
-    if (isComplete(before.status) ||
+    if ((isComplete(before.status) && !nettingCorrection) ||
         snapshot.executedQuoteQuantity + 1e-9 < before.filledQuoteQty) {
       return before;
     }
@@ -220,14 +276,22 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
       : snapshot.executedBaseQuantity;
     const deltaBase = executedBase - before.filledBaseQty;
     const deltaQuote = Math.max(0, snapshot.executedQuoteQuantity - before.filledQuoteQty);
-    const status = manualLifecycleStatus(snapshot.status);
+    // A netting correction changes the base figure only; the order's terminal
+    // status and completion time are already the exchange's truth.
+    const status = nettingCorrection ? before.status : manualLifecycleStatus(snapshot.status);
+    // X7: netted unless this snapshot is gross AND brings fills not yet netted.
+    const fillsNetted = snapshot.netted !== false || !(executedBase > 0) ||
+      (sameQuote && before.fillsNetted);
+    // OD-1: once the entry is terminal at the exchange, nothing is left to cancel.
+    const exitCancelState = isComplete(status) && before.exitCancelState != null
+      ? "done" : before.exitCancelState;
     // A simulated (`dry-`) id never replaces an id the exchange really assigned.
     const exchangeOrderId = isRealExchangeOrderId(before.exchangeOrderId) &&
       !isRealExchangeOrderId(snapshot.exchangeOrderId)
       ? before.exchangeOrderId : (snapshot.exchangeOrderId || before.exchangeOrderId);
     let protectionState = manualProtectionState(
       before.takeProfitPrice, before.stopLossPrice, executedBase);
-    let error: string | null = before.side === "SELL" ? durableFlag(before.error) : null;
+    let error: string | null = durableFlag(before.error);
 
     if (before.side === "BUY") {
       const existing = await tx.smartTrade.findUnique({ where: { manualOrderId: before.id } });
@@ -254,19 +318,25 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
       } else {
         // I1: the trade is closed and stays closed, whatever this snapshot says.
         protectionState = isComplete(status) ? "removed" : ENTRY_WORKING_AFTER_EXIT;
-        error = durableFlag(before.error);
-        // An entry that has stopped working is no longer "still working".
-        if (isComplete(status) && error?.startsWith("ENTRY STILL WORKING")) error = null;
+        const engaged = before.exitCancelState != null;
+        // An entry that has stopped working is no longer "still working" or
+        // "cancel pending": say how it ended instead.
+        if (isComplete(status) && !isComplete(before.status) && isWorkingNote(error)) {
+          error = engaged && status === "canceled"
+            ? entryCanceledAfterExitMessage(existing.id, executedBase, before.symbol) : null;
+        }
         /*
-         * OWNER POLICY HOOK — deliberately not implemented. Whether a working
-         * entry's remainder is CANCELLED before an exit, or a late fill is
-         * automatically PROTECTED, is the owner's decision (scout-3 §5.7). A
-         * policy would plug in here and in the I5 flag below. Until then the
-         * Bot only records, flags, and keeps the late quantity sellable.
+         * OD-1 (owner-approved option C): the exit path pre-cancels a working
+         * entry, so a fill during that race is already in the exit. What lands
+         * here is what became known only after the close (an unknown cancel,
+         * a close by a path that did not pre-cancel): it is booked as its own
+         * position, `race_fill_sweep` when the policy is engaged, which the
+         * protection poller sells. A legacy entry (policy not engaged) keeps
+         * the interim rule: an unprotected late-fill position.
          */
         if (deltaBase > QTY_EPSILON) {
           const late = await recordLateEntryFill(tx, before, existing, deltaBase, deltaQuote,
-            snapshot, executedBase, !isComplete(status));
+            snapshot, executedBase, !isComplete(status), engaged);
           error = late.message;
           afterCommit.push(() => {
             console.error(`[manual] ${late.message}`);
@@ -275,9 +345,18 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
               orderId: `${snapshot.exchangeOrderId || before.clientOrderId}-late-${late.positionId}` })
               .catch((e) => console.error("late-fill notification failed", e));
           });
+        } else if (deltaBase < -QTY_EPSILON) {
+          // X7: the netted figure for fills already booked after the close.
+          const netted = await reduceLatePosition(tx, before, -deltaBase);
+          if (netted) {
+            afterCommit.push(() => console.error(`[manual] X7: position ${netted.id} reduced from ` +
+              `${fmtQty(netted.from)} to ${fmtQty(netted.to)} by the netted base-asset commission of ` +
+              `entry ${before.clientOrderId}`));
+          }
         } else if (!error && !isComplete(status)) {
-          // I5, for a trade closed by a path that did not stamp it (e.g. dust).
-          error = entryWorkingMessage(existing.id, executedBase, before.symbol);
+          // I5, for a trade closed by a path that did not stamp it.
+          error = engaged ? entryCancelPendingMessage(existing.id, executedBase, before.symbol)
+            : entryWorkingMessage(existing.id, executedBase, before.symbol);
         }
       }
     }
@@ -296,7 +375,9 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
                 pnlUsdt: realised.pnlUsdt, pnlPct: realised.pnlPct }
             : { quantity: remaining, quoteSpent: position.quoteSpent * ratio } });
         if (closes && position.manualOrderId) {
-          await flagEntryStillWorking(tx, position.id, position.manualOrderId, afterCommit);
+          // OD-1: the entry may still be working; the policy owes it a cancel.
+          await markEntryForExitCancel(tx, position.id, position.manualOrderId,
+            manualOrderOrigin(before), afterCommit, options.adapter);
         }
       } else if (position) {
         // I4 (SELL side): this used to be dropped without a trace.
@@ -314,12 +395,27 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
       status, exchangeOrderId,
       filledBaseQty: executedBase,
       filledQuoteQty: snapshot.executedQuoteQuantity,
-      averageFillPrice: snapshot.averagePrice, submittedAt: before.submittedAt ?? new Date(),
-      completedAt: isComplete(status) ? new Date() : null, protectionState, error,
+      averageFillPrice: nettingCorrection ? before.averageFillPrice : snapshot.averagePrice,
+      submittedAt: before.submittedAt ?? new Date(),
+      completedAt: nettingCorrection ? before.completedAt : isComplete(status) ? new Date() : null,
+      protectionState: nettingCorrection ? before.protectionState : protectionState,
+      error, fillsNetted, exitCancelState,
     }});
   });
-  for (const effect of afterCommit) effect();
+  for (const effect of afterCommit) await effect();
   return result;
+}
+
+/**
+ * X7: the one snapshot a terminal order still accepts — a BUY whose fills were
+ * booked gross (the trades lookup failed) now answered netted: the same
+ * cumulative quote, a base figure no higher than the gross one.
+ */
+function isNettingCorrection(before: ManualOrder, snapshot: ManualOrderSnapshot): boolean {
+  return isComplete(before.status) && before.side === "BUY" && !before.fillsNetted &&
+    snapshot.netted !== false && before.filledQuoteQty > 0 &&
+    Math.abs(snapshot.executedQuoteQuantity - before.filledQuoteQty) <= 1e-9 &&
+    snapshot.executedBaseQuantity <= before.filledBaseQty + QTY_EPSILON;
 }
 
 function fmtQty(value: number): string {
@@ -340,32 +436,50 @@ type LedgerTx = Pick<typeof prisma, "smartTrade" | "manualOrder">;
  * the protection poller never selects. It is linked to its entry by a
  * deterministic, unique `clientOrderId` (`<entry client id>:late:<n>`), never
  * by `manualOrderId`, which belongs to the closed trade.
+ *
+ * OD-1: when the cancel-first policy is engaged for the entry (`engaged`), a
+ * NEW such position is a `race_fill_sweep` position, which the protection
+ * poller sells. An existing open one keeps its state: one already handed to
+ * the operator (`SWEEP FAILED`) is not taken back.
  */
 async function recordLateEntryFill(tx: LedgerTx, entry: ManualOrder, closed: SmartTrade,
   deltaBase: number, deltaQuote: number, snapshot: ManualOrderSnapshot, cumulativeBase: number,
-  stillWorking: boolean): Promise<{ positionId: string; message: string }> {
+  stillWorking: boolean, engaged: boolean): Promise<{ positionId: string; message: string }> {
   const prefix = `${entry.clientOrderId}:late:`;
   const open = await tx.smartTrade.findFirst({ where: { clientOrderId: { startsWith: prefix },
     status: "active" }, orderBy: { createdAt: "desc" } });
   let positionId: string;
+  let sweep: boolean;
   if (open) {
     await tx.smartTrade.update({ where: { id: open.id }, data: {
       quantity: open.quantity + deltaBase, quoteSpent: open.quoteSpent + deltaQuote } });
     positionId = open.id;
+    sweep = open.protectionState === RACE_FILL_SWEEP;
   } else {
     const earlier = await tx.smartTrade.count({ where: { clientOrderId: { startsWith: prefix } } });
     const price = snapshot.averagePrice ?? (deltaBase > 0 ? deltaQuote / deltaBase : null);
     const created = await tx.smartTrade.create({ data: {
-      source: "manual", exchangeAccountId: entry.exchangeAccountId, botName: "Manual (late fill)",
+      source: "manual", exchangeAccountId: entry.exchangeAccountId,
+      botName: engaged ? "Manual (race fill)" : "Manual (late fill)",
       pair: entry.symbol, direction: "long", status: "active", entryPrice: price,
       currentPrice: price, buyPrice: price, quantity: deltaBase, quoteSpent: deltaQuote,
       exchangeOrderId: snapshot.exchangeOrderId || entry.exchangeOrderId,
       clientOrderId: `${prefix}${earlier + 1}`, manualTpPrice: null, manualSlPrice: null,
-      protectionType: null, protectionState: LATE_FILL_UNPROTECTED,
+      protectionType: null, protectionState: engaged ? RACE_FILL_SWEEP : LATE_FILL_UNPROTECTED,
     } });
     positionId = created.id;
+    sweep = engaged;
   }
   const base = baseAssetOf(entry.symbol);
+  if (sweep) {
+    return { positionId, message: `RACE FILL: ${fmtQty(deltaBase)} ${base} of this BUY filled ` +
+      `after its position ${closed.id} was closed${closed.closedReason ? ` (${closed.closedReason})` : ""} ` +
+      `(cumulative fill now ${fmtQty(cumulativeBase)} ${base}). It was not added to the closed ` +
+      `position: it is tracked as race-fill position ${positionId}, which has no TP/SL and which ` +
+      "the Bot sells automatically (sweep)." + (stillWorking
+      ? " The order is still working: the Bot keeps cancelling it, and further fills can land until a cancel is confirmed."
+      : "") };
+  }
   const message = `LATE FILL: ${fmtQty(deltaBase)} ${base} of this BUY filled after its position ` +
     `${closed.id} was closed${closed.closedReason ? ` (${closed.closedReason})` : ""} ` +
     `(cumulative fill now ${fmtQty(cumulativeBase)} ${base}). This quantity is NOT protected by ` +
@@ -377,16 +491,55 @@ async function recordLateEntryFill(tx: LedgerTx, entry: ManualOrder, closed: Sma
   return { positionId, message };
 }
 
-/** D1/I5: the trade closed while its entry is still working at the exchange. */
-async function flagEntryStillWorking(tx: LedgerTx, tradeId: string, entryId: string,
-  afterCommit: AfterCommit[]): Promise<void> {
+/**
+ * X7: a downward (netting) correction of fills already booked to the open
+ * late / race-fill position of `entry` reduces that position, floored at 0.
+ * Nothing else is touched: if the correction belongs partly to fills the
+ * closed trade already sold, the position is reduced by more than its share,
+ * which only ever sells less.
+ */
+async function reduceLatePosition(tx: LedgerTx, entry: ManualOrder, amount: number):
+  Promise<{ id: string; from: number; to: number } | null> {
+  const open = await tx.smartTrade.findFirst({ where: {
+    clientOrderId: { startsWith: `${entry.clientOrderId}:late:` }, status: "active" },
+  orderBy: { createdAt: "desc" } });
+  if (!open) return null;
+  const to = Math.max(0, open.quantity - amount);
+  await tx.smartTrade.update({ where: { id: open.id }, data: { quantity: to } });
+  return { id: open.id, from: open.quantity, to };
+}
+
+/**
+ * D1/I5 + OD-1: the trade closed while its entry is still working at the
+ * exchange (replaces `flagEntryStillWorking`). The policy engages: the entry
+ * owes a cancel (`exitCancelState: pending`, unless an earlier cancel already
+ * left it `unknown` or `failed`), and the exit's origin is recorded for the
+ * sweep's halt rule. With an adapter, one cancel attempt runs right after the
+ * commit; the reconciler's finalizer owns every later one.
+ */
+async function markEntryForExitCancel(tx: LedgerTx, tradeId: string, entryId: string,
+  origin: ExitOrigin, afterCommit: AfterCommit[], adapter?: ManualExchangeAdapter): Promise<void> {
   const entry = await tx.manualOrder.findUnique({ where: { id: entryId } });
-  if (!entry || !PENDING_STATUSES.includes(entry.status) || durableFlag(entry.error)) return;
-  // OWNER POLICY HOOK: a cancel-first policy would cancel the remainder here.
-  const message = entryWorkingMessage(tradeId, entry.filledBaseQty, entry.symbol);
+  if (!entry || entry.side !== "BUY" || !PENDING_STATUSES.includes(entry.status)) return;
+  const kept = durableFlag(entry.error);
+  const note = kept && !isWorkingNote(kept) ? kept
+    : entryCancelPendingMessage(tradeId, entry.filledBaseQty, entry.symbol);
+  const state = entry.exitCancelState ?? "pending";
   await tx.manualOrder.update({ where: { id: entry.id }, data: {
-    protectionState: ENTRY_WORKING_AFTER_EXIT, error: message } });
-  afterCommit.push(() => console.error(`[manual] ${message}`));
+    protectionState: ENTRY_WORKING_AFTER_EXIT, exitCancelState: state,
+    exitOrigin: entry.exitOrigin ?? origin,
+    exitCancelRequestedAt: entry.exitCancelRequestedAt ?? new Date(), error: note } });
+  afterCommit.push(async () => {
+    console.error(`[manual] ${note}`);
+    if (adapter && (state === "pending" || state === "unknown")) {
+      try {
+        await finalizeEntryAfterExit(entry.id, adapter);
+      } catch (error) {
+        console.error(`[manual] inline cancel of entry ${entry.id} after its exit failed; ` +
+          "the reconciler retries it", error);
+      }
+    }
+  });
 }
 
 /**
@@ -419,7 +572,9 @@ export async function manualExitCapacity(position: Pick<SmartTrade, "id" | "pair
  * The dust stays in the wallet, untracked, as on the strategy side.
  */
 export async function closeManualDust(positionId: string, rules: ManualLotRules,
-  price: number | null, noteOrderId?: string): Promise<boolean> {
+  price: number | null, noteOrderId?: string,
+  /** OD-1: who closed it, and the adapter for the entry's inline cancel attempt. */
+  opts: { adapter?: ManualExchangeAdapter; origin?: ExitOrigin } = {}): Promise<boolean> {
   if (!(rules.minQty > 0) && !(rules.minNotional > 0)) return false;
   const position = await prisma.smartTrade.findUnique({ where: { id: positionId } });
   if (!position || position.status !== "active") return false;
@@ -439,6 +594,13 @@ export async function closeManualDust(positionId: string, rules: ManualLotRules,
   if (closed.count !== 1) return false;
   if (noteOrderId) await prisma.manualOrder.update({ where: { id: noteOrderId }, data: { error: note } });
   console.error(`[manual] ${note}`);
+  if (position.manualOrderId) {
+    // OD-1: a dust close is a close; a still-working entry owes a cancel too.
+    const effects: AfterCommit[] = [];
+    await markEntryForExitCancel(prisma, position.id, position.manualOrderId,
+      opts.origin ?? "automation", effects, opts.adapter);
+    for (const effect of effects) await effect();
+  }
   return true;
 }
 
@@ -470,6 +632,237 @@ export async function refreshWorkingEntry(position: SmartTrade, adapter: ManualE
     `${fmtQty(position.quantity)}.`;
   console.error(`[manual] ${flag}`);
   return { position: fresh, entryWorking: true, flag };
+}
+
+/**
+ * OD-1: what one cancel of a working entry achieved.
+ *
+ *   canceled          the exchange confirmed the cancel (its cumulative fill applied)
+ *   already_terminal  -2011, and the lookup found it had already ended (FILLED)
+ *   not_found         -2011, and the lookup found no such order: nothing to cancel
+ *   not_canceled      a definite rejection of the cancel request, or the order
+ *                     is still working after it; retry later
+ *   unknown           the cancel's outcome is unknown (-1006/-1007, 5xx,
+ *                     transport): it may or may not have been applied
+ *   refused_dry_run   A1: DRY_RUN cannot cancel an order placed on the exchange
+ *   skipped           nothing done (not working, claimed elsewhere, given up)
+ */
+export type ExitCancelOutcome = "canceled" | "already_terminal" | "not_found" | "not_canceled" |
+  "unknown" | "refused_dry_run" | "skipped";
+
+/** True when the adapter can only SIMULATE (the A1 guard's question). */
+function simulatesCancels(adapter: ManualExchangeAdapter): boolean {
+  return (adapter as { dryRun?: boolean }).dryRun ?? config.dryRun;
+}
+
+const LIVE_ENTRY_IN_DRY_RUN = "DRY_RUN is on and this entry was placed on the exchange, so the Bot " +
+  "cannot cancel it (a simulated cancel would leave a live order untracked)";
+
+function entryCancelFailedMessage(entry: ManualOrder, detail: string): string {
+  return `ENTRY CANCEL FAILED: ${detail}. This LIMIT BUY (${entry.clientOrderId}) may still be ` +
+    "working at the exchange, and any further fill is NOT protected by TP/SL: cancel it on " +
+    "Binance manually. The Bot does not retry it.";
+}
+
+/**
+ * One cancel of a working entry, issued by whichever OD-1 path claimed the
+ * attempt (`attemptNo`). Never blind: a -2011 is resolved by a lookup in the
+ * adapter, a definite rejection leaves the cancel owed (`pending`), anything
+ * else is `unknown` and is queried before any later decision. The cancel's own
+ * cumulative fill is applied through `applyManualSnapshot` (I2), so a fill in
+ * the race lands in whichever ledger is current. At the maximum attempts the
+ * policy gives up loudly: `failed`, a durable flag and an ALERT.
+ */
+async function performExitCancel(entry: ManualOrder, adapter: ManualExchangeAdapter,
+  attemptNo: number): Promise<ExitCancelOutcome> {
+  let outcome: "not_canceled" | "unknown";
+  let lastError: string;
+  try {
+    // A1: a simulated entry is cancelled locally, keeping its recorded fills
+    // (the dry-run adapter cannot know them). A live order never reaches here
+    // under DRY_RUN: every caller refuses it first, and so does this guard.
+    if (simulatesCancels(adapter) && isRealExchangeOrderId(entry.exchangeOrderId)) {
+      throw new ManualTradingError(LIVE_ENTRY_IN_DRY_RUN, 409, "live_order_in_dry_run");
+    }
+    const snapshot = simulatesCancels(adapter)
+      ? { exchangeOrderId: entry.exchangeOrderId ?? `dry-${entry.clientOrderId}`,
+        clientOrderId: entry.clientOrderId, status: "CANCELED" as const,
+        executedBaseQuantity: entry.filledBaseQty, executedQuoteQuantity: entry.filledQuoteQty,
+        averagePrice: entry.averageFillPrice, simulated: true }
+      : await adapter.cancel(entry.symbol, entry.clientOrderId);
+    const applied = await applyManualSnapshot(entry.id, snapshot, { adapter });
+    if (isComplete(applied.status)) return applied.status === "canceled" ? "canceled" : "already_terminal";
+    outcome = "not_canceled";
+    lastError = `the exchange still reports the order ${snapshot.status} after the cancel`;
+  } catch (error) {
+    if (error instanceof ManualOrderNotFoundError) {
+      const flag = entryCancelFailedMessage(entry, error.message);
+      await prisma.manualOrder.updateMany({ where: { id: entry.id, status: { in: PENDING_STATUSES } },
+        data: { exitCancelState: "failed", exitCancelLastError: error.message, error: flag } });
+      console.error(`[manual] ${flag}`);
+      return "not_found";
+    }
+    const failure = classifyCancelFailure(error);
+    outcome = failure.outcome === "not_canceled" ? "not_canceled" : "unknown";
+    lastError = failure.message;
+  }
+  const giveUp = attemptNo >= EXIT_CANCEL_MAX_ATTEMPTS;
+  const flag = giveUp ? entryCancelFailedMessage(entry,
+    `${attemptNo} cancels could not be confirmed (last: ${lastError})`) : null;
+  await prisma.manualOrder.updateMany({ where: { id: entry.id, status: { in: PENDING_STATUSES } },
+    data: { exitCancelState: giveUp ? "failed" : outcome === "unknown" ? "unknown" : "pending",
+      exitCancelLastError: lastError, ...(flag ? { error: flag } : {}) } });
+  if (flag) {
+    console.error(`[manual] ALERT: ${flag}`);
+  } else if (attemptNo === EXIT_CANCEL_ALERT_AT) {
+    console.error(`[manual] ALERT: ${attemptNo} cancels of LIMIT BUY ${entry.clientOrderId} ` +
+      `(${entry.symbol}) are unconfirmed (last: ${lastError}). It may still be working and fill ` +
+      "unprotected until a cancel is confirmed; the Bot retries up to " +
+      `${EXIT_CANCEL_MAX_ATTEMPTS} times. Consider cancelling it on Binance.`);
+  }
+  return outcome;
+}
+
+/**
+ * OD-1 pre-exit cancel (trace §1.2 item 1): the sibling of `refreshWorkingEntry`
+ * that CANCELS a still-working entry before an exit is sized, instead of only
+ * reading it. A fill that lands during the race is in the cancel's cumulative
+ * answer, is added to the still-active position (I2) and is sold by the same
+ * exit — option C, "sold as part of the same exit".
+ *
+ * A system action that only reduces exposure: no mainnet confirmation, never
+ * refused by halt or pause. The A1 dry-run guard still applies: a live order
+ * under DRY_RUN is never "simulated" away. Whatever the cancel's outcome, the
+ * exit is never blocked: a cancel that did not settle the entry falls back to
+ * the I8 refresh by query, so the exit is still sized from current fills.
+ *
+ * `raceDelta` is what the cancel (or the fallback refresh) added to the
+ * position over the quantity passed in.
+ */
+export async function cancelWorkingEntryForExit(position: SmartTrade, adapter: ManualExchangeAdapter,
+  origin: ExitOrigin): Promise<{ position: SmartTrade | null; entryWorking: boolean;
+    outcome: ExitCancelOutcome; raceDelta: number; flag?: string }> {
+  const untouched = { position, entryWorking: false, outcome: "skipped" as const, raceDelta: 0 };
+  if (!position.manualOrderId) return untouched;
+  const entry = await prisma.manualOrder.findUnique({ where: { id: position.manualOrderId } });
+  if (!entry || !["open", "partially_filled"].includes(entry.status)) return untouched;
+
+  let outcome: ExitCancelOutcome;
+  let flag: string | undefined;
+  if (simulatesCancels(adapter) && isRealExchangeOrderId(entry.exchangeOrderId)) {
+    // A1: owed, not faked. The reconciler cancels it once DRY_RUN is off.
+    await prisma.manualOrder.update({ where: { id: entry.id }, data: {
+      exitCancelState: entry.exitCancelState === "failed" ? "failed" : "pending",
+      exitOrigin: entry.exitOrigin ?? origin, exitCancelRequestedAt: new Date(),
+      exitCancelLastError: LIVE_ENTRY_IN_DRY_RUN } });
+    outcome = "refused_dry_run";
+    flag = `ENTRY CANCEL PENDING: ${LIVE_ENTRY_IN_DRY_RUN}. It may still fill: cancel it on the ` +
+      `exchange, or switch DRY_RUN off. This exit was sized from the last known quantity ` +
+      `${fmtQty(position.quantity)}.`;
+    console.error(`[manual] ${flag}`);
+  } else if (entry.exitCancelState === "failed" || entry.exitCancelAttempts >= EXIT_CANCEL_MAX_ATTEMPTS) {
+    outcome = "skipped"; // given up loudly earlier; refresh only
+  } else {
+    // Compare-and-set on the attempt counter: one owner per cancel attempt.
+    const claimed = await prisma.manualOrder.updateMany({ where: { id: entry.id,
+      exitCancelAttempts: entry.exitCancelAttempts, status: { in: ["open", "partially_filled"] } },
+    data: { exitCancelAttempts: { increment: 1 }, exitCancelState: "pending",
+      exitOrigin: entry.exitOrigin ?? origin, exitCancelRequestedAt: new Date() } });
+    outcome = claimed.count === 1
+      ? await performExitCancel(entry, adapter, entry.exitCancelAttempts + 1) : "skipped";
+  }
+  if (outcome !== "canceled" && outcome !== "already_terminal" && outcome !== "refused_dry_run") {
+    const refresh = await refreshWorkingEntry(position, adapter);
+    flag = refresh.flag;
+  }
+  const fresh = await prisma.smartTrade.findUnique({ where: { id: position.id } });
+  const raceDelta = fresh?.status === "active" ? Math.max(0, fresh.quantity - position.quantity) : 0;
+  if (raceDelta > QTY_EPSILON && (outcome === "canceled" || outcome === "already_terminal")) {
+    const note = `RACE FILL: ${fmtQty(raceDelta)} ${baseAssetOf(entry.symbol)} more of this BUY had ` +
+      `filled by the time the Bot cancelled it before the exit of position ${position.id}; it was ` +
+      "added to that position and is included in its exit.";
+    await prisma.manualOrder.updateMany({ where: { id: entry.id, error: null }, data: { error: note } });
+  }
+  return { position: fresh, entryWorking: true, outcome, raceDelta, flag };
+}
+
+/**
+ * OD-1 finalizer (trace §1.2 item 6): an entry still owed a cancel after its
+ * trade closed. Query first (unless the caller just applied a fresh
+ * snapshot): a terminal answer ends it, and any post-close fill becomes the
+ * race-fill position through `applyManualSnapshot`. Only a still-working
+ * entry is cancelled again, under a compare-and-set on the attempt counter, so
+ * two finalizers (boot and interval) issue at most one cancel per attempt. A
+ * failed lookup changes nothing.
+ */
+export async function finalizeEntryAfterExit(entryId: string, adapter: ManualExchangeAdapter,
+  opts: { snapshotApplied?: boolean } = {}): Promise<ExitCancelOutcome | "lookup_failed"> {
+  const entry = await prisma.manualOrder.findUnique({ where: { id: entryId } });
+  if (!entry || entry.side !== "BUY" || !["pending", "unknown"].includes(entry.exitCancelState ?? "")) {
+    return "skipped";
+  }
+  const trade = await prisma.smartTrade.findUnique({ where: { manualOrderId: entry.id } });
+  // While the trade is active, the exit path that pre-cancels owns the entry.
+  if (!trade || trade.status === "active") return "skipped";
+  if (isComplete(entry.status)) {
+    await prisma.manualOrder.updateMany({ where: { id: entry.id, exitCancelState: { in: ["pending", "unknown"] } },
+      data: { exitCancelState: "done" } });
+    return "already_terminal";
+  }
+  if (simulatesCancels(adapter) && isRealExchangeOrderId(entry.exchangeOrderId)) {
+    await prisma.manualOrder.update({ where: { id: entry.id }, data: { exitCancelLastError: LIVE_ENTRY_IN_DRY_RUN } });
+    return "refused_dry_run";
+  }
+  let current = entry;
+  if (!opts.snapshotApplied) {
+    let snapshot: ManualOrderSnapshot | null;
+    try {
+      snapshot = await adapter.query(entry.symbol, entry.clientOrderId);
+    } catch (error) {
+      await prisma.manualOrder.update({ where: { id: entry.id }, data: {
+        exitCancelLastError: `lookup before cancel failed: ${error instanceof Error ? error.message : error}` } });
+      return "lookup_failed";
+    }
+    if (snapshot) current = await applyManualSnapshot(entry.id, snapshot, { adapter });
+    if (isComplete(current.status)) return "already_terminal";
+  }
+  if (current.exitCancelAttempts >= EXIT_CANCEL_MAX_ATTEMPTS) return "skipped";
+  const claimed = await prisma.manualOrder.updateMany({ where: { id: current.id,
+    exitCancelAttempts: current.exitCancelAttempts, exitCancelState: { in: ["pending", "unknown"] },
+    status: { in: PENDING_STATUSES } },
+  data: { exitCancelAttempts: { increment: 1 }, exitCancelRequestedAt: new Date() } });
+  if (claimed.count !== 1) return "skipped";
+  return performExitCancel(current, adapter, current.exitCancelAttempts + 1);
+}
+
+/** OD-1: the entry a late / race-fill position belongs to (`<entry client id>:late:<n>`). */
+export async function entryOfRaceFillPosition(position: Pick<SmartTrade, "clientOrderId">):
+  Promise<ManualOrder | null> {
+  const cid = position.clientOrderId;
+  const at = cid ? cid.lastIndexOf(":late:") : -1;
+  if (!cid || at <= 0) return null;
+  return prisma.manualOrder.findUnique({ where: { clientOrderId: cid.slice(0, at) } });
+}
+
+/**
+ * OD-1 operator hand-off: a race-fill position the sweep could not sell within
+ * its bounded attempts stops being swept. It becomes an ordinary unprotected
+ * late-fill position, the entry carries a durable `SWEEP FAILED` flag naming
+ * the quantity to sell, and an ALERT is logged once.
+ */
+export async function handOffRaceFillSweep(position: SmartTrade, entry: ManualOrder | null,
+  attempts: number): Promise<boolean> {
+  const moved = await prisma.smartTrade.updateMany({ where: { id: position.id, status: "active",
+    protectionState: RACE_FILL_SWEEP }, data: { protectionState: LATE_FILL_UNPROTECTED } });
+  if (moved.count !== 1) return false;
+  const base = baseAssetOf(position.pair);
+  const flag = `SWEEP FAILED: the Bot could not sell race-fill position ${position.id} ` +
+    `(${fmtQty(position.quantity)} ${base}) after ${attempts} attempts. It is no longer sold ` +
+    `automatically and has no TP/SL: sell ${fmtQty(position.quantity)} ${base} from the Trade panel ` +
+    "(a manual SELL of that position).";
+  if (entry) await prisma.manualOrder.update({ where: { id: entry.id }, data: { error: flag } });
+  console.error(`[manual] ALERT: ${flag}`);
+  return true;
 }
 
 /**
@@ -582,34 +975,91 @@ export async function submitManualOrder(
 
   const adapter = adapterFactory(account);
   /*
+   * X4: a FULL manual SELL of a tracked position takes the per-trade close lock
+   * the protection poller holds, so an operator close and a TP/SL exit can no
+   * longer run on one position at the same time. Released however this ends.
+   */
+  const lock: { positionId: string | null } = { positionId: null };
+  try {
+    return await submitManualOrderLocked(input, account, adapter, shariahContext, lock);
+  } finally {
+    if (lock.positionId) releaseTradeClose(lock.positionId);
+  }
+}
+
+async function submitManualOrderLocked(input: SubmitManualOrderInput, account: ExchangeAccount,
+  adapter: ManualExchangeAdapter, shariahContext: string | null, lock: { positionId: string | null }):
+  Promise<ManualOrder> {
+  /*
    * D1/I8 for an OPERATOR exit: a manual SELL of a position whose entry is
    * still working first refreshes that entry, so the ledger is current before
-   * any exit. A manual order is NEVER raised (F1): it sells at most what the
-   * operator asked for, capped by I3. Any refreshed remainder stays an active,
-   * TP/SL-protected position, and a request beyond the (refreshed) position is
-   * still refused by `assertSellAssociation`. Only the automated protection
-   * exit sizes itself to everything acquired.
+   * any exit, and a request beyond the (refreshed) position is refused by
+   * `assertSellAssociation` before anything is cancelled.
+   *
+   * OD-1 (owner-approved option C): a FULL exit — the operator asks for the
+   * whole refreshed position — then cancels the working entry first, and the
+   * fill of the race (`raceDelta`) is sold by this same order, flagged
+   * `RACE FILL`: the order is raised by the race delta only, capped by I3. A
+   * PARTIAL exit never cancels and is never raised (F1): it sells at most what
+   * was asked, the entry keeps working, and its later fills add to the still
+   * active, still protected position.
    */
   let refreshFlag: string | null = null;
+  let exitNote: string | null = null;
   let fullExitPositionId: string | null = null;
   if (input.side === "SELL" && input.positionId) {
     const target = await prisma.smartTrade.findFirst({ where: { id: input.positionId, source: "manual",
       exchangeAccountId: account.id, pair: input.symbol, status: "active" } });
-    if (target?.manualOrderId) {
-      const refresh = await refreshWorkingEntry(target, adapter);
-      refreshFlag = refresh.flag ?? null;
-      const refreshed = refresh.position;
+    if (target) {
+      let current: SmartTrade | null = target;
+      let entryWorking = false;
+      if (target.manualOrderId) {
+        const refresh = await refreshWorkingEntry(target, adapter);
+        refreshFlag = refresh.flag ?? null;
+        current = refresh.position;
+        entryWorking = refresh.entryWorking;
+      }
       const requested = input.baseQuantity ?? 0;
-      if (refresh.entryWorking && refreshed?.status === "active" &&
-          requested <= refreshed.quantity * 1.000000001) {
-        const free = adapter.baseFree ? await adapter.baseFree(input.symbol) : Number.POSITIVE_INFINITY;
-        const { capacity } = await manualExitCapacity(refreshed, account.id, free);
-        if (!(capacity > 0)) {
-          throw new ManualTradingError("the free balance attributable to this position is 0; " +
-            "reconcile the account balance before selling", 409);
+      if (current?.status === "active" && requested <= current.quantity * 1.000000001) {
+        const full = requested >= current.quantity * (1 - 1e-9);
+        if (full) {
+          if (!acquireTradeClose(target.id)) {
+            throw new ManualTradingError("this position is being closed by another exit right now; " +
+              "read the position again before selling", 409, "trade_closing");
+          }
+          lock.positionId = target.id;
         }
-        input.baseQuantity = Math.min(requested, capacity);
-        fullExitPositionId = input.baseQuantity >= refreshed.quantity * (1 - 1e-9) ? target.id : null;
+        if (entryWorking) {
+          let raceDelta = 0;
+          if (full) {
+            const cancel = await cancelWorkingEntryForExit(current, adapter, "operator");
+            refreshFlag = cancel.flag ?? refreshFlag;
+            raceDelta = cancel.raceDelta;
+            current = cancel.position;
+            if (current?.status !== "active") {
+              throw new ManualTradingError("the position closed while its entry was being cancelled; " +
+                "read the position again before selling", 409, "trade_closing");
+            }
+          }
+          const free = adapter.baseFree ? await adapter.baseFree(input.symbol) : Number.POSITIVE_INFINITY;
+          const { capacity } = await manualExitCapacity(current, account.id, free);
+          if (!(capacity > 0)) {
+            throw new ManualTradingError("the free balance attributable to this position is 0; " +
+              "reconcile the account balance before selling", 409);
+          }
+          input.baseQuantity = Math.min(requested + raceDelta, capacity);
+          fullExitPositionId = input.baseQuantity >= current.quantity * (1 - 1e-9) ? target.id : null;
+          const base = baseAssetOf(input.symbol);
+          if (!full) {
+            exitNote = "ENTRY STILL WORKING (partial exit): the entry of this position is still working " +
+              `at the exchange and was not cancelled. Its further fills add to position ${target.id}, ` +
+              "which stays active with its TP/SL.";
+          } else if (raceDelta > QTY_EPSILON) {
+            exitNote = `RACE FILL: ${fmtQty(raceDelta)} ${base} of the entry filled while the Bot ` +
+              `cancelled it for this full exit; this SELL was raised by that amount only ` +
+              `(${fmtQty(requested)} asked, ${fmtQty(input.baseQuantity)} sold).`;
+          }
+        }
       }
     }
   }
@@ -634,7 +1084,7 @@ export async function submitManualOrder(
           ? "pending_entry" : "none",
         shariahContext,
         clientOrderId: clientOrderId(`manual:${input.requestId}`),
-        error: refreshFlag,
+        error: [exitNote, refreshFlag].filter((note) => note).join(" ") || null,
       }});
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
@@ -652,7 +1102,7 @@ export async function submitManualOrder(
   try {
     order = await prisma.manualOrder.update({ where: { id: order.id },
       data: { status: "submitted", submittedAt: new Date() } });
-    applied = await applyManualSnapshot(order.id, await adapter.submit(intentFromOrder(order)));
+    applied = await applyManualSnapshot(order.id, await adapter.submit(intentFromOrder(order)), { adapter });
   } catch (error) {
     /*
      * D2: only a DEFINITE rejection is terminal — a local refusal raised
@@ -675,7 +1125,7 @@ export async function submitManualOrder(
     // D1/I7: a full exit that leaves only an unsellable remainder closes it.
     try {
       if (await closeManualDust(fullExitPositionId, await adapter.lotRules(input.symbol),
-        applied.averageFillPrice, applied.id)) {
+        applied.averageFillPrice, applied.id, { adapter, origin: "operator" })) {
         return prisma.manualOrder.findUniqueOrThrow({ where: { id: applied.id } });
       }
     } catch (error) {
@@ -805,8 +1255,10 @@ export async function reconcilePendingManualOrders(
       const adapter = adapterFactory(order.exchangeAccount);
       const step = await reconcileManualOrderStep(order, adapter, defaultFirstSubmitGate, true);
       manualLookupFailures.delete(order.id);
-      if (step.kind === "snapshot") await applyManualSnapshot(order.id, step.snapshot);
-      else if (step.kind === "absent") await closeOffAbsentManualOrder(order, now);
+      if (step.kind === "snapshot") {
+        const applied = await applyManualSnapshot(order.id, step.snapshot, { adapter });
+        await finalizeOnReconcile(applied, adapter);
+      } else if (step.kind === "absent") await closeOffAbsentManualOrder(order, now);
     } catch (error) {
       if (error instanceof ManualHaltRefusal && error.terminal) {
         // Compare-and-set on `requested`: that status is the proof nothing was
@@ -825,6 +1277,26 @@ export async function reconcilePendingManualOrders(
         error: `reconciliation pending: ${error instanceof Error ? error.message : "unknown error"}` }});
     }
   }
+}
+
+/**
+ * OD-1 (trace §1.2 item 6): after the reconciler applied a fresh snapshot of a
+ * BUY entry whose trade is closed and which still works, the cancel owed by
+ * the policy is attempted — the snapshot just applied IS the query-first read.
+ * A trade closed by a path that did not engage the policy (or before it
+ * existed) engages it here; cancels run under halt and pause alike.
+ */
+async function finalizeOnReconcile(entry: ManualOrder, adapter: ManualExchangeAdapter): Promise<void> {
+  if (entry.side !== "BUY" || !PENDING_STATUSES.includes(entry.status) ||
+      entry.exitCancelState === "failed" || entry.exitCancelState === "done") return;
+  const trade = await prisma.smartTrade.findUnique({ where: { manualOrderId: entry.id } });
+  if (!trade || trade.status === "active") return;
+  if (entry.exitCancelState == null) {
+    const effects: AfterCommit[] = [];
+    await markEntryForExitCancel(prisma, trade.id, entry.id, "automation", effects);
+    for (const effect of effects) await effect();
+  }
+  await finalizeEntryAfterExit(entry.id, adapter, { snapshotApplied: true });
 }
 
 /**
@@ -997,13 +1469,23 @@ export async function listManualState(symbol?: string): Promise<unknown> {
     : halt.halted
       ? "TP/SL is NOT being checked: the Bot is halted. Your own SELL still works; resume the Bot to restore protection."
       : "Checked by the bot poller about every 30 s; no exchange-resting protective order is claimed.";
+  /*
+   * OD-1: a race-fill position from an automated exit is held while halted
+   * (the halt stops automated exits). Say so, so it is never read as handled.
+   */
+  const sweepsWaiting = halt.halted ? positions.filter((p) =>
+    p.status === "active" && p.protectionState === RACE_FILL_SWEEP).length : 0;
+  const sweepNote = sweepsWaiting > 0
+    ? "race fill awaiting sweep — Bot halted; sell it from the Trade panel (a race fill from an " +
+      "automated exit is not sold while the Bot is halted)." : undefined;
   return { enabled: config.manualTradingEnabled,
     mainnetEnabled: config.mainnetManualTradingEnabled, dryRun: config.dryRun,
     tradingHalted: halt.halted,
     mixed: accounts.some((a) => a.testnet) && accounts.some((a) => !a.testnet),
     accounts: accounts.map((a) => ({ ...a, mode: a.testnet ? "testnet" : "mainnet" })),
     orders, positions, protection: { type: "bot-managed", exchangeResting: false, polling,
-      haltedBy: halt.haltedBy, mainnetPositionsChecked: config.mainnetManualTradingEnabled, note } };
+      haltedBy: halt.haltedBy, mainnetPositionsChecked: config.mainnetManualTradingEnabled, note,
+      ...(sweepNote ? { sweepNote } : {}) } };
 }
 
 /** The stored identity of a command body: kind plus key-order-independent JSON. */

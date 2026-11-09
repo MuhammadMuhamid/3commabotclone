@@ -301,6 +301,21 @@ model ManualOrder {
   error                 String?
   submittedAt           DateTime?
   completedAt           DateTime?
+  /// OD-1 cancel-first policy for an ENTRY whose position is exiting. Null =
+  /// policy not engaged; `pending` (a cancel is owed), `unknown` (the last
+  /// cancel's outcome is unknown), `done` (the entry is terminal at the
+  /// exchange), `failed` (gave up after the bounded attempts, or not found).
+  exitCancelState       String?
+  /// Cancels issued under this policy (pre-exit and finalizer), bounded.
+  exitCancelAttempts    Int               @default(0)
+  exitCancelRequestedAt DateTime?
+  exitCancelLastError   String?
+  /// `automation` or `operator`: who decided the exit. Decides whether a
+  /// race-fill sweep is held by the halt.
+  exitOrigin            String?
+  /// X7: false while the last applied BUY snapshot could not be netted of its
+  /// base-asset commission (the trades lookup failed); a sweep waits for it.
+  fillsNetted           Boolean           @default(true)
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
 
