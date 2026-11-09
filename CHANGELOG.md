@@ -1,5 +1,72 @@
 # Changelog
 
+## 2026-11-09 — Trading Scene control routes, uncertain outcomes, late fills, dashboard truth
+
+### Added: signed control routes for Trading Scene's `/bot`
+
+`/api/manual-trading/control/*` (`routes/manualControl.ts`) lets the Platform
+administrator operate this Bot from Trading Scene. The routes cover status,
+halt, resume, risk limits, target-state bot start/stop, Close and Partial for
+strategy trades, and command status. Key custody, the ledger and the 24/7
+TP/SL poll stay here.
+
+- The routes are mounted after `requireManualAuth`, with the same HMAC, ±60 s
+  window and single-use nonce as a manual order.
+- The prefix is control plane, so it works with manual trading disabled. It has
+  its own rate limiters, so polling cannot starve a halt.
+- Close and Partial reuse the dashboard's money path (`services/tradeExit.ts`).
+  They do not re-implement it.
+- `BotControlCommand` (migration `20261109130000_bot_control_command`) claims
+  each request id once, replays a finished result, and never runs a command
+  twice. It records the order it placed before the wire.
+- Bot create/edit/delete and exchange keys are not exposed.
+
+### Fixed: uncertain exchange answers are never rejections (D2)
+
+- `classifyExchangeFailure` is the one classifier on every submit path.
+  `-1006`/`-1007`, 5xx and code-less errors stay pending and are reconciled by
+  the original client order id. They used to be booked as rejected, and a fresh
+  signal then placed a second BUY.
+- A definitive not-found 60 s after submission closes an order off as ABSENT. A
+  failed lookup never closes one.
+- An unresolved BUY blocks a fresh BUY for that bot and pair.
+- A reused manual request id must carry the same body (migration
+  `20261109120000_manual_command_body_hash`), and a stored command is never
+  re-run.
+
+### Fixed: no resurrected or oversold manual positions (D1, policy-neutral)
+
+- A closed trade is never reopened, and snapshots apply as deltas.
+- An exit never sells more than the position or the free balance net of other
+  tracked positions. The entry is refreshed before an automated exit.
+- A late fill becomes a separate `late_fill_unprotected` position, with no
+  TP/SL.
+- Cancel-first versus track-late-fills is an open owner decision (OD-1), not
+  implemented.
+- Under `DRY_RUN`, cancelling a manual LIMIT with a real exchange id is refused
+  (409 `live_order_in_dry_run`).
+
+### Fixed: dashboard and API truth
+
+- A re-halt keeps the existing halt. It used to overwrite a daily-loss latch,
+  and resume then skipped the loss re-check.
+- The halt and its controls are shown in `DRY_RUN`. The halt prompt states the
+  real policy.
+- Close and Partial refuse manual trades (409 `trade_manual`, pointing to
+  Trading Scene's Trade panel).
+- The empty entry-JSON block is gone, and Reveal shows the secret and the exit
+  message.
+- Testnet is pre-ticked, the API requires an explicit `testnet`, and mainnet
+  needs a typed `MAINNET`.
+- A bot with active trades or unresolved intents cannot be deleted.
+- `listManualState` now says whether manual TP/SL is really being checked
+  (`tradingHalted`, `protection.polling`, `protection.haltedBy`,
+  `protection.mainnetPositionsChecked`, `protection.note`).
+
+**Unchanged:** halt semantics (automation stops in both directions, including
+both TP/SL pollers; operator SELL/Close/Partial pass), Spot-only execution,
+the Shariah floor, and the exit-only TradingView path.
+
 ## 2026-09-02 — Shariah exposure enforcement (Trading Scene Shariah V1)
 
 ### Added: a final new-exposure gate, and nothing else
