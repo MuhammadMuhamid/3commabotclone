@@ -3,7 +3,8 @@
 > **Audience:** AI agents and engineers onboarding to this codebase.  
 > **Repository:** https://github.com/MuhammadMuhamid/3commabotclone (public)  
 > **Local checkout:** wherever this repository is cloned.  
-> **Last audited:** 2026-08-24
+> **Last audited:** 2026-08-24; sections on Trading Scene control, halts, exits, exchange
+> accounts, TradingView and known gaps updated 2026-11-09 against `finish/integrated-20261109`
 
 ---
 
@@ -35,6 +36,10 @@
 - Executes **Binance Spot** market buy/sell orders
 - Tracks open positions as **SmartTrades** with live PnL, take-profit, and stop-loss
 - Provides a **React dashboard** to configure bots, exchange accounts, and view trade history
+- Since 2026-11-09, accepts **signed control commands from Trading Scene** (`/bot`: status, halt,
+  resume, risk limits, bot start/stop, strategy Close/Partial, command status) on
+  `/api/manual-trading/control/*`. The dashboard remains the restricted recovery path; keys stay here
+- Direct TradingView traffic is **exit-only**: a BUY needs Platform correlation (§8)
 
 | Item | Value |
 |------|--------|
@@ -142,9 +147,10 @@ sequenceDiagram
 
 ### 3.3 Sell / exit flow
 
-1. **Webhook sell** — Pine `longJustClosed` or manual `action: sell` → `marketSellBase` → close latest active `SmartTrade` for bot+pair (`closedReason: signal_exit`).
-2. **Dashboard close** — `POST /api/trades/:id/close` → internal `processWebhook` with `SELL` + stored quantity.
-3. **Take profit / stop loss** — `setInterval` 30s → `checkTakeProfitStopLoss` → compares `pnlPct` to bot thresholds → `marketSellBase` → `closedReason: take_profit` or `stop_loss`.
+1. **Webhook sell** — Pine `longJustClosed` or manual `action: sell` → `marketSellBase` → close latest active `SmartTrade` for bot+pair (`closedReason: signal_exit`). Refused while the Bot is halted.
+2. **Operator Close** — the dashboard's `POST /api/trades/:id/close`, or Trading Scene's C6 `POST /api/manual-trading/control/trades/:id/close`. Both call `closeStrategyTrade` (`services/tradeExit.ts`), which runs `processWebhook` with `SELL`, the stored quantity, `skipExitCheck` and a refuse-only `expectSmartTradeId`. A strategy trade only: a manual trade is 409 `trade_manual` (close it from Trading Scene's Trade panel), and a deleted, paused, unlisted-pair or ambiguous same-pair trade is refused with its code. Allowed while halted.
+3. **Operator Partial** — the dashboard's `POST /api/trades/:id/partial-close` or C7; `partialCloseStrategyTrade` sells 1–99 %, resolves unresolved strategy SELLs first (`exit_unresolved`), and works on a paused bot. Allowed while halted.
+4. **Take profit / stop loss** — the 30-second scheduler → `checkTakeProfitStopLoss` → compares `pnlPct` to bot thresholds → `marketSellBase` → `closedReason: take_profit` or `stop_loss`. Skipped entirely while the Bot is halted, and nothing is checked while the process is down.
 
 ### 3.4 Process layout (production)
 
@@ -290,7 +296,7 @@ Exports `config` from environment:
 | `marketType` | String | Default `"spot"` |
 | `apiKeyEnc` | String | AES-256-GCM encrypted API key |
 | `apiSecretEnc` | String | Encrypted secret |
-| `testnet` | Boolean | Use `https://testnet.binance.vision` |
+| `testnet` | Boolean | Use `https://testnet.binance.vision`. Required on create (no default); the dashboard pre-ticks it and asks for a typed `MAINNET` to send `false` |
 | `bots` | Relation | SignalBots using this account |
 
 #### `SignalBot`
@@ -337,6 +343,8 @@ Exports `config` from environment:
 | `buyPrice` | Float? | Same as entry for buys |
 | `exchangeOrderId` | String? | Binance order id or `dry-*` |
 | `closedReason` | String? | `signal_exit`, `take_profit`, `stop_loss` |
+| `source` | String | `strategy` or `manual` (opened from Trading Scene's Trade panel). Strategy routes refuse manual trades |
+| `protectionState` | String? | Manual positions: `active`, `triggered`, … or `late_fill_unprotected` (a BUY fill after its trade closed: no TP/SL, never polled) |
 | `closedAt` | DateTime? | When closed |
 
 #### `StrategyOrderIntent`
@@ -350,6 +358,15 @@ pass. Before that call it is compare-and-set to `submitted`; from then on every
 process queries the deterministic client ID and a miss remains unresolved.
 `reconciled` means the exchange result and local accounting were committed
 idempotently.
+
+#### `BotControlCommand` (2026-11-09)
+
+One row per signed Trading Scene control command: `requestId` (unique), `kind`, `target`,
+`commandHash` (kind + target + params, not the actor), the signed actor and step-up method,
+`status` (`processing` / `succeeded` / `failed` / `pending`), the stored result or typed error, and
+the `intentId` / `attemptId` of an order it placed. Insert-first claim; never re-run. Migration
+`20261109130000_bot_control_command`. `ManualCommand` also gained a nullable `bodyHash`
+(`20261109120000_manual_command_body_hash`): a reused manual request id must carry the same body.
 
 #### `WebhookLog`
 
@@ -399,7 +416,7 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 | Method | Path | Handler | Behavior |
 |--------|------|---------|----------|
 | GET | `/` | list | All accounts (no secrets) |
-| POST | `/` | create | Zod: name, apiKey, apiSecret, testnet? → encrypt → create |
+| POST | `/` | create | Zod: name, apiKey, apiSecret, **testnet (required boolean)** → encrypt → create |
 | GET | `/:id/balance` | balance | `getUsdtBalance` via Binance |
 | DELETE | `/:id` | remove | Hard delete account |
 
@@ -407,13 +424,13 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 
 | Method | Path | Behavior |
 |--------|------|----------|
-| GET | `/` | List bots with stats: totalProfit, activeSmartTrades, signalCount, tradingSince, webhookUrl, entry/exit JSON templates |
+| GET | `/` | List bots with stats: totalProfit, activeSmartTrades, signalCount, tradingSince, webhookUrl, masked secret, `tradingViewSetup` (exit-only note). No secret-bearing payloads |
 | GET | `/stats` | Global: upnl, locked, activeCount, closedCount, todayPnl, botCount, activeBotCount, stoppedBotCount |
 | GET | `/meta/units` | Returns `INVESTMENT_UNITS` labels |
-| GET | `/:id` | Single bot via `mapBot()` |
+| GET | `/:id` | Single bot via `mapBot()`; `?reveal=1` adds the plain secret and the exit (SELL) JSON |
 | POST | `/` | Create bot; generates 48-char hex `webhookSecret` |
 | PATCH | `/:id` | Partial update via `botSchema.partial()` |
-| DELETE | `/:id` | Delete bot (cascades SmartTrades) |
+| DELETE | `/:id` | Delete bot. Refused with 409 `bot_has_open_trades` while it has an active trade, or `bot_has_unresolved_intents` while an order intent is `requested`/`submitted` (one atomic transaction). Closed trades keep their history (`botId` set null) |
 | POST | `/:id/toggle` | Toggle `active` ↔ `paused` |
 
 **Helper functions in `bots.ts`:**
@@ -421,9 +438,10 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 | Function | Purpose |
 |----------|---------|
 | `webhookUrl()` | `{publicUrl}/api/webhooks/signal_bots` |
-| `entryJson(secret)` | Template for TV entry with `{{strategy.order.action}}`, `{{ticker}}`, `{{timenow}}` |
-| `exitJson(secret)` | Static sell template |
-| `tradingViewSetup()` | Instructions object for UI |
+| `exitJson(secret)` | Static sell template (only in a revealed response) |
+| `tradingViewSetup()` | Instructions object for UI: exit alerts only; the Platform is the sole BUY authority |
+| `setBotStatus(id, status)` | Target-state start/stop (used by C5) |
+| `countUnresolvedBotIntents(id)` | Unresolved strategy intents for one bot |
 | `mapBot(b, extra?)` | Parses `pairs` JSON, adds labels and webhook helpers |
 
 #### `tradesRouter` — prefix `/api/trades`
@@ -431,9 +449,9 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 | Method | Path | Behavior |
 |--------|------|----------|
 | GET | `/` | Query `status` (`active` \| `history`→`closed`), optional `botId`; calls `refreshAllActivePnL()` first |
-| POST | `/:id/close` | Loads trade; `processWebhook({ secret, action: "SELL", symbol, quantity })` |
-| POST | `/:id/partial-close` | Sells a percentage of an active trade; records a `PartialClose` row |
-| DELETE | `/:id` | Removes a trade record (history cleanup; does not touch the exchange) |
+| POST | `/:id/close` | `closeStrategyTrade` (shared with C6): strategy trades only; typed refusals `trade_manual`, `bot_deleted`, `bot_paused`, `pair_not_listed`, `ambiguous_trade`, `exit_unresolved`, `exit_recent`; an unknown outcome answers 202 `pending` |
+| POST | `/:id/partial-close` | `partialCloseStrategyTrade` (shared with C7): `pct` 1–99; records a `PartialClose` row; refuses manual and deleted-bot trades; an uncertain exchange answer is 202 `pending`, never `exchange_rejected` |
+| DELETE | `/:id` | Removes a **closed** trade record (history cleanup; does not touch the exchange; an active trade is refused). Note: removing a closed trade also removes it from the daily-loss window |
 
 #### `webhooksRouter` — prefix `/api/webhooks`
 
@@ -458,6 +476,50 @@ cumulative snapshots, exchange acceptance time, and a distinct manual-command
 completion time are not persisted and are not returned. These handlers use
 Prisma reads only: no reconciliation helper, Binance client, execution action,
 or risk/halt mutation is reachable from them.
+
+#### `manualControlRouter` — prefix `/api/manual-trading/control` (2026-11-09)
+
+Trading Scene's signed operator controls, mounted after `requireManualAuth`:
+
+- **Authentication.** The manual HMAC covers method, path, timestamp, nonce,
+  request id and body, with a ±60 s window and a durable single-use nonce.
+- **Control plane.** The prefix works while `MANUAL_TRADING_ENABLED=false`.
+- **Rate limits.** The routes have their own limiters: 120 reads and 60 writes
+  per minute. A 429 carries `code: "bot_rate_limited"`; nothing was executed.
+
+| # | Method | Path | Behavior |
+|---|---|---|---|
+| C0 | GET | `/status` | Dry run and halt (independent), routing, limits/snapshot/latch, bot counts, protection, Shariah floor, manual flags |
+| C1 | POST | `/halt` | `haltBotTrading`. Never overwrites an existing halt (`alreadyHalted`) |
+| C2 | POST | `/resume` | `resumeBotTrading` (shared with `/api/ops/resume`). 409 `still_breached` |
+| C3/C4 | GET/PATCH | `/risk-limits` | `updateBotRiskLimits`. A change never clears a latch |
+| C5 | POST | `/bots/:id/status` | `setBotStatus`, a target state, plus `unresolvedIntents` |
+| C6 | POST | `/trades/:id/close` | `closeStrategyTrade` (§3.3) |
+| C7 | POST | `/trades/:id/partial-close` | `partialCloseStrategyTrade` (§3.3) |
+| C8 | GET | `/commands/:requestId` | The `BotControlCommand` row, with the live intent/attempt state when pending |
+
+How a command runs:
+
+- Every changing body is zod `.strict()` and carries the Platform's signed
+  `actor`.
+- `runControlCommand` (`services/controlCommands.ts`) claims the request id
+  once. A same-hash repeat replays the stored result. A different hash is 409
+  `request_id_reused`. A command still running is 409 `command_in_progress`,
+  never re-run.
+- Business refusals are typed `ControlRefusal {status, code, message}`. Any
+  other error is masked.
+
+The route table and the Platform side are in the [README](../README.md) and the
+Platform's `docs/OPERATIONS.md` §1.
+
+#### `operationsRouter` (`/api/ops`) halt fixes (2026-11-09)
+
+- `POST /api/ops/halt` no longer overwrites an existing halt. It used to
+  replace a daily-loss latch with `operator`, and resume then skipped the loss
+  re-check.
+- `GET /api/ops/status` reports `risk.tradingHalted` independently of `mode`.
+  `DRY_RUN` outranks `HALTED` in `mode`, so the dashboard reads the halt from
+  `risk`.
 
 ### 6.5 Services
 
@@ -513,9 +575,17 @@ protection; `StrategyOrderIntent` is monetary submission/recovery truth; and
 `SmartTrade`/`PartialClose` is lifecycle/accounting truth. Receipt release never
 resets a durable attempted intent. Startup and the 30-second reconciler submit a
 never-attempted row only after current halt/risk/bot gates pass. An already
-attempted row is queried even if trading is later halted; a query miss remains
-`submitted`, and an authoritative `FILLED` result reconstructs local state
-exactly once. BUY lookup requires commission trades so recovered base quantity
+attempted row is queried even if trading is later halted. A query miss stays
+`submitted` for 60 s after submission (`SUBMITTED_ABSENCE_SETTLE_MS`); after
+that, a definitive "no such order" closes it off as `rejected`/ABSENT, and a
+failed lookup never closes it (an alert after 3 failed cycles). An
+authoritative `FILLED` result reconstructs local state exactly once. A submit
+error is classified by `classifyExchangeFailure` (`services/binance.ts`):
+only a whitelist of Binance codes, HTTP 429/418 without a code, or a local
+refusal before the wire is a definite rejection. `-1006`/`-1007`, other 5xx
+answers and code-less transport errors stay pending and are reconciled by the
+original client order id, never booked as rejected (D2). While a BUY for a bot
+and pair is unresolved, a fresh BUY there is refused (`risk_blocked`). BUY lookup requires commission trades so recovered base quantity
 stays net of base-asset fees.
 
 For dedupe-keyed custom exits, `RealizationEvent` is a fourth, narrow
@@ -545,7 +615,9 @@ user-data timing, and commission-trade availability/timing.
 | `resolveSellQuantity(client, symbol, requestedQty)` | Floor to step, enforce min |
 | `getBaseFreeBalance(client, symbol)` | Free base asset balance |
 
-**Dry run:** When `config.dryRun`, orders return fake `orderId: dry-{timestamp}` at current ticker price.
+**Dry run:** When `config.dryRun`, orders return fake `orderId: dry-{timestamp}` at current ticker price. Trading Scene labels this **DRY RUN (simulated)**, never PAPER, which is the Platform's own paper engine. Under `DRY_RUN` the Bot refuses to cancel a manual LIMIT that has a real exchange id (409 `live_order_in_dry_run`) and never replaces a real id with a `dry-` one.
+
+`classifyExchangeFailure(err)` → `rejected` / `duplicate` / `uncertain` is the one classifier every order-submitting path uses (manual MARKET/LIMIT, the strategy webhook and so Close, Partial, and the manual TP/SL SELL).
 
 #### `services/smartTrade.ts`
 
@@ -553,7 +625,7 @@ user-data timing, and commission-trade availability/timing.
 |--------|---------|
 | `updateSmartTradePnl(tradeId, client?)` | Ticker price → update currentPrice, pnlUsdt, pnlPct |
 | `refreshAllActivePnL()` | Loop all active trades |
-| `checkTakeProfitStopLoss()` | Every 30s from index.ts; sells on TP/SL hit |
+| `checkTakeProfitStopLoss()` | Every 30s from index.ts; sells on TP/SL hit. Skips every trade while the Bot is halted (re-read per trade) |
 
 ### 6.6 Libraries
 
@@ -766,7 +838,8 @@ Nav links: Dashboard, Create Bot, Settings.
 | `stats()` | GET `/api/bots/stats` |
 | `bots.list/get/create/update/remove/toggle` | CRUD |
 | `trades.list(status, botId?)` | GET `/api/trades` |
-| `trades.close(id)` | POST close |
+| `trades.close(id)` | POST close; a 202 `pending` or `ignored_duplicate` result is shown as such, never as "closed" |
+| `ops.status/halt/resume` | `/api/ops/*`; `halt` reports `alreadyHalted` |
 | `exchange.list/create/balance/remove` | Exchange accounts |
 
 **Utilities:** `formatPair`, `copyText`, `INVESTMENT_UNIT_LABELS`, TypeScript types mirroring API.
@@ -778,23 +851,24 @@ Nav links: Dashboard, Create Bot, Settings.
 - Polls every **15s**: bots, stats, trades (active/history tab), config (dry run badge)
 - **Bot filters:** all / active / stopped
 - **Metrics:** UPNL, Active SmartTrades, Bots count, Value Locked
-- **BotRow:** edit, toggle start/stop, delete with confirm
-- **TradeRow:** PnL bar for active; manual Close → `api.trades.close`
+- **Halt:** the halt state and *Halt trading* / *Resume trading* are shown in `DRY_RUN` too (read from `risk.tradingHalted`, not from `mode`); a red banner states the policy: *"While the Bot is halted, TP/SL protection is not checked and TradingView exits are refused; your own SELL / Close / Partial still work."*
+- **BotRow:** edit, toggle start/stop, delete with confirm (refused while the bot has active trades or unresolved orders)
+- **TradeRow:** PnL bar for active; Close → `api.trades.close` and Partial for **strategy** trades only. A manual (Trading Scene) position shows *Managed in Trading Scene* instead
 
 #### `CreateBot.tsx`
 
 - Form → `api.bots.create(buildBotPayload(form))`
-- Success view: copy webhook URL + entry JSON
+- Success view: copy the webhook URL, the webhook secret (for the Trading Scene deployment) and, optionally, the TradingView **exit (SELL)** message. No entry JSON: direct TradingView BUYs are refused
 - Validates at least one pair
 
 #### `EditBot.tsx`
 
 - Loads bot via `api.bots.get(id)` → `botToForm`
-- PATCH on save; shows webhook copy screen (unchanged secret)
+- PATCH on save; shows the webhook URL. **Reveal webhook secret** (`?reveal=1`) shows the secret and the exit (SELL) message
 
 #### `Settings.tsx`
 
-- Form: name, apiKey, apiSecret, testnet checkbox
+- Form: name, apiKey, apiSecret, **Use Binance testnet** (ticked by default; unticking asks for a typed `MAINNET`)
 - Lists connected accounts with remove
 
 ### 7.4 `BotFormFields.tsx`
@@ -842,28 +916,13 @@ https://bot.alphawebstudioz.com/api/webhooks/signal_bots
 
 ### 8.2 JSON payload format
 
-**Minimum buy:**
-
-```json
-{
-  "secret": "<webhookSecret from bot>",
-  "action": "buy",
-  "symbol": "NEARUSDT",
-  "quote_order_qty": 100.01,
-  "dedupe_key": "L-123-4567890"
-}
-```
-
-**Buy using bot sizing (omit quote):**
-
-```json
-{
-  "secret": "<webhookSecret>",
-  "action": "BUY",
-  "symbol": "APTUSDT",
-  "dedupe_key": "{{timenow}}"
-}
-```
+**Direct TradingView traffic is exit-only.** A BUY (`buy`, `enter_long`, …) sent without the
+Platform's correlation headers (`x-platform-deployment-id` and `x-platform-order-intent-id`) is
+refused with **403 "Platform authority required for exposure-increasing BUY"**
+(`routes/webhooks.ts`). Entries come only from Trading Scene, which sends those headers, a
+`dedupe_key` and the signed Shariah context. The retired entry examples that used to stand here
+(a BUY with `quote_order_qty`, or with bot sizing) are refused today and must not be configured in
+TradingView.
 
 **Sell / exit:**
 
@@ -882,7 +941,7 @@ https://bot.alphawebstudioz.com/api/webhooks/signal_bots
 |-------|---------|
 | `tv_instrument` | Alternative to `symbol` |
 | `quantity` | Sell specific base qty; else uses active SmartTrade or wallet |
-| `quote_order_qty` | Override USDT spend on buy |
+| `quote_order_qty` | Override USDT spend on a Platform-authorised buy |
 
 **Response:**
 
@@ -890,6 +949,8 @@ https://bot.alphawebstudioz.com/api/webhooks/signal_bots
 |--------|---------|
 | `ok` | Order executed (or dry-run simulated) |
 | `ignored_duplicate` | Dedupe blocked (still HTTP 200) |
+
+While the Bot is halted every webhook SELL is refused as well; only operator exits (dashboard or Trading Scene Close/Partial, a manual SELL) pass a halt.
 
 ### 8.3 TradingView alert settings (critical)
 
@@ -908,9 +969,9 @@ Replaces bottom "Alerts" section of SR+Trend v5:
 
 | Trigger | JSON action |
 |---------|-------------|
-| `longSignal` | `buy` + quote + dedupe_key `L-{bar}-{time}` |
+| `longSignal` | `buy` + quote + dedupe_key `L-{bar}-{time}` — **refused today** (403, no Platform authority); entries come from Trading Scene |
 | `shortSignal` (if enabled) | `sell` with quantity (short entry) |
-| `longJustClosed` | `sell` exit dedupe_key `X-{bar}-{time}` |
+| `longJustClosed` | `sell` exit dedupe_key `X-{bar}-{time}` — the only part that still acts |
 
 **Inputs on chart:**
 
@@ -923,17 +984,10 @@ Replaces bottom "Alerts" section of SR+Trend v5:
 
 ### 8.5 UI-generated templates (`bots.ts`)
 
-**Entry template** (for strategy order action substitution):
-
-```json
-{
-  "secret": "<bot-secret>",
-  "action": "{{strategy.order.action}}",
-  "symbol": "{{ticker}}",
-  "quote_order_qty": null,
-  "dedupe_key": "{{timenow}}"
-}
-```
+There is no entry template: the backend does not generate one, and since 2026-11-09 the dashboard no
+longer shows an (empty) entry block. It shows the webhook secret for the Trading Scene deployment plus
+an optional exit message.
+The exit template is returned only in a revealed response (`GET /api/bots/:id?reveal=1`).
 
 **Exit template:**
 
@@ -1033,7 +1087,10 @@ cd frontend && npm i && npm run dev
 | `PORT` | No | API port (4000) |
 | `BINANCE_API_KEY` | Optional | Fallback if bot has no exchangeAccountId |
 | `BINANCE_API_SECRET` | Optional | Fallback secret |
-| `BINANCE_TESTNET` | No | `true` for testnet base URL |
+| `BINANCE_TESTNET` | No | `true` for the testnet base URL — the process-wide default for a bot **without** its own exchange account only (default `false`). Each exchange account's own `testnet` flag decides where its orders go (§12b) |
+| `MANUAL_TRADING_ENABLED` | No | `true` enables Trading Scene manual orders and the `/bot` read views. The control routes work without it |
+| `MAINNET_MANUAL_TRADING_ENABLED` | No | `false` by default; manual orders on mainnet accounts need it |
+| `MANUAL_TRADING_HMAC_SECRET` | With manual trading | Platform-to-Bot control-plane key, 32+ chars, the same value as the Platform's; signs manual orders, the Shariah floor and the control routes |
 | `JWT_SECRET` | **Yes** | Signs session tokens. `openssl rand -hex 64`. Changing it logs everyone out |
 | `SCRYPT_SALT` | **Yes** | KDF salt, 16 hex chars. Changing it after first deploy invalidates all stored API keys |
 | `SECURE_COOKIES` | No | `false` only for local HTTP dev; always `true` in production |
@@ -1056,7 +1113,7 @@ cd frontend && npm i && npm run dev
 | `maxActiveSmartTrades` | Cap open trades per bot |
 | `maxEntryOrders` | Cap open trades per pair |
 | `takeProfitPct` / `stopLossPct` | Server-side auto-close |
-| `status` | `paused` rejects all webhooks |
+| `status` | `paused` rejects all webhooks; set from the dashboard toggle or Trading Scene's C5 (target state) |
 | `webhookSecret` | Auth token in JSON body |
 
 ### 10.3 HTTP error mapping (webhooks)
@@ -1077,17 +1134,18 @@ cd frontend && npm i && npm run dev
 1. Deploy or run locally with `DRY_RUN=true`.
 2. Open **Settings** → add Binance API key (withdraw disabled, IP whitelist).
 3. **Create Signal Bot** → select exchange, pairs, sizing, optional TP/SL.
-4. Copy **Webhook URL** and entry JSON.
-5. Configure TradingView alerts per §8.3.
-6. Send test alert; check dashboard **Signals** count and **WebhookLog** (DB).
-7. Set `DRY_RUN=false` only when ready for live orders.
+4. Copy the **Webhook URL** and the webhook secret into the Trading Scene deployment (entries come from Trading Scene). Optionally copy the exit (SELL) message for a TradingView exit alert.
+5. Configure any TradingView exit alert per §8.3.
+6. Send a test signal from Trading Scene; check dashboard **Signals** count and **WebhookLog** (DB).
+7. On Trading Scene, turn on the administrator's two-factor sign-in before relying on `/bot` controls.
+8. Set `DRY_RUN=false` only when ready for live orders.
 
 ### 11.2 Creating and editing bots
 
-- **Create:** `/create` → after submit, webhook screen shows URL + JSON.
-- **Edit:** Dashboard → Edit → PATCH saves settings; secret unchanged.
-- **Stop:** Toggle pauses webhook processing without deleting bot.
-- **Delete:** Removes bot and SmartTrades (cascade).
+- **Create:** `/create` → after submit, the screen shows the URL, the secret and the optional exit message. Bots are created, edited and deleted here only; Trading Scene cannot.
+- **Edit:** Dashboard → Edit → PATCH saves settings; secret unchanged; **Reveal webhook secret** shows it again.
+- **Stop:** Toggle (or Trading Scene's *Stop…*) pauses webhook processing without deleting the bot. Its open trades keep TP/SL; *Close* on a paused bot's trade is refused (`bot_paused`), *Partial* still works.
+- **Delete:** refused while the bot has an active trade (`bot_has_open_trades`) or an unresolved order intent (`bot_has_unresolved_intents`), because those trades would lose TP/SL and could no longer be closed here. Closed trades keep their history (`botId` set null).
 
 ### 11.3 Multi-pair bots
 
@@ -1113,10 +1171,17 @@ One bot can trade multiple pairs (shared secret). Each pair is independently all
 
 ### 11.5 Manual close
 
-Dashboard → SmartTrades → **Close** on active row → `POST /api/trades/:id/close`.
+Dashboard → SmartTrades → **Close** on an active **strategy** row → `POST /api/trades/:id/close` (the same `closeStrategyTrade` as Trading Scene's `/bot`). The usual place is now Trading Scene's `/bot`; the dashboard is the recovery path.
+
+- **Manual (Trading Scene) positions are closed from Trading Scene's Trade panel only** (a SELL). The dashboard shows *Managed in Trading Scene* and the API refuses Close and Partial with 409 `trade_manual`, so the manual ledger and its TP/SL stay correct.
+- *Close* is refused (nothing sold) for a deleted bot's trade, a paused bot's trade, a pair no longer listed, or one of several active trades on the same pair; a trade-targeted exit for those cases is not built.
+- An uncertain exchange answer shows as *submitted, outcome not yet known* (202 `pending`) and is reconciled; it is never shown as closed or failed.
+- Close and Partial work while the Bot is halted.
 
 ### 11.6 Going live checklist
 
+- [ ] Trading Scene administrator has two-factor sign-in on (every `/bot` command except Halt needs it)
+- [ ] Exchange account added with the intended network (testnet is the default; mainnet needs a typed `MAINNET`)
 - [ ] DNS points to Elastic IP
 - [ ] `curl https://bot.alphawebstudioz.com/health` returns ok
 - [ ] `DRY_RUN=false` in server `backend/.env`
@@ -1135,7 +1200,9 @@ Dashboard → SmartTrades → **Close** on active row → `POST /api/trades/:id/
 | **webhookSecret** | Per-bot token sent in JSON `secret` field; UUID-derived hex string. |
 | **dedupe_key** | Client-provided id; duplicate within 120s → ignored. Required on every BUY signal, regardless of `maxEntryOrders` — it identifies the logical signal and must be reused on retries; without it the per-minute fallback cannot tell a genuine re-entry from a retry. |
 | **Trade dedupe** | Server-side `trade:{secret}:{symbol}:{side}` 45s window. |
-| **dry run** | Simulated fills at market price without `client.order()`. |
+| **dry run** | Simulated fills at market price without `client.order()`. Shown in Trading Scene as **DRY RUN (simulated)** / *Dry run (simulated)*; not the Platform's PAPER mode. A dry-run Bot can still be halted. |
+| **halt** | The Bot's own kill switch (`RiskControl`), separate from the Platform's halt. Blocks webhook BUY/SELL (TradingView exits included), manual BUY and both TP/SL pollers; operator SELL/Close/Partial still pass. |
+| **late fill** | A manual BUY fill after its trade closed; kept as its own `late_fill_unprotected` position with no TP/SL. |
 | **pct_bot** | Position size as % of total USDT balance. |
 | **pct_trade** | Labeled per-trade %; implementation uses same balance % (see gaps). |
 | **quote_order_qty** | USDT amount for market buy (Binance `quoteOrderQty`). |
@@ -1193,7 +1260,15 @@ An operator reading only the first could believe every order is on testnet while
 an account sends some to mainnet, so a disagreement is its own state — `MIXED
 NET` — rather than being folded into either. The status response carries account
 names and flags only; no key material leaves the process, and nothing here
-contacts Binance.
+contacts Binance. Trading Scene's C0 status reports the same as `routing`
+(`TESTNET` / `MAINNET` / `MIXED` / `NONE`) with account counts.
+
+**The testnet default (2026-11-09).** `POST /api/exchange-accounts` used to
+treat an omitted `testnet` as `false`, so any client that left it out created a
+mainnet account inside an installation running on testnet. It now **requires**
+an explicit boolean, and the Settings form starts with *Use Binance testnet*
+ticked and asks for a typed `MAINNET` before sending `false`. Nothing here
+enables mainnet manual trading (`MAINNET_MANUAL_TRADING_ENABLED` is separate).
 
 ### The TP/SL monitor's schedule (`BOT-033`)
 
@@ -1257,7 +1332,12 @@ below was re-checked against this checkout.
 | 5 | **Protective orders** | The exchange-native stop adapter is **not wired**: `placeProtection` and `cancelProtection` have no call sites, so the flag places nothing and protection is a 30-second in-process poll whether it is set or not. A position is unprotected while this process is down, and a gap through the stop fills at the next tick (`BOT-017`). |
 | 6 | **Webhook logs UI** | No frontend page for `WebhookLog`. Database only. |
 | 7 | **Dedupe across replicas** | The close lock is in-process. Two backend replicas would not share it, and nothing prevents running two. |
-| 8 | **Pine** | `deploy/pine-exit-webhook.snippet.pine` is deprecated; use `deploy/SR-Trend-v5-custom-webhook-ALERTS.pine`. |
+| 8 | **Pine** | `deploy/pine-exit-webhook.snippet.pine` is deprecated; use `deploy/SR-Trend-v5-custom-webhook-ALERTS.pine`. Its entry (`longSignal` BUY) alerts are refused (403) since direct TradingView BUY authority was removed; only its exits act. |
+| 9 | **Close on paused / deleted / same-pair trades** | *Close* refuses a paused bot's trade, a deleted bot's trade and one of several active trades on the same bot and pair (dashboard and Trading Scene alike). A trade-id-targeted operator exit in `webhook.ts` is needed; it is a separate money-path change, not built. *Partial* works on a paused bot. |
+| 10 | **Deleting a closed trade** | `DELETE /api/trades/:id` on a closed trade removes it from the daily-loss window, lowering the figure. Operator-only; a guard is recommended, not built. |
+| 11 | **Partly filled LIMIT when TP/SL fires (owner decision OD-1)** | The policy-neutral part is in place: a closed trade is never reopened, the entry is refreshed before an automated exit, a still-working remainder is flagged, and a late fill becomes a separate `late_fill_unprotected` position with no TP/SL. Whether to cancel the remainder first (or cancel and sweep), or to track and protect late fills, is an open owner decision; not implemented. |
+| 12 | **Halt and TP/SL (owner decision OD-3)** | A halt stops both TP/SL pollers. One switch for Platform and Bot, or a Bot halt that keeps TP/SL running, is an owner decision; not implemented. |
+| 13 | **`BotControlCommand` actor** | The actor on a control command is a claim signed by the Platform's key, not independent proof of who acted. |
 
 ### Fixed since the audit, and no longer true
 
@@ -1271,7 +1351,15 @@ below was re-checked against this checkout.
 | `remote-deploy.sh` hardcoded a Mac path | Derived from the script's own location, and `DRY_RUN` is no longer forced to `false` (`BOT-030`) |
 | No automated test suite | 122 tests across nine files, run by `npm test` with no network and no database |
 | Dashboard showed a hardcoded exchange name | The account's own name is shown |
-| A crash after strategy exchange acceptance required operator ledger repair | Durable strategy intents query the deterministic client ID on restart and transactionally reconstruct BUY/SELL SmartTrade accounting exactly once; unfindable attempts remain unresolved without resubmission |
+| A crash after strategy exchange acceptance required operator ledger repair | Durable strategy intents query the deterministic client ID on restart and transactionally reconstruct BUY/SELL SmartTrade accounting exactly once; unfindable attempts are never resubmitted (closed off as ABSENT only on a definitive not-found 60 s after submission) |
+| `-1006`/`-1007`, 5xx and code-less errors were booked as rejected, and a fresh signal placed a second BUY (D2) | One classifier; uncertain answers stay pending and are reconciled by client order id; an unresolved BUY blocks a fresh one (2026-11-09) |
+| A late fill after partial exit resurrected a closed manual trade; repeat or oversized exit SELLs (D1) | Invariants I1–I8; late fills are a separate unprotected position (2026-11-09) |
+| A re-halt overwrote a daily-loss latch, so resume skipped the loss check | An existing halt is kept (`alreadyHalted`) on the dashboard and Trading Scene routes (2026-11-09) |
+| The halt and its controls were hidden in `DRY_RUN` | Shown in `DRY_RUN` too (2026-11-09) |
+| Close/Partial on a manual trade failed with "close on Binance" | 409 `trade_manual` pointing to Trading Scene's Trade panel; buttons hidden for manual rows (2026-11-09) |
+| The dashboard showed an empty entry-JSON block; Reveal showed nothing | Entry block removed; Reveal shows the secret and the exit message (2026-11-09) |
+| An unticked exchange-account form created a mainnet account | Testnet pre-ticked, explicit boolean required, typed `MAINNET` (2026-11-09) |
+| Deleting a bot orphaned its open trades (no TP/SL, no Close) | Delete refused while active trades or unresolved intents exist, atomically (2026-11-09) |
 
 
 ---
@@ -1286,6 +1374,9 @@ below was re-checked against this checkout.
 | `routes/webhooks.ts` | `webhooksRouter` |
 | `routes/trades.ts` | `tradesRouter` |
 | `routes/exchange.ts` | `exchangeRouter` |
+| `routes/manualControl.ts` | `manualControlRouter`, `BOT_HALT_POLICY`, `createControlRateLimiters` |
+| `services/tradeExit.ts` | `closeStrategyTrade`, `partialCloseStrategyTrade` |
+| `services/controlCommands.ts` | `runControlCommand`, `readControlCommand`, `ControlRefusal` |
 | `services/webhook.ts` | `processWebhook`, `WebhookBody` |
 | `services/binance.ts` | `BinanceClient`, `clientFromAccount`, `clientFromEnv`, `getUsdtBalance`, `getTickerPrice`, `marketBuyQuote`, `marketSellBase`, `resolveSellQuantity`, `getBaseFreeBalance` |
 | `services/smartTrade.ts` | `updateSmartTradePnl`, `refreshAllActivePnL`, `checkTakeProfitStopLoss` |

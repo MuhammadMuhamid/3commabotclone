@@ -4,7 +4,10 @@ Current documentation starts at [docs/README.md](docs/README.md).
 
 Full-stack execution bot: connect **Binance Spot**, execute authenticated
 Platform decisions, manage **multi-pair bots**, and monitor them from a
-3commas-inspired dashboard. Direct TradingView traffic is exit-only.
+3commas-inspired dashboard. Since 2026-11-09 the administrator operates it from
+Trading Scene's `/bot` page over signed control routes (below). This dashboard
+remains the restricted recovery and break-glass path. Direct TradingView
+traffic is exit-only.
 
 > **Risk:** Live trading can lose money. Start with `DRY_RUN=true` and tiny position sizes.
 
@@ -71,6 +74,20 @@ npm run lint && npm run typecheck && npm test && npm run build
 only. The execution-reliability tests migrate and remove their ignored temporary
 SQLite database. Never point them at a real database or a real key.
 
+The cross-repository check lives in the Platform repository. Run it from the
+Platform's `platform/backend` with this checkout installed (`npm ci` in
+`backend`):
+
+```bash
+TRADING_SCENE_BOT_ROOT=/path/to/this/checkout \
+  node --env-file=tests/test.env --import tsx --test tests/crossRepositoryRealization.test.ts
+```
+
+The signing vector for control commands is asserted on both sides:
+`backend/tests/botControl.test.ts` here, and the Platform's
+`botControlClient.test.ts`. `scripts/release.sh gate --peer-platform-root`
+runs the contract diff, below.
+
 ## Spot execution reliability boundary
 
 - Authenticated manual Spot commands bind timestamp, nonce, request ID, path,
@@ -81,13 +98,53 @@ SQLite database. Never point them at a real database or a real key.
   cumulative open, partial, filled or canceled exchange snapshots idempotently.
 - Once a manual intent is `submitted`, a not-found query does **not** authorize
   another submission: absence cannot distinguish lookup delay from a crash just
-  before the wire call. It remains pending for later reconciliation/operator
-  review. A never-attempted `requested` intent may submit once.
+  before the wire call. Within 60 s of submission it stays pending.
+  `SUBMITTED_ABSENCE_SETTLE_MS` is the same rule the strategy SELL path already
+  used. After that window, a definitive "no such order" from the exchange
+  closes a never-acknowledged order off as `rejected` (ABSENT): none was
+  placed. A failed lookup never closes an order. A never-attempted `requested`
+  intent may submit once.
 - Every strategy MARKET BUY/SELL has a durable `StrategyOrderIntent` before the
   exchange boundary. `requested` proves no submission has been attempted;
   `submitted` is persisted before the wire call and can only query the
-  deterministic client ID. A query miss stays unresolved and never authorizes
-  a replacement order.
+  deterministic client ID. A query miss never authorizes a replacement order.
+  The same 60-second absence rule closes off a submitted intent that the
+  exchange still does not know.
+- **An uncertain exchange answer is never booked as a rejection (D2).**
+  - `classifyExchangeFailure` in `backend/src/services/binance.ts` is the one
+    classifier on every submit path: manual MARKET/LIMIT, the strategy webhook,
+    the dashboard and Platform Close/Partial, and the manual TP/SL SELL.
+  - Only a whitelist counts as a definite rejection: `-1002`, `-1003`,
+    `-1013`, `-1015`, `-1021`, `-1022`, `-1100`…`-1131`, `-2014`, `-2015`, `-2010`
+    (except "Duplicate order sent"), HTTP 429/418 without a code, and a local
+    refusal before the wire.
+  - Everything else stays pending and is reconciled query-first by the original
+    client order id. That includes `-1006`/`-1007`, other 5xx answers and
+    code-less transport errors. A lookup that keeps failing raises an alert
+    after 3 cycles.
+  - An unresolved strategy BUY for a bot and pair blocks a fresh BUY there
+    (`risk_blocked`). The risk snapshot counts unresolved BUYs as exposure.
+  - A reused manual request id must carry the same body
+    (`ManualCommand.bodyHash`), and a stored manual command is never re-run.
+- **A closed manual trade is never reopened (D1, policy-neutral part).**
+  - Snapshots apply as deltas, so a stale or repeated snapshot changes nothing.
+  - An exit never sells more than the position or the free balance net of
+    other tracked positions.
+  - Before an automated TP/SL exit, the Bot re-reads the entry and sells what
+    was actually acquired. A manual SELL is never raised above what the
+    operator asked for.
+  - An entry still working when its trade closes is flagged on the order.
+  - A BUY fill that lands after the trade closed becomes its own position with
+    `protectionState: late_fill_unprotected`: no TP/SL, never polled, sellable
+    from Trading Scene's Trade panel, with a plain warning. A late SELL fill is
+    flagged, not dropped.
+  - Whether the Bot should instead cancel the working remainder first, or carry
+    TP/SL to late fills, is an open owner decision (OD-1). Neither is
+    implemented.
+- Under `DRY_RUN=true` the Bot refuses to cancel a manual LIMIT whose exchange
+  order id is real (409 `live_order_in_dry_run`). It never replaces a real
+  exchange id with a `dry-` one, so a still-working order is not marked
+  cancelled.
 - Startup and a bounded poller reconstruct an authoritative `FILLED` order into
   the normal SmartTrade/partial-close ledger transactionally. BUY recovery
   requires commission trades; repeated recovery links or reuses the same local
@@ -112,12 +169,17 @@ SQLite database. Never point them at a real database or a real key.
   and 0.1% on sell revenue. It is not exchange-observed net P&L. A bounded
   50-event HMAC-authenticated outbox batch retries with backoff; Platform
   failure never rolls back Bot accounting.
-- The operator halt stops the automation in both directions: webhook and
-  Platform signals, strategy intents and the TP/SL monitors place no BUY and no
-  SELL while halted. It never refuses an OPERATOR exit — a manual SELL, the
-  dashboard Close and the dashboard scale-out stay available, and a manual BUY
-  is refused with 409 — so a halt (including one latched by a daily-loss
-  breach) can never trap an open position. Numeric exposure, concurrency and
+- The operator halt stops the automation in both directions. Webhook and
+  Platform signals (TradingView exit alerts included), strategy intents and
+  both TP/SL monitors (strategy and manual) place no BUY and no SELL while
+  halted. It never refuses an OPERATOR exit: a manual SELL, and Close and
+  Partial from the dashboard or from Trading Scene, stay available. A manual BUY
+  is refused with 409. So a halt, including one latched by a daily-loss breach,
+  can never trap an open position. A halt request while already halted keeps
+  the existing halt, its reason and its source (`alreadyHalted`), so a
+  daily-loss latch is never overwritten. The halt is shown and switchable in
+  DRY_RUN too, because a halt gates a dry run exactly as it gates a live one.
+  The Platform has its own, separate halt. Numeric exposure, concurrency and
   daily-loss limits continue to permit exits according to the existing policy. A never-attempted strategy intent rechecks those gates, while
   an already-attempted intent still reconciles exchange truth during a later
   halt. Dry run never sends an order, and manual live execution is restricted
@@ -129,6 +191,70 @@ SQLite database. Never point them at a real database or a real key.
 section on the Platform. They use the same signature as manual orders, read local
 rows only and never contact an exchange. Responses are built field by field in
 `backend/src/services/botView.ts`, so no webhook secret or exchange key is included.
+
+### Platform control routes (added 2026-11-09)
+
+`backend/src/routes/manualControl.ts` is mounted at
+`/api/manual-trading/control` after `requireManualAuth`. That is the same HMAC
+over method, path, timestamp, nonce, request id and body as a manual order, with
+the ±60 s window and the single-use durable nonce. The `/control/` prefix is
+control plane: it works while `MANUAL_TRADING_ENABLED=false`. Trading Scene's
+`/bot` page is the only intended caller, and the production proxy answers
+`/api/manual-trading/*` only from the Platform's address.
+
+| # | Route | What it does |
+|---|---|---|
+| C0 | `GET /status` | dry run and halt as independent fields, exchange routing (testnet/mainnet/mixed/none, with account counts), risk limits, snapshot and latch, bot counts, protection (in-process poll, interval, nothing resting on the exchange), Shariah floor, manual and mainnet-manual flags |
+| C1 | `POST /halt` | `{confirmation:"HALT_TRADING", reason, actor}`. Never overwrites an existing halt; answers `alreadyHalted` |
+| C2 | `POST /resume` | `{confirmation:"RESUME_TRADING", actor}`. 409 `still_breached` while a latched daily-loss halt is still at its limit. Shares `resumeBotTrading()` with the dashboard |
+| C3 / C4 | `GET` / `PATCH /risk-limits` | the same bounds as `/api/ops/risk-limits`. A change never clears a latch |
+| C5 | `POST /bots/:id/status` | `{status:"active"|"paused", actor}`, a target state rather than a toggle. Answers `changed` and the bot's unresolved-intent count |
+| C6 | `POST /trades/:id/close` | `closeStrategyTrade`, shared with the dashboard (below) |
+| C7 | `POST /trades/:id/partial-close` | `{pct: 1..99, actor}`, through `partialCloseStrategyTrade`, shared with the dashboard |
+| C8 | `GET /commands/:requestId` | the stored command, with the live intent or attempt state for a pending order; 404 `command_not_found` |
+
+**C6 and C7 refusals.** Each is a typed `{error, code}` refusal, and nothing is
+sold.
+
+- *Close* refuses:
+  - a manual trade (409 `trade_manual`: close it from Trading Scene's Trade
+    panel);
+  - a deleted bot's trade (`bot_deleted`);
+  - a paused bot's trade (`bot_paused`);
+  - a pair no longer listed (`pair_not_listed`);
+  - one of several active trades on the same bot and pair (`ambiguous_trade`).
+- `processWebhook` also takes a refuse-only `expectSmartTradeId`. If the trade it
+  would close is not the one asked for, it refuses before any lock or order.
+- *Partial* refuses manual and deleted-bot trades, and works on a paused bot.
+- Both refuse while an earlier exit is unresolved (`exit_unresolved`).
+- A recent exit that left the position open is 409 `exit_recent`, never a
+  success.
+- A submitted order whose outcome is not yet known answers 202 `pending`, and
+  the Bot reconciles it by its client order id.
+
+**Idempotency.** `BotControlCommand` (migration
+`20261109130000_bot_control_command`) works like this:
+
+- It claims each request id with an insert first.
+- Its command hash covers kind, target and parameters, but not the actor.
+- The same id and hash replays the stored result. A different hash is 409
+  `request_id_reused`. A command still running is 409 `command_in_progress`,
+  and it is never run again, whatever its age.
+- The intent or attempt id is recorded before the order goes on the wire, so
+  `C8` tells the truth after a crash.
+
+**Other rules.**
+
+- Every POST/PATCH carries `actor`: who stepped up on the Platform, how, and
+  when. It is a claim signed by the Platform's key.
+- Bodies are zod `.strict()`, and no request body is logged.
+- The control routes have their own rate limits: 120 reads and 60 writes per
+  minute. They are separate from the 120/min API limiter, so polling cannot
+  starve a halt. A 429 carries `code: "bot_rate_limited"` and means nothing
+  was executed.
+
+Bot create/edit/delete and exchange keys are **not** exposed here; they stay on
+this dashboard.
 
 ### Persisted execution evidence reads
 
@@ -334,19 +460,32 @@ Sessions use a 15-minute access token with a rotating 30-day refresh token, both
 
 1. Open the app → **Settings** (or first-run prompt).
 2. Add your Binance API key + secret (withdraw disabled, IP whitelist recommended).
-3. Create a **Signal Bot** with pairs, direction, entry %, TP/SL toggles.
+   **Use Binance testnet** is ticked by default. Unticking it asks you to type
+   `MAINNET` before a real-money account is added. The API itself requires an
+   explicit `testnet: true|false` and refuses an account that omits it. Keys are
+   entered here only, never in Trading Scene.
+3. Create a **Signal Bot** with pairs, direction, entry %, TP/SL toggles. Bots
+   are created, edited and deleted here; Trading Scene's `/bot` can start and
+   stop them. A bot with active trades, or with orders still being reconciled,
+   cannot be deleted (409 `bot_has_open_trades` / `bot_has_unresolved_intents`),
+   because its trades would lose TP/SL and could no longer be closed.
 
 ### 5. TradingView emergency/independent exit webhook
 
 On the **Create Signal Bot** page, copy:
 
 - **Webhook URL:** `https://YOUR-DOMAIN/api/webhooks/signal_bots`
-- **JSON message** (includes per-bot `secret`)
+- **Webhook secret**, to paste into the Trading Scene deployment (entries come
+  from Trading Scene);
+- optionally, the **TradingView exit (SELL) alert message**, which includes the
+  per-bot `secret`.
 
-Paste the URL in TradingView alert → **Notifications** → **Webhook URL**.
-Paste only the generated exit JSON in the alert **Message** field. The UI does
-not generate a BUY payload because direct TradingView entry authority is
-disabled.
+Afterwards the secret and the exit message are shown only after an explicit
+**Reveal webhook secret** on the Edit page. Paste the URL in TradingView alert
+→ **Notifications** → **Webhook URL**, and only the exit message in the alert
+**Message** field. The UI generates no BUY payload: a BUY without Platform
+correlation headers is refused with 403 "Platform authority required for
+exposure-increasing BUY".
 
 Supported actions in JSON:
 
@@ -411,6 +550,10 @@ Host nginx config lives in `deploy/nginx-production.conf`.
 | `SECURE_COOKIES` | `false` only for local HTTP dev; `true` in production |
 | `CORS_ORIGIN` | Exact frontend origin, or the browser drops session cookies |
 | `VAPID_*` | Optional Web Push keys (`npx web-push generate-vapid-keys`) |
+| `BINANCE_TESTNET` | Process-wide default network for a bot **without** its own exchange account (default `false`). Each exchange account carries its own `testnet` flag, which decides where its orders go |
+| `MANUAL_TRADING_ENABLED` | `true` enables Trading Scene's manual orders and the read views behind its `/bot` page. The control routes (`/api/manual-trading/control/*`) work without it |
+| `MAINNET_MANUAL_TRADING_ENABLED` | `false` by default; manual orders on a mainnet account need it and a confirmation phrase |
+| `MANUAL_TRADING_HMAC_SECRET` | The Platform-to-Bot control-plane key (32+ characters, the same value as the Platform's). Signs manual orders, the Shariah floor and the control routes; without it those routes refuse |
 
 With `DRY_RUN=false`, the API refuses to start unless `ENCRYPTION_KEY`,
 `SCRYPT_SALT` and `JWT_SECRET` are all present and long enough.
@@ -423,7 +566,8 @@ SQLite `bot.db` is the authoritative local recovery artifact. It includes bot
 configuration and webhook secrets; exchange-account routing and encrypted API
 key blobs; `SmartTrade`, `PartialClose`, `StrategyOrderIntent`, immutable
 `RealizationEvent` payload/outbox state, `ManualOrder`,
-`ManualCommand`, nonce/receipt dedupe records, close marks, risk/halt state,
+`ManualCommand`, `BotControlCommand` (Platform control commands),
+nonce/receipt dedupe records, close marks, risk/halt state,
 execution logs, users/sessions/push subscriptions, and Prisma migration history.
 The live-price/PnL snapshots in those rows can be refreshed, but identities,
 quantities, linkage and lifecycle state must be preserved.
