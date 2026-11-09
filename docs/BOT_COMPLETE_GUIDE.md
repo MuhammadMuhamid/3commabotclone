@@ -1349,7 +1349,7 @@ below was re-checked against this checkout.
 | Dedupe in memory only, cleared by a restart | Durable `pairCloseMark` rows with a TTL (`BOT-019`) |
 | TP/SL close set `closedReason` without the final P&L | The close writes `status`, `closedAt`, `closedReason`, `currentPrice`, `pnlUsdt` and `pnlPct` in one update |
 | `remote-deploy.sh` hardcoded a Mac path | Derived from the script's own location, and `DRY_RUN` is no longer forced to `false` (`BOT-030`) |
-| No automated test suite | 122 tests across nine files, run by `npm test` with no network and no database |
+| No automated test suite | An automated suite, run by `npm test` with no network and no database |
 | Dashboard showed a hardcoded exchange name | The account's own name is shown |
 | A crash after strategy exchange acceptance required operator ledger repair | Durable strategy intents query the deterministic client ID on restart and transactionally reconstruct BUY/SELL SmartTrade accounting exactly once; unfindable attempts are never resubmitted (closed off as ABSENT only on a definitive not-found 60 s after submission) |
 | `-1006`/`-1007`, 5xx and code-less errors were booked as rejected, and a fresh signal placed a second BUY (D2) | One classifier; uncertain answers stay pending and are reconciled by client order id; an unresolved BUY blocks a fresh one (2026-11-09) |
