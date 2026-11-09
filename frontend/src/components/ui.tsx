@@ -136,7 +136,8 @@ export function Input({
   hint?: string;
   placeholder?: string;
   min?: number;
-  step?: number;
+  /** "any" leaves value validation to the API instead of an HTML step grid. */
+  step?: number | "any";
   right?: ReactNode;
 }) {
   return (

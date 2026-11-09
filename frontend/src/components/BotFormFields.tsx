@@ -280,7 +280,13 @@ export function BotFormFields({
             <input
               type="number"
               min={0.01}
-              step={form.maxInvestmentUnit.startsWith("usdt") ? 1 : 0.1}
+              /*
+               * "any": with `min` set, a numeric step only admits min + n·step,
+               * so 0.01 with 0.1 (or 1) rejected the default 5 and the browser
+               * silently blocked Create Bot. The API's schema is the authority
+               * on the value; the input adds no stricter grid.
+               */
+              step="any"
               value={form.maxInvestmentPct}
               onChange={(e) => setForm((f) => ({ ...f, maxInvestmentPct: Number(e.target.value) }))}
               className="w-28 bg-[var(--color-panel-2)] border border-[var(--color-border)] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-[var(--color-accent)] transition-all"
@@ -349,7 +355,7 @@ export function BotFormFields({
               type="number"
               value={String(form.entryVolumePct)}
               min={1}
-              step={1}
+              step="any"
               onChange={(v) => setForm((f) => ({ ...f, entryVolumePct: Number(v) }))}
               hint="Percentage of Max. investment to use for each order (default 100)."
               right={<span>%</span>}
@@ -406,7 +412,7 @@ export function BotFormFields({
                 type="number"
                 value={String(form.takeProfitPct)}
                 min={0.1}
-                step={0.1}
+                step="any"
                 onChange={(v) => setForm((f) => ({ ...f, takeProfitPct: Number(v) }))}
                 hint="e.g. 3 = close when PnL ≥ +3%"
                 right={<span>%</span>}
@@ -440,7 +446,7 @@ export function BotFormFields({
                 type="number"
                 value={String(form.stopLossPct)}
                 min={0.1}
-                step={0.1}
+                step="any"
                 onChange={(v) => setForm((f) => ({ ...f, stopLossPct: Number(v) }))}
                 hint="e.g. 3 = close when PnL ≤ −3%"
                 right={<span>%</span>}
