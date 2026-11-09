@@ -22,7 +22,7 @@
  * The bot and account logic is the Classic dashboard's own, shared through
  * `services/botAdmin.ts` and `services/exchangeAccounts.ts`.
  */
-import { Router, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { asyncHandler } from "../middleware/errors.js";
@@ -190,17 +190,33 @@ manualControlManageRouter.get("/exchange-accounts/:id/balance", asyncHandler(asy
 // ── C17 POST /exchange-enrollments ──────────────────────────────────────────
 
 /**
- * Ticket minting has its own budget on top of the control write limiter:
- * 5 per 10 minutes (trace §4.2). Mutable only so tests can widen it.
+ * Ticket minting has its own budget on top of the control write limiter
+ * (trace §4.2: 5 per 10 minutes). Review fix 5: the budget is PER OPERATOR —
+ * keyed by the signed `actor.platformUserId`, applied after the body is
+ * validated, so a refused (400) request spends nothing — because every
+ * Platform user arrives from the Platform's single IP. A coarse per-IP
+ * ceiling (30 per 10 minutes) still bounds the channel as a whole.
+ * Mutable only so tests can widen it.
  */
-export const enrollmentMintLimit = { windowMs: 10 * 60_000, max: 5 };
-export const enrollmentMintLimiter = rateLimit({
+export const enrollmentMintLimit = { windowMs: 10 * 60_000, perActor: 5, perIp: 30 };
+const mintRateLimited = {
+  error: "Too many enrollment links requested; nothing was issued. Retry shortly.",
+  code: "bot_rate_limited",
+};
+export const enrollmentMintIpLimiter = rateLimit({
   windowMs: enrollmentMintLimit.windowMs,
-  limit: () => enrollmentMintLimit.max,
+  limit: () => enrollmentMintLimit.perIp,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Too many enrollment links requested; nothing was issued. Retry shortly.",
-    code: "bot_rate_limited" },
+  message: mintRateLimited,
+});
+export const enrollmentMintActorLimiter = rateLimit({
+  windowMs: enrollmentMintLimit.windowMs,
+  limit: () => enrollmentMintLimit.perActor,
+  keyGenerator: (_req, res) => `actor:${String(res.locals.enrollmentActor ?? "")}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: mintRateLimited,
 });
 
 const mintSchema = z.object({
@@ -228,10 +244,18 @@ const mintSchema = z.object({
   }
 });
 
-manualControlManageRouter.post("/exchange-enrollments", enrollmentMintLimiter, asyncHandler(async (req, res) => {
+/** Validate before the per-operator limiter, so a refused body spends nothing. */
+function validateMint(req: Request, res: Response, next: NextFunction): void {
   const body = parseBody(mintSchema, req, res);
   if (!body) return;
-  const { actor, ...input } = body;
+  res.locals.mintBody = body;
+  res.locals.enrollmentActor = body.actor.platformUserId;
+  next();
+}
+
+manualControlManageRouter.post("/exchange-enrollments", enrollmentMintIpLimiter, validateMint,
+  enrollmentMintActorLimiter, asyncHandler(async (req, res) => {
+  const { actor, ...input } = res.locals.mintBody as z.infer<typeof mintSchema>;
   // Never cache an answer that can carry a bearer ticket.
   res.setHeader("Cache-Control", "no-store");
   await runAndSend(req, res, {
