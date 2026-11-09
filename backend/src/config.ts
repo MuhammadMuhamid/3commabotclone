@@ -132,6 +132,14 @@ export const config = {
   realizationDeliveryEnabled: process.env.REALIZATION_DELIVERY_ENABLED === "true",
   realizationPlatformUrl: process.env.REALIZATION_PLATFORM_URL ?? "",
   realizationHmacSecret: process.env.REALIZATION_HMAC_SECRET ?? "",
+  /**
+   * OD-5: emit realization contract v2 (v1 + the order's `environment`) for
+   * events persisted while this is true AND the Platform's last acknowledged
+   * ingest answer listed `realization.v2`. Default false. Rows persisted
+   * earlier keep their v1 shape forever (payloads are immutable and hashed).
+   * Do not roll the Bot back past this version once v2 rows exist.
+   */
+  realizationContractV2Enabled: process.env.REALIZATION_CONTRACT_V2_ENABLED === "true",
 
   /*
    * OD-4: exchange-key enrollment and webhook-secret reveal on the Bot's own

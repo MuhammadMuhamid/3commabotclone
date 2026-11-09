@@ -11,6 +11,7 @@ import {
   clearanceForFirstSubmission, clearanceForPersistedEntry, shariahScopeForBot,
 } from "./shariah.js";
 import { persistStrategyRealization } from "./realizationEvents.js";
+import { executionEnvironmentForBot } from "./executionEnvironment.js";
 import {
   evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
   shouldLatchHalt,
@@ -170,6 +171,8 @@ export async function reserveStrategyIntent(
       smartTradeId: input.smartTradeId,
       shariahContext: input.shariahContext ?? null,
       authorizationNonceHash: input.authorizationNonceHash ?? null,
+      // OD-5: recorded once, from the inputs that choose the endpoint.
+      executionEnvironment: await executionEnvironmentForBot(input.bot),
     }});
   } catch (error) {
     if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") {

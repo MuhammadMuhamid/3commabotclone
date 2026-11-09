@@ -441,6 +441,10 @@ model StrategyOrderIntent {
   /// distinct, so they never collide with each other.
   authorizationNonceHash String? @unique
   skipExitCheck     Boolean  @default(false)
+  /// OD-5: where this order was routed when it was reserved — DRY_RUN,
+  /// TESTNET or MAINNET — from the same inputs that choose the endpoint.
+  /// Null on intents reserved before the column existed (read as UNKNOWN).
+  executionEnvironment String?
   smartTradeId      String?
   status            String   @default("requested")
   exchangeOrderId   String?
@@ -701,4 +705,15 @@ model ExchangeEnrollment {
   updatedAt        DateTime  @updatedAt
 
   @@index([status, expiresAt])
+}
+
+/**
+ * OD-5: a capability the Platform advertised in its LAST acknowledged
+ * realization-ingest answer (`capabilities: [...]`). A row exists while the
+ * latest acknowledgement listed it; an acknowledgement without it deletes the
+ * row, so a rolled-back Platform stops receiving the newer shape.
+ */
+model PlatformCapability {
+  name   String   @id
+  seenAt DateTime
 }
