@@ -15,7 +15,7 @@ import { sendExecutionNotification } from "./push.js";
 import { SUBMITTED_ABSENCE_SETTLE_MS } from "./strategyOrderIntent.js";
 import {
   type BotOrderOrigin, type BotRiskLimits, evaluateBotHalt, evaluateBotRisk, getBotRiskLimits,
-  readBotRiskSnapshot, setBotTradingHalted, shouldLatchHalt,
+  readBotHaltState, readBotRiskSnapshot, setBotTradingHalted, shouldLatchHalt,
 } from "./riskControls.js";
 import { calcRealizedPnl } from "./smartTrade.js";
 import {
@@ -981,12 +981,26 @@ export async function listManualState(symbol?: string): Promise<unknown> {
         createdAt: true, closedAt: true, closedReason: true },
       orderBy: { createdAt: "desc" }, take: 100 }),
   ]);
+  /*
+   * Say whether the TP/SL poller is actually running, so no client can show a
+   * position as protected while it is not (checkManualProtection returns early
+   * when manual trading is off or the Bot is halted, and skips mainnet-account
+   * positions while mainnet manual trading is off). Additive fields only.
+   */
+  const halt = await readBotHaltState();
+  const polling = config.manualTradingEnabled && !halt.halted;
+  const note = !config.manualTradingEnabled
+    ? "TP/SL is NOT being checked: manual trading is disabled on the Bot."
+    : halt.halted
+      ? "TP/SL is NOT being checked: the Bot is halted. Your own SELL still works; resume the Bot to restore protection."
+      : "Checked by the bot poller about every 30 s; no exchange-resting protective order is claimed.";
   return { enabled: config.manualTradingEnabled,
     mainnetEnabled: config.mainnetManualTradingEnabled, dryRun: config.dryRun,
+    tradingHalted: halt.halted,
     mixed: accounts.some((a) => a.testnet) && accounts.some((a) => !a.testnet),
     accounts: accounts.map((a) => ({ ...a, mode: a.testnet ? "testnet" : "mainnet" })),
-    orders, positions, protection: { type: "bot-managed", exchangeResting: false,
-      note: "Checked by the bot poller; no exchange-resting protective order is claimed." } };
+    orders, positions, protection: { type: "bot-managed", exchangeResting: false, polling,
+      haltedBy: halt.haltedBy, mainnetPositionsChecked: config.mainnetManualTradingEnabled, note } };
 }
 
 /** The stored identity of a command body: kind plus key-order-independent JSON. */
