@@ -975,7 +975,10 @@ export async function listManualState(symbol?: string): Promise<unknown> {
     prisma.manualOrder.findMany({ where: pair ? { symbol: pair } : undefined,
       orderBy: { createdAt: "desc" }, take: 100 }),
     prisma.smartTrade.findMany({ where: { source: "manual", ...(pair ? { pair } : {}) },
-      select: { id: true, exchangeAccountId: true, pair: true, status: true, entryPrice: true,
+      // manualOrderId / exchangeOrderId let a client derive the position's
+      // environment from its own entry evidence (a `dry-` id ⇒ DRY_RUN).
+      select: { id: true, exchangeAccountId: true, manualOrderId: true, exchangeOrderId: true,
+        pair: true, status: true, entryPrice: true,
         currentPrice: true, quantity: true, quoteSpent: true, pnlUsdt: true, pnlPct: true,
         manualTpPrice: true, manualSlPrice: true, protectionType: true, protectionState: true,
         createdAt: true, closedAt: true, closedReason: true },

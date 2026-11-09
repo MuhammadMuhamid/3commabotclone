@@ -61,3 +61,21 @@ test("protection.polling is true and the note says checked only while the poller
   assert.equal(disabled.protection.polling, false);
   assert.match(disabled.protection.note, /manual trading is disabled/);
 });
+
+test("positions carry their entry evidence (manualOrderId, exchangeOrderId) so a client can label dry-run positions", async () => {
+  const acct = await prisma.exchangeAccount.create({ data: { name: "t", exchange: "binance", marketType: "spot",
+    apiKeyEnc: "x", apiSecretEnc: "y", testnet: true } });
+  const order = await prisma.manualOrder.create({ data: { requestId: "state-evidence-1", exchangeAccountId: acct.id,
+    symbol: "BTCUSDT", side: "BUY", orderType: "MARKET", quantityType: "quote", requestedQuoteQty: 10,
+    status: "filled", clientOrderId: "cid-state-evidence-1", exchangeOrderId: "dry-cid-state-evidence-1",
+    filledBaseQty: 0.0001, filledQuoteQty: 10, averageFillPrice: 100000, protectionState: "none" } });
+  await prisma.smartTrade.create({ data: { source: "manual", manualOrderId: order.id, exchangeAccountId: acct.id,
+    botName: "Manual", pair: "BTCUSDT", direction: "long", status: "active", entryPrice: 100000, currentPrice: 100000,
+    buyPrice: 100000, quantity: 0.0001, quoteSpent: 10, exchangeOrderId: "dry-cid-state-evidence-1",
+    clientOrderId: "cid-state-evidence-1", protectionType: "bot-managed", protectionState: "none" } });
+  const state = await listManualState("BTCUSDT") as { positions: { manualOrderId: string | null; exchangeOrderId: string | null }[] };
+  const p = state.positions.find((x) => x.manualOrderId === order.id);
+  assert.ok(p, "the position is listed with its entry order id");
+  assert.equal(p.exchangeOrderId, "dry-cid-state-evidence-1");
+});
+
