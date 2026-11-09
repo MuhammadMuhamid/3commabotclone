@@ -38,6 +38,12 @@ export interface ManualOrderSnapshot {
   executedQuoteQuantity: number;
   averagePrice: number | null;
   simulated: boolean;
+  /**
+   * X7: false when this is a BUY with fills whose base-asset commission could
+   * not be netted because the trades lookup failed, so `executedBaseQuantity`
+   * is the GROSS figure. Absent means netted (or nothing to net).
+   */
+  netted?: boolean;
 }
 
 /** A local exchange-filter refusal, raised before any order is sent. */
@@ -174,6 +180,7 @@ async function fromBinanceOrder(
 ): Promise<ManualOrderSnapshot> {
   const grossBase = Number(order.executedQty ?? 0);
   let netBase = grossBase;
+  let netted = true;
   const side = String(order.side ?? "");
   const orderId = String(order.orderId ?? "");
   if (!simulated && side === "BUY" && grossBase > 0 && orderId) {
@@ -188,7 +195,9 @@ async function fromBinanceOrder(
       netBase = Math.max(0, grossBase - commission);
     } catch {
       // A just-submitted order can be visible before its fills endpoint. The
-      // next bounded reconciliation pass corrects the net quantity.
+      // next bounded reconciliation pass corrects the net quantity; until it
+      // does, the snapshot says it is gross (X7), so no sweep sizes from it.
+      netted = false;
     }
   }
   const quote = Number(order.cummulativeQuoteQty ?? 0);
@@ -200,6 +209,7 @@ async function fromBinanceOrder(
     executedQuoteQuantity: quote,
     averagePrice: grossBase > 0 ? quote / grossBase : null,
     simulated,
+    ...(netted ? {} : { netted: false }),
   };
 }
 

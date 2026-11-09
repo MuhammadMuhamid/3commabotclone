@@ -33,6 +33,12 @@ export interface BotRiskLimits {
   /** Rolling realised loss that trips the switch, as a positive number. Null disables. */
   maxDailyLossQuote: number | null;
   dailyLossWindowHours: number;
+  /**
+   * OD-3: new entries are paused. Independent of `tradingHalted`: exits, the
+   * TP/SL monitors, OD-1 cancels and sweeps, and reconciliation all continue.
+   */
+  entriesPaused: boolean;
+  entriesPausedReason: string | null;
 }
 
 export const DEFAULT_BOT_RISK_LIMITS: BotRiskLimits = {
@@ -43,6 +49,8 @@ export const DEFAULT_BOT_RISK_LIMITS: BotRiskLimits = {
   maxConcurrentTrades: null,
   maxDailyLossQuote: null,
   dailyLossWindowHours: 24,
+  entriesPaused: false,
+  entriesPausedReason: null,
 };
 
 export interface BotRiskSnapshot {
@@ -77,6 +85,7 @@ export function realisedPnlFromTradeEvents(
 
 export type BotRiskBlockCode =
   | "trading_halted"
+  | "entries_paused"
   | "max_exposure"
   | "max_concurrent_trades"
   | "daily_loss_limit";
@@ -122,13 +131,36 @@ export function isOperatorExit(order: { side: unknown; origin?: BotOrderOrigin }
 }
 
 /**
+ * OD-3: the pause rule, once. Exact comparison, as for the halt: a side that
+ * is not literally `"sell"` — missing, mis-cased, anything — is an ENTRY and is
+ * refused while entries are paused, whoever asks (an operator's manual BUY
+ * too). A SELL is never paused.
+ */
+export function entriesPausedDecision(
+  limits: Partial<Pick<BotRiskLimits, "entriesPaused" | "entriesPausedReason">>,
+  order: { side: unknown }
+): BotRiskDecision | null {
+  if (limits.entriesPaused === true && order.side !== "sell") {
+    return block("entries_paused",
+      limits.entriesPausedReason ? `entries paused: ${limits.entriesPausedReason}` : "entries paused");
+  }
+  return null;
+}
+
+/**
  * The halt half of the gate on its own, for a caller that must re-check ONLY
  * the halt — the manual reconciler re-proving an order it already admitted,
  * whose own pending exposure the snapshot would otherwise count twice.
  * `evaluateBotRisk` calls this first, so the rule exists exactly once.
+ *
+ * OD-3: the entries pause is part of this half (it gates WHETHER an entry may
+ * be placed, not how big), checked after the halt, so while both are set the
+ * halt is reported first. It reaches every gated path with no other edit: the
+ * webhook preflight and entry guard, the manual BUY, and both reconcilers.
  */
 export function evaluateBotHalt(
-  limits: Pick<BotRiskLimits, "tradingHalted" | "haltedReason">,
+  limits: Pick<BotRiskLimits, "tradingHalted" | "haltedReason"> &
+    Partial<Pick<BotRiskLimits, "entriesPaused" | "entriesPausedReason">>,
   order: { side: unknown; origin?: BotOrderOrigin }
 ): BotRiskDecision {
   if (limits.tradingHalted && !isOperatorExit(order)) {
@@ -137,7 +169,7 @@ export function evaluateBotHalt(
       limits.haltedReason ? `trading is halted: ${limits.haltedReason}` : "trading is halted"
     );
   }
-  return { allowed: true };
+  return entriesPausedDecision(limits, order) ?? { allowed: true };
 }
 
 /**
@@ -220,7 +252,92 @@ export async function getBotRiskLimits(): Promise<BotRiskLimits> {
     maxConcurrentTrades: row.maxConcurrentTrades,
     maxDailyLossQuote: row.maxDailyLossQuote,
     dailyLossWindowHours: row.dailyLossWindowHours,
+    entriesPaused: row.entriesPaused,
+    entriesPausedReason: row.entriesPausedReason,
   };
+}
+
+// ── OD-3: pause new entries ─────────────────────────────────────────────────
+
+/** The entries pause as stored. */
+export interface EntriesPauseState {
+  paused: boolean;
+  pausedAt: Date | null;
+  pausedBy: string | null;
+  reason: string | null;
+}
+
+export async function readEntriesPause(): Promise<EntriesPauseState> {
+  const row = await prisma.riskControl.findUnique({ where: { id: SINGLETON_ID } });
+  return {
+    paused: row?.entriesPaused ?? false,
+    pausedAt: row?.entriesPausedAt ?? null,
+    pausedBy: row?.entriesPausedBy ?? null,
+    reason: row?.entriesPausedReason ?? null,
+  };
+}
+
+/**
+ * Set the entries pause to a TARGET state — the one implementation behind the
+ * Platform's signed C9 and the dashboard's `/api/ops/entries`.
+ *
+ * Idempotent: pausing a paused Bot keeps the pause that is in force (its time,
+ * actor and reason are what an operator needs to see) and reports
+ * `changed: false`; resuming an un-paused Bot is likewise a no-op. Each write
+ * is one conditional statement on the current value, so two racing requests
+ * cannot both "change" it. Never touches the halt, and the halt never touches
+ * it.
+ */
+export async function setEntriesPaused(target:
+  | { paused: true; reason: string; by: string }
+  | { paused: false; by: string }
+): Promise<{ changed: boolean; state: EntriesPauseState }> {
+  await prisma.riskControl.upsert({
+    where: { id: SINGLETON_ID }, create: { id: SINGLETON_ID }, update: {},
+  });
+  const written = target.paused
+    ? await prisma.riskControl.updateMany({
+      where: { id: SINGLETON_ID, entriesPaused: false },
+      data: { entriesPaused: true, entriesPausedAt: new Date(), entriesPausedBy: target.by,
+        entriesPausedReason: target.reason },
+    })
+    : await prisma.riskControl.updateMany({
+      where: { id: SINGLETON_ID, entriesPaused: true },
+      data: { entriesPaused: false, entriesPausedAt: null, entriesPausedBy: null,
+        entriesPausedReason: null },
+    });
+  return { changed: written.count === 1, state: await readEntriesPause() };
+}
+
+/**
+ * OD-3: the entries pause as C0, C9 and the dashboard report it, with what a
+ * pause cannot stop by itself: manual LIMIT BUYs resting at the exchange, and
+ * strategy BUYs whose exchange outcome is still unresolved.
+ */
+export async function readEntriesStatus(): Promise<{
+  paused: boolean; pausedAt: string | null; pausedBy: string | null; reason: string | null;
+  workingEntryLimits: number; unresolvedBuyIntents: number;
+}> {
+  const [pause, workingEntryLimits, unresolvedBuyIntents] = await Promise.all([
+    readEntriesPause(),
+    prisma.manualOrder.count({ where: { side: "BUY", orderType: "LIMIT",
+      status: { in: ["open", "partially_filled"] } } }),
+    prisma.strategyOrderIntent.count({ where: { side: "BUY", status: { in: ["requested", "submitted"] } } }),
+  ]);
+  return {
+    paused: pause.paused,
+    pausedAt: pause.pausedAt?.toISOString() ?? null,
+    pausedBy: pause.pausedBy,
+    reason: pause.reason,
+    workingEntryLimits,
+    unresolvedBuyIntents,
+  };
+}
+
+/** True when the rolling realised loss meets the daily-loss limit right now (live, not the latch). */
+export function dailyLossBreached(limits: BotRiskLimits, snapshot: BotRiskSnapshot): boolean {
+  if (limits.maxDailyLossQuote === null) return false;
+  return -Math.min(0, snapshot.realisedPnlInWindow) >= limits.maxDailyLossQuote;
 }
 
 /** The halt as stored, including when it began. */
@@ -447,11 +564,13 @@ export function describeBotRiskState(limits: BotRiskLimits, snapshot: BotRiskSna
   if (limits.tradingHalted) {
     return `HALTED${limits.haltedBy ? ` (${limits.haltedBy})` : ""}${
       limits.haltedReason ? `: ${limits.haltedReason}` : ""
-    }`;
+    }${limits.entriesPaused ? "; new entries also paused" : ""}`;
   }
   const loss = -Math.min(0, snapshot.realisedPnlInWindow);
   return (
-    "ACTIVE — " +
+    (limits.entriesPaused
+      ? `ENTRIES PAUSED${limits.entriesPausedReason ? `: ${limits.entriesPausedReason}` : ""} — `
+      : "ACTIVE — ") +
     `exposure ${snapshot.openExposureQuote.toFixed(2)}` +
     (limits.maxTotalExposureQuote !== null ? `/${limits.maxTotalExposureQuote.toFixed(2)}` : "") +
     `, trades ${snapshot.openTrades}` +

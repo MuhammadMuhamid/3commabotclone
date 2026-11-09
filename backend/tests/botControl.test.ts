@@ -521,28 +521,21 @@ test("C5: target state, idempotent across requests, with the unresolved-intent c
 // C6 — Close
 // ════════════════════════════════════════════════════════════════════════════
 
+// B-SLICE2 (2026-11-09): C6 is trade-id-targeted. `bot_paused`, `pair_not_listed`
+// and `ambiguous_trade` are no longer refusals — those trades are closable on
+// their own (see operatorExit.test.ts); `trade_manual` and `bot_deleted` stay.
 test("C6: every refusal is typed, and none of them reaches the exchange", async () => {
   const exchange = fakeExchange();
   useExchange(exchange);
   const bot = await createBot();
-  const paused = await createBot({ status: "paused" } as Partial<SignalBot>);
-  const delisted = await createBot({ pairs: JSON.stringify(["ETHUSDT"]) } as Partial<SignalBot>);
-  const multi = await createBot({ maxEntryOrders: 2 } as Partial<SignalBot>);
 
   const manual = await createTrade(null, { source: "manual", botName: "Manual" });
   const orphan = await createTrade(null);
-  const ofPaused = await createTrade(paused);
-  const ofDelisted = await createTrade(delisted);
-  const twinA = await createTrade(multi);
-  await createTrade(multi, { createdAt: new Date() });
   const closed = await createTrade(bot, { status: "closed", closedAt: new Date() });
 
   const expectations: Array<[string, number, string]> = [
     [manual.id, 409, "trade_manual"],
     [orphan.id, 422, "bot_deleted"],
-    [ofPaused.id, 422, "bot_paused"],
-    [ofDelisted.id, 422, "pair_not_listed"],
-    [twinA.id, 422, "ambiguous_trade"],
     [closed.id, 409, "trade_not_active"],
     ["00000000-0000-4000-8000-0000000000ee", 404, "trade_not_found"],
   ];
@@ -560,32 +553,29 @@ test("C6: every refusal is typed, and none of them reaches the exchange", async 
   assert.equal(heldLockCount(), 0);
 });
 
-test("C6 / F3: a sibling trade appearing after the guard is refused as ambiguous_trade, with zero orders", async () => {
-  const exchange = fakeExchange();
-  useExchange(exchange);
-  const bot = await createBot({ maxEntryOrders: 2 } as Partial<SignalBot>);
-  const clicked = await createTrade(bot);
-  let sibling: SmartTrade | null = null;
-  // The client factory runs inside processWebhook, after closeStrategyTrade's
-  // guard and immediately before the newest-active-trade selection: exactly
-  // the race window F3 describes.
-  tradeExchangeClient.closeFactory = async () => {
-    sibling = await createTrade(bot, { createdAt: new Date() });
-    return exchange.client;
-  };
-  const r = await post(`/trades/${clicked.id}/close`, { actor: ACTOR });
-  assert.equal(r.status, 422);
-  assert.equal(r.body.code, "ambiguous_trade");
-  assert.equal(exchange.submissions.length, 0, "nothing was sold");
-  assert.equal(await prisma.strategyOrderIntent.count(), 0, "no intent was reserved");
-  assert.ok(sibling);
-  for (const id of [clicked.id, (sibling as SmartTrade).id]) {
-    assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id } })).status, "active");
-  }
-  assert.equal(heldLockCount(), 0);
-  // The receipt was released: the 45 s exit dedupe does not swallow a retry.
-  assert.equal(await prisma.webhookReceipt.count(), 0);
-});
+test("C6 / F3 → B-SLICE2: a sibling trade appearing after the guard is not sold; the CLICKED trade is closed by id",
+  async () => {
+    const exchange = fakeExchange();
+    useExchange(exchange);
+    const bot = await createBot({ maxEntryOrders: 2 } as Partial<SignalBot>);
+    const clicked = await createTrade(bot);
+    let sibling: SmartTrade | null = null;
+    // The client factory runs inside processWebhook, after closeStrategyTrade's
+    // guard and immediately before the trade selection: the race window F3
+    // describes. The targeted close selects by id, so the sibling is irrelevant.
+    tradeExchangeClient.closeFactory = async () => {
+      sibling = await createTrade(bot, { createdAt: new Date() });
+      return exchange.client;
+    };
+    const r = await post(`/trades/${clicked.id}/close`, { actor: ACTOR });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(exchange.submissions.length, 1, "exactly one order");
+    assert.ok(sibling);
+    assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id: clicked.id } })).status, "closed");
+    assert.equal((await prisma.smartTrade.findUniqueOrThrow({ where: { id: (sibling as SmartTrade).id } })).status,
+      "active", "the sibling is never sold");
+    assert.equal(heldLockCount(), 0);
+  });
 
 test("F3 at the source: processWebhook refuses a mismatched expectSmartTradeId before any lock or order", async () => {
   const exchange = fakeExchange();
@@ -943,10 +933,13 @@ const EXIT_RECENT =
   "A close for this trade was already sent in the last 45 seconds; no new order was placed. " +
   "Check the trade's current state.";
 
-async function recentExitReceipt(bot: SignalBot): Promise<void> {
-  // Exactly the receipt a SELL for this bot and pair reserves in processWebhook.
+async function recentExitReceipt(bot: SignalBot, tradeId?: string): Promise<void> {
+  // Exactly the receipt a SELL reserves in processWebhook. B-SLICE2: a
+  // targeted operator close's leg names its trade (`op:<tradeId>`), so only
+  // a recent close of THIS trade is a duplicate of it.
   await prisma.webhookReceipt.create({ data: {
-    keyHash: createHash("sha256").update(tradeEventKey(bot.id, "BTCUSDT", "sell")).digest("hex"),
+    keyHash: createHash("sha256").update(
+      tradeEventKey(bot.id, "BTCUSDT", "sell", tradeId ? `op:${tradeId}` : undefined)).digest("hex"),
     expiresAt: new Date(Date.now() + 45_000),
   } });
 }
@@ -956,7 +949,7 @@ test("A2: C6 inside the 45 s exit window is 409 exit_recent while the trade is s
   useExchange(exchange);
   const bot = await createBot();
   const trade = await createTrade(bot);
-  await recentExitReceipt(bot);
+  await recentExitReceipt(bot, trade.id);
   const r = await post(`/trades/${trade.id}/close`, { actor: ACTOR });
   assert.equal(r.status, 409);
   assert.equal(r.body.code, "exit_recent");
@@ -970,7 +963,7 @@ test("A2: the dashboard Close shows the same refusal, not a success", async () =
   useExchange(exchange);
   const bot = await createBot();
   const trade = await createTrade(bot);
-  await recentExitReceipt(bot);
+  await recentExitReceipt(bot, trade.id);
   const response = await fetch(`${baseUrl}/api/trades/${trade.id}/close`, {
     method: "POST", headers: { "content-type": "application/json" } });
   assert.equal(response.status, 409, "a non-2xx: the dashboard raises it as an error toast");

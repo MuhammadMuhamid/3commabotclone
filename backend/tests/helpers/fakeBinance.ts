@@ -15,7 +15,11 @@
  *    thrown": the order lands in the book and the caller still sees an error,
  *    which is exactly what an uncertain response is;
  *  - free/locked balances that MARKET SELL fills actually debit, so an
- *    over-sell shows up as a drained wallet.
+ *    over-sell shows up as a drained wallet;
+ *  - OD-1 cancels: scripted `cancelFailures` (optionally "accepted then
+ *    thrown": the cancel — and a last fill — lands in the book while the
+ *    caller sees an error), a one-shot `fillBeforeCancel` race, and a
+ *    `myTradesFails` switch for the commission lookup (X7).
  */
 import type { BinanceClient } from "../../src/services/binance.js";
 
@@ -39,6 +43,15 @@ export interface ScriptedFailure {
   fill?: { status: string; executedQty: string; quote: string };
 }
 
+/** A scripted failure for one `cancelOrder()` call. */
+export interface ScriptedCancelFailure {
+  error: Error;
+  /** Apply the cancel in the book (after `fillTo`, when given) before throwing. */
+  accepted?: boolean;
+  /** The cumulative fill the order reached before an accepted cancel took effect. */
+  fillTo?: { executedQty: string; quote: string };
+}
+
 export interface FakeBinanceOptions {
   price?: string;
   baseAsset?: string;
@@ -58,6 +71,14 @@ export interface FakeBinanceOptions {
   fills?: { status: string; executedQty: string; quote: string }[];
   /** Base-asset commission per BUY order, reported by `myTrades`. */
   buyCommission?: string;
+  /** Base-asset commission as a fraction of each BUY order's executed quantity (`myTrades`). */
+  buyCommissionRate?: number;
+  /** Failures for successive `cancelOrder()` calls; `undefined` entries succeed. */
+  cancelFailures?: (ScriptedCancelFailure | undefined)[];
+  /** `myTrades` throws while true (the commission lookup failed). */
+  myTradesFails?: boolean;
+  /** The asset `myTrades` reports commission in. Defaults to the base asset (netted). */
+  commissionAsset?: string;
 }
 
 export interface FakeBinance {
@@ -67,8 +88,15 @@ export interface FakeBinance {
   submissions: Record<string, unknown>[];
   lookups: string[];
   cancels: string[];
+  /** Every exchange call in order: `order:<side>:<cid>`, `get:<cid>`, `cancel:<cid>`. */
+  events: string[];
   wallet: { free: number; locked: number; quote: number };
   setPrice(price: string): void;
+  /** Queue a scripted outcome for the next `cancelOrder()` call(s). */
+  scriptCancel(...failures: (ScriptedCancelFailure | undefined)[]): void;
+  /** One-shot race: the next `cancelOrder()` first fills the order to this cumulative figure. */
+  fillBeforeCancel(fill: { executedQty: string; quote: string; status?: string }): void;
+  setMyTradesFails(fails: boolean): void;
   /** Put an order straight into the book, as if it had been placed earlier. */
   seed(order: Partial<FakeOrder> & { clientOrderId: string }): void;
   /** Overwrite an existing order's fill, as the matching engine would. */
@@ -115,9 +143,13 @@ export function fakeBinance(opts: FakeBinanceOptions = {}): FakeBinance {
   const submissions: Record<string, unknown>[] = [];
   const lookups: string[] = [];
   const cancels: string[] = [];
+  const events: string[] = [];
   const orderFailures = [...(opts.orderFailures ?? [])];
   const lookupFailures = [...(opts.lookupFailures ?? [])];
   const fills = [...(opts.fills ?? [])];
+  const cancelFailures = [...(opts.cancelFailures ?? [])];
+  let raceFill: { executedQty: string; quote: string; status?: string } | undefined;
+  let myTradesFails = opts.myTradesFails ?? false;
   const wallet = {
     free: Number(opts.freeBase ?? "10"),
     locked: Number(opts.lockedBase ?? "0"),
@@ -159,6 +191,18 @@ export function fakeBinance(opts: FakeBinanceOptions = {}): FakeBinance {
     return order;
   };
 
+  /** A cumulative fill of a resting order, as the matching engine would apply it. */
+  const fillTo = (order: FakeOrder, executedQty: string, quote: string, status: string) => {
+    const previous = Number(order.executedQty);
+    order.executedQty = executedQty;
+    order.cummulativeQuoteQty = quote;
+    order.status = status;
+    if (order.side === "BUY") wallet.free += Number(executedQty) - previous;
+    else wallet.free -= Number(executedQty) - previous;
+  };
+  const working = (order: FakeOrder | undefined) =>
+    order !== undefined && ["NEW", "PARTIALLY_FILLED"].includes(order.status);
+
   const client = {
     prices: async ({ symbol }: { symbol: string }) => ({ [symbol]: price }),
     accountInfo: async () => ({ balances: [
@@ -172,6 +216,7 @@ export function fakeBinance(opts: FakeBinanceOptions = {}): FakeBinance {
     ] }] }),
     order: async (payload: Record<string, unknown>) => {
       submissions.push(payload);
+      events.push(`order:${String(payload.side)}:${String(payload.newClientOrderId ?? "")}`);
       const scripted = orderFailures.shift();
       if (scripted) {
         if (scripted.accepted) place(payload, scripted.fill);
@@ -188,6 +233,7 @@ export function fakeBinance(opts: FakeBinanceOptions = {}): FakeBinance {
     },
     getOrder: async ({ origClientOrderId }: { origClientOrderId: string }) => {
       lookups.push(origClientOrderId);
+      events.push(`get:${origClientOrderId}`);
       const scripted = lookupFailures.shift();
       if (scripted) throw scripted;
       const order = book.get(origClientOrderId);
@@ -196,21 +242,47 @@ export function fakeBinance(opts: FakeBinanceOptions = {}): FakeBinance {
     },
     cancelOrder: async ({ origClientOrderId }: { origClientOrderId: string }) => {
       cancels.push(origClientOrderId);
+      events.push(`cancel:${origClientOrderId}`);
       const order = book.get(origClientOrderId);
-      if (!order || !["NEW", "PARTIALLY_FILLED"].includes(order.status)) {
+      const race = raceFill;
+      raceFill = undefined;
+      if (order && race && working(order)) {
+        fillTo(order, race.executedQty, race.quote, race.status ?? "PARTIALLY_FILLED");
+      }
+      const scripted = cancelFailures.shift();
+      if (scripted) {
+        if (scripted.accepted && order && working(order)) {
+          if (scripted.fillTo) {
+            fillTo(order, scripted.fillTo.executedQty, scripted.fillTo.quote, "PARTIALLY_FILLED");
+          }
+          order.status = "CANCELED";
+        }
+        throw scripted.error;
+      }
+      if (!order || !working(order)) {
         throw binanceError("Unknown order sent.", -2011);
       }
       order.status = "CANCELED";
       return { ...order };
     },
-    myTrades: async () => opts.buyCommission
-      ? [{ commission: opts.buyCommission, commissionAsset: base }] : [],
+    myTrades: async ({ orderId }: { orderId?: number | string } = {}) => {
+      if (myTradesFails) throw binanceError("Internal error; unable to process your request.", -1001);
+      if (opts.buyCommissionRate !== undefined) {
+        const order = [...book.values()].find((o) => o.orderId === String(orderId));
+        return order ? [{ commission: String(Number(order.executedQty) * opts.buyCommissionRate),
+          commissionAsset: opts.commissionAsset ?? base }] : [];
+      }
+      return opts.buyCommission ? [{ commission: opts.buyCommission, commissionAsset: base }] : [];
+    },
     allOrders: async () => [],
   } as unknown as BinanceClient;
 
   return {
-    client, book, submissions, lookups, cancels, wallet,
+    client, book, submissions, lookups, cancels, events, wallet,
     setPrice(next) { price = next; },
+    scriptCancel(...failures) { cancelFailures.push(...failures); },
+    fillBeforeCancel(fill) { raceFill = fill; },
+    setMyTradesFails(fails) { myTradesFails = fails; },
     seed(order) {
       book.set(order.clientOrderId, { orderId: order.orderId ?? `seed-${order.clientOrderId}`,
         side: order.side ?? "BUY", type: order.type ?? "LIMIT", status: order.status ?? "NEW",
@@ -220,12 +292,7 @@ export function fakeBinance(opts: FakeBinanceOptions = {}): FakeBinance {
     fill(clientOrderId, executedQty, quote, status) {
       const order = book.get(clientOrderId);
       if (!order) throw new Error(`fake: no order ${clientOrderId}`);
-      const previous = Number(order.executedQty);
-      order.executedQty = executedQty;
-      order.cummulativeQuoteQty = quote;
-      order.status = status;
-      if (order.side === "BUY") wallet.free += Number(executedQty) - previous;
-      else wallet.free -= Number(executedQty) - previous;
+      fillTo(order, executedQty, quote, status);
     },
     accepted(side) {
       return side ? acceptedOrders.filter((o) => o.side === side) : [...acceptedOrders];

@@ -253,6 +253,34 @@ export function classifyExchangeFailure(err: unknown): ExchangeFailureClassifica
   return { outcome: classifyRaw(code, httpStatus, message), code, httpStatus, message };
 }
 
+/**
+ * OD-1: what a failed CANCEL proves about the order it targeted.
+ *
+ *   `query`        — `-2011 Unknown order sent.`: the order is already terminal
+ *                    (or never existed). Only a lookup by its client order id
+ *                    says which; the manual adapter does that lookup itself.
+ *   `not_canceled` — a definite rejection from the same whitelist as order
+ *                    submission (auth, signature, timestamp, rate limit,
+ *                    request validation): the cancel was not processed and the
+ *                    order is as it was. Retry later.
+ *   `unknown`      — anything else (-1006/-1007, 5xx, transport, timeout, an
+ *                    unknown code): the cancel MAY have been applied. Never
+ *                    assume either way; the order is queried before anything
+ *                    else is decided about it.
+ */
+export type CancelFailureOutcome = "query" | "not_canceled" | "unknown";
+
+const UNKNOWN_ORDER_ON_CANCEL = -2011;
+
+export function classifyCancelFailure(err: unknown): {
+  outcome: CancelFailureOutcome; code?: number; httpStatus?: number; message: string;
+} {
+  const failure = classifyExchangeFailure(err);
+  if (failure.code === UNKNOWN_ORDER_ON_CANCEL) return { ...failure, outcome: "query" };
+  // `duplicate` is a submission-only answer; on a cancel it proves nothing.
+  return { ...failure, outcome: failure.outcome === "rejected" ? "not_canceled" : "unknown" };
+}
+
 /** The operator-facing note for an order left pending by an uncertain answer. */
 export function describeUncertainFailure(failure: ExchangeFailureClassification): string {
   const detail = failure.code !== undefined ? ` (${failure.code})`
