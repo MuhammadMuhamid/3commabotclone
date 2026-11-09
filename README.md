@@ -138,9 +138,22 @@ runs the contract diff, below.
     `protectionState: late_fill_unprotected`: no TP/SL, never polled, sellable
     from Trading Scene's Trade panel, with a plain warning. A late SELL fill is
     flagged, not dropped.
-  - Whether the Bot should instead cancel the working remainder first, or carry
-    TP/SL to late fills, is an open owner decision (OD-1). Neither is
-    implemented.
+  - **OD-1 (cancel first, then sweep).** A full exit (TP, SL, or a manual
+    full SELL, including `positionFull`) of a position whose manual LIMIT entry
+    is still working first cancels that entry (query first; `-2011` is resolved
+    by a lookup), re-reads the fills, and sells the fresh quantity, noted
+    `RACE FILL`. A fill that lands after the trade closed becomes a
+    `race_fill_sweep` position that the poller sells (at most 3 attempts, then
+    `late_fill_unprotected` plus `SWEEP FAILED` and an alert). A reconciler
+    finalizer retries a pending cancel (alerts at 3 and 5 attempts). A partial
+    SELL never cancels. Cancels always run, under a halt or a pause; an
+    automation-origin sweep waits for a halt to clear. There is no
+    zero-exposure promise: an unknown cancel leaves a window until a later
+    query. Legacy entries flagged `ENTRY STILL WORKING` before this release are
+    **not** cancelled at deploy. Binance cancel semantics are not verified
+    against a real exchange.
+  - A manual full SELL takes the per-trade close lock (409 `trade_closing`).
+    A SELL above the position is 409 `sell_exceeds_position`.
 - Under `DRY_RUN=true` the Bot refuses to cancel a manual LIMIT whose exchange
   order id is real (409 `live_order_in_dry_run`). It never replaces a real
   exchange id with a `dry-` one, so a still-working order is not marked
@@ -213,20 +226,21 @@ control plane: it works while `MANUAL_TRADING_ENABLED=false`. Trading Scene's
 | C6 | `POST /trades/:id/close` | `closeStrategyTrade`, shared with the dashboard (below) |
 | C7 | `POST /trades/:id/partial-close` | `{pct: 1..99, actor}`, through `partialCloseStrategyTrade`, shared with the dashboard |
 | C8 | `GET /commands/:requestId` | the stored command, with the live intent or attempt state for a pending order; 404 `command_not_found` |
+| C9 | `POST /entries` | OD-3 pause new entries: `{paused:true, reason 3..200, cancelWorkingEntries?, actor}` or `{paused:false, actor}`; target state. Blocks BUYs only (webhook 409 `risk_blocked`, manual 409 `entries_paused`, queued strategy BUY intents are closed off at once). Exits, TP/SL, cancels and sweeps are unaffected. Independent of the halt |
+| C10 to C14 | `POST /bots`, `GET` / `PATCH /bots/:id`, `POST /bots/:id/delete`, `POST /bots/:id/rotate-secret` | create (the secret is in the live reply only; the stored replay holds `secretIssued:true`), read, edit, guarded delete, rotate. Guards: `bot_has_open_trades`, `pair_has_open_trades`, `bot_has_unresolved_intents`, `realizations_pending`, `bot_busy_retry`. The same shared code serves the Classic dashboard |
+| C15, C16, C19 | `GET /exchange-accounts`, `POST /exchange-accounts/:id/delete`, `GET /exchange-accounts/:id/balance` | no key material; delete needs `REMOVE_ACCOUNT` and is refused with `account_in_use`; balance is numbers only |
+| C17, C18 | `POST /exchange-enrollments`, `GET /exchange-enrollments/:id` | mint a single-use ticket (create, replace, reveal_webhook) and read its status. See `deploy/ENROLLMENT.md` |
 
 **C6 and C7 refusals.** Each is a typed `{error, code}` refusal, and nothing is
 sold.
 
-- *Close* refuses:
-  - a manual trade (409 `trade_manual`: close it from Trading Scene's Trade
-    panel);
-  - a deleted bot's trade (`bot_deleted`);
-  - a paused bot's trade (`bot_paused`);
-  - a pair no longer listed (`pair_not_listed`);
-  - one of several active trades on the same bot and pair (`ambiguous_trade`).
+- *Close* and *Partial* are **trade-id targeted** (`operatorTarget`) and work
+  for a paused bot's trade, a delisted pair and a twin trade on the same pair.
+  They refuse a manual trade (409 `trade_manual`) and a deleted bot's trade
+  (`bot_deleted`). `bot_paused`, `pair_not_listed` and `ambiguous_trade` no
+  longer exist. Capability `operatorExit.v1`.
 - `processWebhook` also takes a refuse-only `expectSmartTradeId`. If the trade it
   would close is not the one asked for, it refuses before any lock or order.
-- *Partial* refuses manual and deleted-bot trades, and works on a paused bot.
 - Both refuse while an earlier exit is unresolved (`exit_unresolved`).
 - A recent exit that left the position open is 409 `exit_recent`, never a
   success.
@@ -254,8 +268,20 @@ sold.
   starve a halt. A 429 carries `code: "bot_rate_limited"` and means nothing
   was executed.
 
-Bot create/edit/delete and exchange keys are **not** exposed here; they stay on
-this dashboard.
+C0 also reports `capabilities` (`entries.v1`, `bots.v1`, `accounts.v1`,
+`enroll.v1` only when `ENROLLMENT_ENABLED`, `operatorExit.v1`,
+`manualPositionFull.v1`) and `entries`; Trading Scene shows a feature only when
+it is listed. Exchange keys are entered only on this Bot's `/enroll` page
+(`ENROLLMENT_ENABLED`, `deploy/ENROLLMENT.md`).
+
+**Classic dashboard changes (break-glass).** It shares the same server rules:
+changing a bot's account with open trades is refused (`bot_has_open_trades`);
+a mainnet account needs the server-verified `MAINNET` confirmation; a pause
+control and pill (`POST /api/ops/entries`); targeted Close and Partial. Its
+closed-trade hard delete (`DELETE /api/trades/:id`) is unchanged and unsafe
+(it removes realised P&L from the daily-loss window); an archive replacement
+is proposed, not built. It also keeps the Bot's push notifications, which
+Trading Scene does not replace. Restrict the dashboard to an allow-list or VPN.
 
 ### Persisted execution evidence reads
 
@@ -555,6 +581,9 @@ Host nginx config lives in `deploy/nginx-production.conf`.
 | `MANUAL_TRADING_ENABLED` | `true` enables Trading Scene's manual orders and the read views behind its `/bot` page. The control routes (`/api/manual-trading/control/*`) work without it |
 | `MAINNET_MANUAL_TRADING_ENABLED` | `false` by default; manual orders on a mainnet account need it and a confirmation phrase |
 | `MANUAL_TRADING_HMAC_SECRET` | The Platform-to-Bot control-plane key (32+ characters, the same value as the Platform's). Signs manual orders, the Shariah floor and the control routes; without it those routes refuse |
+| `ENROLLMENT_ENABLED` | `false` by default. `true` turns on `/api/enroll/*` and the `enroll.v1` capability. Needs `PUBLIC_URL` to be the Bot's https origin and `PLATFORM_RETURN_URL` |
+| `PLATFORM_RETURN_URL` | Exact https return page after enrollment, e.g. `https://mytradingview.alphawebstudioz.com/bot/accounts`. Never read from a request |
+| `REALIZATION_CONTRACT_V2_ENABLED` | `false` by default. Set `true` only after the Platform is deployed (see "Realization contract v2"). Do not roll the Bot back past this version once v2 rows exist |
 
 With `DRY_RUN=false`, the API refuses to start unless `ENCRYPTION_KEY`,
 `SCRYPT_SALT` and `JWT_SECRET` are all present and long enough.
@@ -714,6 +743,16 @@ this check has not classified `BACKWARD_COMPATIBLE`.
 **Preferred upgrade order:** Platform first, then Bot — see the Platform
 `docs/OPERATIONS.md` §7 for the full reasoning and the scenario-specific
 rollback order (bad Platform only / bad Bot only / full paired rollback).
+
+### V3 migrations and deploy order (2026-11-09)
+
+Five additive migrations: `20261110100000_manual_exit_cancel`,
+`20261110110000_entries_pause`, `20261110200000_exchange_account_key_hint`,
+`20261110210000_exchange_enrollment`, `20261110220000_realization_environment`.
+Back up the SQLite file first, deploy the Bot with the three flags off, deploy
+the Platform, enable enrollment, then `REALIZATION_CONTRACT_V2_ENABLED`, then a
+testnet round trip with an operator present. The full order and checklist are in
+the Platform repo's `docs/MAHAMID_FINAL_HANDOFF_2026-11-09.md`.
 
 ### Realization contract v2 (OD-5): rollout and Platform rollback
 
