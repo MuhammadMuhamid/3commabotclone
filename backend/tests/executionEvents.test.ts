@@ -371,6 +371,28 @@ test("capability executions.v1 is advertised", () => {
   assert.ok(buildControlCapabilities().includes("executions.v1"));
 });
 
+// ── cross-repository contract ──────────────────────────────────────────────
+// The same fixture lives in the Platform repo (backend/tests/fixtures), whose
+// validator must accept it. Here: what this Bot records has exactly its shape.
+test("contract: a recorded event has exactly the fields and types of the shared v1 fixture", async () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "executionEvent.v1.json"), "utf8")) as
+    Record<string, unknown>;
+  const feed = await events.readExecutionFeed(0, 100);
+  assert.ok(feed.events.length > 0);
+  for (const recorded of feed.events as unknown as Array<Record<string, unknown>>) {
+    assert.deepEqual(Object.keys(recorded).sort(), Object.keys(fixture).sort());
+    for (const key of Object.keys(fixture)) {
+      if (recorded[key] === null || fixture[key] === null) continue;
+      assert.equal(typeof recorded[key], typeof fixture[key], key);
+    }
+  }
+  const platformRoot = process.env.TRADING_SCENE_PLATFORM_ROOT;
+  if (platformRoot) {
+    const theirs = fs.readFileSync(path.join(platformRoot, "platform", "backend", "tests", "fixtures", "executionEvent.v1.json"), "utf8");
+    assert.equal(theirs, fs.readFileSync(path.join(import.meta.dirname, "fixtures", "executionEvent.v1.json"), "utf8"));
+  }
+});
+
 test("pruning keeps the newest row so the cursor never moves backwards", async () => {
   const latest = await prisma.executionEvent.findFirst({ orderBy: { seq: "desc" } });
   const far = new Date(Date.now() + 365 * 86_400_000);
