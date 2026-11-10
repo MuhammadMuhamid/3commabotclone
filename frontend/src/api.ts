@@ -168,6 +168,20 @@ export type SmartTrade = {
   closedAt?: string | null;
   bot: { id: string | null; name: string; exchangeAccount?: { name: string } | null };
   partialCloses?: PartialClose[];
+  /**
+   * Feature B: when the trade was hidden from History (null = visible).
+   * Presentation state only — an archived trade still counts in every total.
+   */
+  archivedAt?: string | null;
+  /** Why Archive would be refused right now (History rows only; null = allowed). */
+  archiveBlocked?: { code: string; message: string } | null;
+};
+
+/** History listing filter for archived trades. */
+export type ArchivedFilter = "exclude" | "include" | "only";
+
+export type TradeArchiveResult = {
+  id: string; archived: boolean; archivedAt: string | null; archivedBy: string | null; changed: boolean;
 };
 
 export type Stats = {
@@ -351,10 +365,11 @@ export const api = {
   },
 
   trades: {
-    list: (status: "active" | "history" | "closed", botId?: string) => {
+    list: (status: "active" | "history" | "closed", botId?: string, archived?: ArchivedFilter) => {
       const q = status === "history" ? "closed" : status;
       const params = new URLSearchParams({ status: q });
       if (botId) params.set("botId", botId);
+      if (archived) params.set("archived", archived);
       return request<SmartTrade[]>(`/api/trades?${params}`);
     },
     /**
@@ -367,7 +382,13 @@ export const api = {
     close:  (id: string) =>
       request<{ status: "ok" | "ignored_duplicate" | "pending"; detail?: unknown }>(
         `/api/trades/${id}/close`, { method: "POST" }),
-    remove: (id: string) => request<void>(`/api/trades/${id}`, { method: "DELETE" }),
+    /**
+     * Feature B: Archive replaced Delete. Hides a closed trade from History;
+     * its P&L and daily-loss history are kept. A refusal is a typed 409
+     * (`trade_not_closed`, `trade_has_unresolved_orders`, `trade_needs_attention`).
+     */
+    archive: (id: string) => request<TradeArchiveResult>(`/api/trades/${id}/archive`, { method: "POST" }),
+    restore: (id: string) => request<TradeArchiveResult>(`/api/trades/${id}/restore`, { method: "POST" }),
     // F4: sell a percentage of an active trade
     // BOT-P1-6: `executedQty` is what actually sold and `requestedQty` what was
     // asked for. They differ on a partial or zero fill, and `partial` is null
