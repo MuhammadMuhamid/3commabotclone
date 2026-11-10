@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { executionEnvironmentForBot } from "./executionEnvironment.js";
 import { prisma } from "../lib/prisma.js";
 import type { BinanceClient } from "./binance.js";
 import { getTickerPrice, marketSellBase, clientFromAccount, clientFromEnv } from "./binance.js";
@@ -394,6 +395,7 @@ export async function checkTakeProfitStopLoss(
         origin: "tpsl",
         requestedBaseQty: fresh.quantity,
         closedReason: hitTp ? "take_profit" : "stop_loss",
+        executionEnvironment: await executionEnvironmentForBot(bot),
       });
       // Before the wire call, never after.
       await markOrderAttemptSubmitted(attempt.id, fresh.quantity);

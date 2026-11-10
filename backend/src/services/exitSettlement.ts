@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import type { BinanceClient, OrderProbe } from "./binance.js";
 import { probeOrderByClientId } from "./binance.js";
 import { calcFinalClosePnl, calcRealizedPnl } from "./smartTrade.js";
+import { confirmedEnvironment, recordExecutionEvent } from "./executionEvents.js";
 import {
   abandonOrderAttempt, recordOrderAttemptObservation, settleOrderAttempt,
   type ExitAttemptOrigin,
@@ -183,6 +184,25 @@ export async function applyExitFill(
      * marks the pair exactly as the synchronous path does — the stale-SELL guard
      * must not depend on which resolver got there first.
      */
+    // P-81: the confirmed exit, booked with the fill. Reports what the
+    // exchange executed (the ledger above clamps to the holding).
+    await recordExecutionEvent(tx, {
+      eventId: `exit:${attempt.id}`,
+      side: "SELL",
+      symbol: trade.pair,
+      executedBaseQty: fill.executedQty,
+      executedQuoteQty: fill.cummulativeQuoteQty,
+      averagePrice: fill.avgPrice,
+      environment: confirmedEnvironment(attempt.executionEnvironment, { exchangeOrderId: fill.orderId }),
+      source: attempt.origin === "partial" ? "partial" : "tpsl",
+      orderComplete: true,
+      cumulativeBaseQty: fill.executedQty,
+      botId: trade.botId,
+      botName: trade.botName || null,
+      smartTradeId: trade.id,
+      exchangeOrderId: fill.orderId || null,
+    });
+
     if (closed && attempt.origin === "tpsl" && trade.botId) {
       await tx.pairCloseMark.upsert({
         where: { botId_pair: { botId: trade.botId, pair: trade.pair } },

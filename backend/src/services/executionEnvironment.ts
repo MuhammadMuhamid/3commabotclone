@@ -20,6 +20,20 @@ export type ExecutionEnvironment = "DRY_RUN" | "TESTNET" | "MAINNET" | "UNKNOWN"
 
 export const EXECUTION_ENVIRONMENTS: readonly ExecutionEnvironment[] = ["DRY_RUN", "TESTNET", "MAINNET", "UNKNOWN"];
 
+/**
+ * P-81: the environment of a MANUAL order (or a manual TP/SL/sweep exit),
+ * decided when its row is created, from the inputs that route it: the
+ * adapter's dry-run switch, otherwise the account's own network.
+ */
+export function manualExecutionEnvironment(
+  account: { testnet: boolean } | null, adapter?: unknown
+): ExecutionEnvironment {
+  const dryRun = (adapter as { dryRun?: boolean } | undefined)?.dryRun ?? config.dryRun;
+  if (dryRun) return "DRY_RUN";
+  if (!account) return "UNKNOWN";
+  return account.testnet ? "TESTNET" : "MAINNET";
+}
+
 export async function executionEnvironmentForBot(
   bot: Pick<SignalBot, "exchangeAccountId">
 ): Promise<ExecutionEnvironment> {

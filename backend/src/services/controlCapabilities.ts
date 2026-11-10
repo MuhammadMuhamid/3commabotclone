@@ -13,6 +13,7 @@
  * `manualPositionFull.v1`).
  */
 import { config } from "../config.js";
+import { EXECUTION_FEED_CAPABILITY } from "./executionEvents.js";
 
 export function buildControlCapabilities(): string[] {
   const capabilities = [
@@ -21,6 +22,7 @@ export function buildControlCapabilities(): string[] {
     "entries.v1",  // C9: pause / resume new entries (OD-3)
     "manualPositionFull.v1", // manual SELL `positionFull` (OD-7)
     "operatorExit.v1", // C6/C7 trade-id-targeted operator exits
+    EXECUTION_FEED_CAPABILITY, // P-81: GET /control/executions (confirmed fills)
   ];
   // C17/C18 + /enroll: only while ENROLLMENT_ENABLED (the public routes 404 otherwise).
   if (config.enrollmentEnabled) capabilities.push("enroll.v1");

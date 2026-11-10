@@ -44,6 +44,7 @@ import {
 } from "../services/controlCommands.js";
 import { countUnresolvedBotIntents, setBotStatus } from "./bots.js";
 import { buildControlCapabilities } from "../services/controlCapabilities.js";
+import { EXECUTION_FEED_MAX_LIMIT, readExecutionFeed } from "../services/executionEvents.js";
 
 export const manualControlRouter = Router();
 
@@ -241,6 +242,27 @@ export async function readControlStatus() {
 
 manualControlRouter.get("/status", asyncHandler(async (_req, res) => {
   res.json(await readControlStatus());
+}));
+
+// ── P-81 GET /executions (`executions.v1`) ──────────────────────────────────
+// The confirmed-execution feed (services/executionEvents.ts). Read-only and
+// control plane: it stays available when manual ORDERS are off, because
+// strategy executions still happen. Without `after` it answers only the
+// cursor, so a new reader does not replay history.
+
+const executionFeedSchema = z.object({
+  after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+  limit: z.coerce.number().int().min(1).max(EXECUTION_FEED_MAX_LIMIT).default(50),
+}).strict();
+
+manualControlRouter.get("/executions", asyncHandler(async (req, res) => {
+  const parsed = executionFeedSchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.errors[0]?.message ?? "invalid executions request",
+      code: "invalid_request" });
+    return;
+  }
+  res.json(await readExecutionFeed(parsed.data.after ?? null, parsed.data.limit));
 }));
 
 // ── C1 POST /halt ───────────────────────────────────────────────────────────
