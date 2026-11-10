@@ -21,6 +21,7 @@ export function buildControlCapabilities(): string[] {
     "entries.v1",  // C9: pause / resume new entries (OD-3)
     "manualPositionFull.v1", // manual SELL `positionFull` (OD-7)
     "operatorExit.v1", // C6/C7 trade-id-targeted operator exits
+    "tradeArchive.v1", // POST /control/trades/:id/archive (Feature B; presentation state only)
   ];
   // C17/C18 + /enroll: only while ENROLLMENT_ENABLED (the public routes 404 otherwise).
   if (config.enrollmentEnabled) capabilities.push("enroll.v1");

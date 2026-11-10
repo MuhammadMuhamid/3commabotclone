@@ -257,6 +257,15 @@ model SmartTrade {
   manualSlPrice      Float?
   protectionType     String?
   protectionState    String?
+  /**
+   * Feature B: "Archive / Hide from History". Presentation state ONLY — every
+   * accounting and risk read (realised P&L, totals, the daily-loss window, the
+   * halt latch, realization events) ignores these columns on purpose. Null on
+   * every row created before the column existed, so those stay visible.
+   * `archivedBy` is a short actor label: `classic:<userId>` / `platform:<id>`.
+   */
+  archivedAt         DateTime?
+  archivedBy         String?
 
   // BOT-024: every hot query filters on status, and most also on bot or pair.
   // Without these, the 30-second TP/SL loop and the 60-second manual-close sync
@@ -267,6 +276,7 @@ model SmartTrade {
   @@index([closedAt])
   @@index([exchangeOrderId])
   @@index([exchangeAccountId, status])
+  @@index([status, archivedAt, closedAt])
 }
 
 /**

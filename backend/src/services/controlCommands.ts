@@ -65,7 +65,9 @@ export type ControlKind =
   | "entries"
   // Slice 2 (contract v2.0, C10–C17)
   | "bot_create" | "bot_update" | "bot_delete" | "bot_rotate_secret"
-  | "account_delete" | "enrollment_create";
+  | "account_delete" | "enrollment_create"
+  // Feature B: archive / restore a closed trade (presentation state only).
+  | "trade_archive";
 
 export interface ControlActor {
   platformUserId: string;
