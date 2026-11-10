@@ -3,7 +3,8 @@ import { Link } from "react-router-dom";
 import {
   TrendingUp, TrendingDown, Layers, DollarSign, BarChart3,
   Bot, ChevronRight, ArrowUpRight, ArrowDownRight, Clock,
-  Zap, X, Play, Square, Pencil, RefreshCw, Wallet, Scissors, Trash2, ShieldAlert, PauseCircle,
+  Zap, X, Play, Square, Pencil, RefreshCw, Wallet, Scissors, ShieldAlert, PauseCircle,
+  Archive, ArchiveRestore,
 } from "lucide-react";
 import {
   api, formatPair, type BotListItem, type SmartTrade, type Stats, type ExchangeAccount,
@@ -571,15 +572,36 @@ function TradeRow({
   const [busy, setBusy]                     = useState(false);
   const [showPartial, setShowPartial]       = useState(false);
 
-  const handleDelete = async () => {
-    if (!confirm(`Delete this ${formatPair(t.pair)} trade from history?\nThis cannot be undone.`)) return;
+  /*
+   * Feature B: Archive replaced Delete. A delete erased realised P&L from the
+   * totals and the daily-loss window; Archive only hides the row. The server
+   * refuses a trade that is not fully resolved and says why.
+   */
+  const handleArchive = async () => {
+    if (!confirm(
+      `Archive this ${formatPair(t.pair)} trade?\n\nIt will be hidden from History. ` +
+      "Its P&L and daily-loss history are kept. You can restore it."
+    )) return;
     setBusy(true);
     try {
-      await api.trades.remove(t.id);
-      toast("Trade deleted from history", "success");
+      await api.trades.archive(t.id);
+      toast("Trade archived. Its P&L is still counted.", "success");
       onClose();
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Delete failed", "error");
+      toast(e instanceof Error ? e.message : "Archive failed", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRestore = async () => {
+    setBusy(true);
+    try {
+      await api.trades.restore(t.id);
+      toast("Trade restored to History", "success");
+      onClose();
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Restore failed", "error");
     } finally {
       setBusy(false);
     }
@@ -667,7 +689,10 @@ function TradeRow({
               </div>
             </div>
           ) : (
-            closedReasonBadge[t.closedReason ?? ""] ?? <Badge variant="muted">{t.status}</Badge>
+            <div className="flex flex-wrap items-center gap-1">
+              {closedReasonBadge[t.closedReason ?? ""] ?? <Badge variant="muted">{t.status}</Badge>}
+              {t.archivedAt && <Badge variant="muted">Archived</Badge>}
+            </div>
           )}
         </td>
         {/* P&L (net after fees) */}
@@ -733,15 +758,29 @@ function TradeRow({
                 {busy ? "…" : "Close"}
               </Btn>
             </div>
+          ) : t.archivedAt ? (
+            <button
+              type="button"
+              onClick={handleRestore}
+              disabled={busy}
+              className="p-1.5 rounded text-[var(--color-muted)] hover:text-white hover:bg-[var(--color-panel-3)] transition-all disabled:opacity-40"
+              title="Restore to History"
+              aria-label={`Restore ${pair} trade to History`}
+            >
+              <ArchiveRestore size={13} />
+            </button>
           ) : (
             <button
               type="button"
-              onClick={handleDelete}
-              disabled={busy}
-              className="p-1.5 rounded text-[var(--color-muted)] hover:text-[var(--color-danger)] hover:bg-[var(--color-danger-dim)] transition-all disabled:opacity-40"
-              title="Delete from history"
+              onClick={handleArchive}
+              disabled={busy || Boolean(t.archiveBlocked)}
+              className="p-1.5 rounded text-[var(--color-muted)] hover:text-white hover:bg-[var(--color-panel-3)] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              title={t.archiveBlocked
+                ? `Cannot archive yet: ${t.archiveBlocked.message}`
+                : "Archive (hide from History; P&L is kept)"}
+              aria-label={`Archive ${pair} trade`}
             >
-              <Trash2 size={13} />
+              <Archive size={13} />
             </button>
           )}
         </td>
@@ -930,6 +969,9 @@ export default function Dashboard() {
   const [tradeTab, setTradeTab]     = useState<"active" | "history">("active");
   const [stats, setStats]           = useState<Stats | null>(null);
   const [trades, setTrades]         = useState<SmartTrade[]>([]);
+  // Feature B: archived trades are hidden from the History list by default,
+  // but every History total is computed from ALL closed trades.
+  const [showArchived, setShowArchived] = useState(false);
   const [accounts, setAccounts]     = useState<ExchangeAccount[]>([]);
   const [opsMode, setOpsMode]       = useState<"DRY_RUN" | "HALTED" | "LIVE" | "UNKNOWN">("UNKNOWN");
   const [haltReason, setHaltReason] = useState<string | null>(null);
@@ -1069,7 +1111,9 @@ export default function Dashboard() {
       const [botList, s, t, accs, ops] = await Promise.all([
         api.bots.list(),
         api.stats(),
-        api.trades.list(tradeTab),
+        // History loads archived trades too, so its summary stays truthful;
+        // the list hides them unless "Show archived" is on.
+        api.trades.list(tradeTab, undefined, tradeTab === "history" ? "include" : undefined),
         api.exchange.list(),
         // A failure here must not blank the dashboard — the badge falls back to
         // UNKNOWN, which is an honest answer, rather than to LIVE or DRY RUN.
@@ -1103,6 +1147,10 @@ export default function Dashboard() {
     botFilter === "active" ? b.status === "active" :
     botFilter === "stopped" ? b.status !== "active" : true
   );
+
+  const archivedCount = tradeTab === "history" ? trades.filter((t) => t.archivedAt).length : 0;
+  const visibleTrades = tradeTab === "history" && !showArchived
+    ? trades.filter((t) => !t.archivedAt) : trades;
 
   const activeBots  = bots.filter((b) => b.status === "active").length;
   const stoppedBots = bots.filter((b) => b.status !== "active").length;
@@ -1333,9 +1381,26 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* History stats bar — shown when viewing closed trades */}
+        {/* History stats bar — shown when viewing closed trades. Computed from
+            ALL closed trades, archived included: Archive never changes P&L. */}
         {tradeTab === "history" && !loading && (
-          <HistoryStatsBar trades={trades} />
+          <>
+            <HistoryStatsBar trades={trades} />
+            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2 border-b border-[var(--color-border)] text-[11px] text-[var(--color-muted)]">
+              <span>
+                Totals include archived trades{archivedCount > 0 ? ` (${archivedCount} archived)` : ""}.
+              </span>
+              <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={showArchived}
+                  onChange={(e) => setShowArchived(e.target.checked)}
+                  className="accent-[var(--color-accent)]"
+                />
+                Show archived
+              </label>
+            </div>
+          </>
         )}
 
         <div className="overflow-x-auto">
@@ -1354,17 +1419,19 @@ export default function Dashboard() {
             <tbody>
               {loading ? (
                 <TableSkeleton cols={7} />
-              ) : trades.length === 0 ? (
+              ) : visibleTrades.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="py-12 text-center">
                     <div className="flex flex-col items-center gap-2">
                       <Layers size={32} className="text-[var(--color-border)]" />
-                      <p className="text-[var(--color-muted)] text-sm">No {tradeTab} trades</p>
+                      <p className="text-[var(--color-muted)] text-sm">
+                        No {tradeTab} trades{archivedCount > 0 && !showArchived ? " (archived trades are hidden)" : ""}
+                      </p>
                     </div>
                   </td>
                 </tr>
               ) : (
-                trades.map((t) => (
+                visibleTrades.map((t) => (
                   <TradeRow key={t.id} trade={t} tab={tradeTab} onClose={() => load(false)} />
                 ))
               )}
@@ -1372,12 +1439,12 @@ export default function Dashboard() {
           </table>
         </div>
 
-        {!loading && trades.length > 0 && (
+        {!loading && visibleTrades.length > 0 && (
           <div className="px-4 py-2.5 border-t border-[var(--color-border)] flex items-center gap-1.5 text-[10px] text-[var(--color-muted)]">
             <RefreshCw size={10} className={refreshing ? "animate-spin" : ""} />
             PnL refreshes every 30 seconds · Net of 0.1% fees
             <ChevronRight size={10} />
-            {trades.length} trade{trades.length !== 1 ? "s" : ""}
+            {visibleTrades.length} trade{visibleTrades.length !== 1 ? "s" : ""}
           </div>
         )}
       </div>

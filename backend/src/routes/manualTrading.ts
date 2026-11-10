@@ -11,6 +11,7 @@ import { readManualAccountState } from "../services/manualAccountState.js";
 import {
   BOT_VIEW_MAX_PAGE_SIZE, listBotViewBots, listBotViewTrades, readBotViewSummary,
 } from "../services/botView.js";
+import { archivedFilterSchema } from "../services/tradeArchive.js";
 import { shariahContextSchema } from "./webhookSchema.js";
 import {
   readInstallationShariahMode, setInstallationShariahMode, ShariahEnforcementError,
@@ -145,6 +146,7 @@ const botViewTradesSchema = z.object({
   botId: z.string().uuid().optional(),
   page: z.coerce.number().int().min(1).max(100_000).default(1),
   pageSize: z.coerce.number().int().min(1).max(BOT_VIEW_MAX_PAGE_SIZE).default(50),
+  archived: archivedFilterSchema.default("exclude"),
 }).strict();
 
 manualTradingRouter.get("/bot-view/trades", asyncHandler(async (req, res) => {

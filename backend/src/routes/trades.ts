@@ -3,6 +3,10 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { ControlPending, ControlRefusal } from "../services/controlCommands.js";
 import { closeStrategyTrade, partialCloseStrategyTrade } from "../services/tradeExit.js";
+import {
+  TradeArchiveRefusal, archivedFilterSchema, archivedWhere, findArchiveBlockers, setTradeArchived,
+  type ArchiveBlock,
+} from "../services/tradeArchive.js";
 
 export const tradesRouter = Router();
 
@@ -32,22 +36,47 @@ function sendExitError(res: Response, e: unknown, fallback: string): void {
   res.status(500).json({ error: e instanceof Error ? e.message : fallback });
 }
 
-// Delete a closed trade from history
-tradesRouter.delete("/:id", async (req, res) => {
-  const trade = await prisma.smartTrade.findUnique({ where: { id: req.params.id } });
-  if (!trade) return res.status(404).json({ error: "Not found" });
-  if (trade.status === "active") {
-    return res.status(400).json({ error: "Cannot delete an active trade. Close it first." });
-  }
-  await prisma.smartTrade.delete({ where: { id: req.params.id } });
-  res.status(204).send();
+/**
+ * Feature B: deleting a trade is gone. A delete erased realised P&L from the
+ * totals and the daily-loss window (and could lift a latched daily-loss halt).
+ * Nothing is deleted here any more; Archive hides a trade from History and
+ * keeps its accounting.
+ */
+export const TRADE_DELETE_REMOVED = {
+  error: "Deleting trades was replaced by Archive. Archived trades keep their P&L and daily-loss history.",
+  code: "trade_delete_removed",
+} as const;
+
+tradesRouter.delete("/:id", (_req, res) => {
+  res.status(410).json(TRADE_DELETE_REMOVED);
 });
+
+for (const [route, archived] of [["archive", true], ["restore", false]] as const) {
+  tradesRouter.post(`/:id/${route}`, async (req, res, next) => {
+    try {
+      res.json(await setTradeArchived(req.params.id, archived, `classic:${String(res.locals.userId ?? "unknown")}`));
+    } catch (e) {
+      if (e instanceof TradeArchiveRefusal) {
+        res.status(e.status).json({ error: e.message, code: e.code });
+        return;
+      }
+      next(e);
+    }
+  });
+}
 
 tradesRouter.get("/", async (req, res) => {
   const raw = (req.query.status as string) || "active";
   const status = raw === "history" ? "closed" : raw;
   const botId = req.query.botId as string | undefined;
-  const where: { status: string; botId?: string } = { status };
+  const archivedFilter = archivedFilterSchema.safeParse(req.query.archived ?? "exclude");
+  if (!archivedFilter.success) {
+    return res.status(400).json({ error: "archived must be one of exclude, include, only", code: "invalid_request" });
+  }
+  // The archive filter applies to History only; an active trade is never archived.
+  const where: { status: string; botId?: string; archivedAt?: null | { not: null } } = {
+    status, ...(status === "closed" ? archivedWhere(archivedFilter.data) : {}),
+  };
   if (botId) where.botId = botId;
 
   const trades = await prisma.smartTrade.findMany({
@@ -66,8 +95,12 @@ tradesRouter.get("/", async (req, res) => {
   });
 
   // F5: for orphaned trades (bot deleted) expose botName from the denormalised field
+  // Feature B: History rows say whether Archive would be refused, and why —
+  // the same rule `setTradeArchived` enforces.
+  const blockers = status === "closed" ? await findArchiveBlockers(trades) : new Map<string, ArchiveBlock>();
   const mapped = trades.map((t) => ({
     ...t,
+    archiveBlocked: blockers.get(t.id) ?? null,
     bot: t.bot ?? { id: null, name: t.botName || "Deleted Bot", exchangeAccount: null },
   }));
 

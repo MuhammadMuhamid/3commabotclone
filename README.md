@@ -225,6 +225,7 @@ control plane: it works while `MANUAL_TRADING_ENABLED=false`. Trading Scene's
 | C5 | `POST /bots/:id/status` | `{status:"active"|"paused", actor}`, a target state rather than a toggle. Answers `changed` and the bot's unresolved-intent count |
 | C6 | `POST /trades/:id/close` | `closeStrategyTrade`, shared with the dashboard (below) |
 | C7 | `POST /trades/:id/partial-close` | `{pct: 1..99, actor}`, through `partialCloseStrategyTrade`, shared with the dashboard |
+| Archive | `POST /trades/:id/archive` | `{archived: boolean, actor}`, capability `tradeArchive.v1`. Presentation state only (never P&L, the daily-loss window or the halt); idempotent; refusals `trade_not_closed`, `trade_has_unresolved_orders`, `trade_needs_attention`, `not_found` |
 | C8 | `GET /commands/:requestId` | the stored command, with the live intent or attempt state for a pending order; 404 `command_not_found` |
 | C9 | `POST /entries` | OD-3 pause new entries: `{paused:true, reason 3..200, cancelWorkingEntries?, actor}` or `{paused:false, actor}`; target state. Blocks BUYs only (webhook 409 `risk_blocked`, manual 409 `entries_paused`, queued strategy BUY intents are closed off at once). Exits, TP/SL, cancels and sweeps are unaffected. Independent of the halt |
 | C10 to C14 | `POST /bots`, `GET` / `PATCH /bots/:id`, `POST /bots/:id/delete`, `POST /bots/:id/rotate-secret` | create (the secret is in the live reply only; the stored replay holds `secretIssued:true`), read, edit, guarded delete, rotate. Guards: `bot_has_open_trades`, `pair_has_open_trades`, `bot_has_unresolved_intents`, `realizations_pending`, `bot_busy_retry`. The same shared code serves the Classic dashboard |
@@ -277,10 +278,12 @@ it is listed. Exchange keys are entered only on this Bot's `/enroll` page
 **Classic dashboard changes (break-glass).** It shares the same server rules:
 changing a bot's account with open trades is refused (`bot_has_open_trades`);
 a mainnet account needs the server-verified `MAINNET` confirmation; a pause
-control and pill (`POST /api/ops/entries`); targeted Close and Partial. Its
-closed-trade hard delete (`DELETE /api/trades/:id`) is unchanged and unsafe
-(it removes realised P&L from the daily-loss window); an archive replacement
-is proposed, not built. It also keeps the Bot's push notifications, which
+control and pill (`POST /api/ops/entries`); targeted Close and Partial. The
+closed-trade hard delete is gone: `DELETE /api/trades/:id` answers 410
+`trade_delete_removed` and deletes nothing. **Archive** (`POST
+/api/trades/:id/archive`, `/restore`) hides a closed, fully resolved trade from
+History; it is presentation state only, so P&L, totals, the daily-loss window
+and the halt latch still count it. It also keeps the Bot's push notifications, which
 Trading Scene does not replace. Restrict the dashboard to an allow-list or VPN.
 
 ### Persisted execution evidence reads

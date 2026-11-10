@@ -23,6 +23,7 @@ export function buildControlCapabilities(): string[] {
     "manualPositionFull.v1", // manual SELL `positionFull` (OD-7)
     "operatorExit.v1", // C6/C7 trade-id-targeted operator exits
     EXECUTION_FEED_CAPABILITY, // P-81: GET /control/executions (confirmed fills)
+    "tradeArchive.v1", // POST /control/trades/:id/archive (Feature B; presentation state only)
   ];
   // C17/C18 + /enroll: only while ENROLLMENT_ENABLED (the public routes 404 otherwise).
   if (config.enrollmentEnabled) capabilities.push("enroll.v1");

@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { formatInvestmentLabel } from "../lib/investment.js";
 import { sumMoney } from "../lib/money.js";
 import { prisma } from "../lib/prisma.js";
+import { archivedWhere, findArchiveBlockers, type ArchiveBlock, type ArchivedFilter } from "./tradeArchive.js";
 
 /**
  * What the Platform's Bot section reads over the signed channel.
@@ -35,6 +36,10 @@ export async function readBotStats() {
   };
 }
 
+/**
+ * Every summary figure here counts ALL closed trades, archived ones included:
+ * Archive (Feature B) is presentation state and never changes a total.
+ */
 export async function readBotViewSummary() {
   const [stats, realizedRows] = await Promise.all([
     readBotStats(),
@@ -92,8 +97,15 @@ export async function listBotViewBots() {
 
 export async function listBotViewTrades(query: {
   status: "active" | "closed"; botId?: string; page: number; pageSize: number;
+  /** Feature B: History listing filter (default `exclude`). Listing only — never a summary. */
+  archived?: ArchivedFilter;
 }) {
-  const where = { status: query.status, ...(query.botId ? { botId: query.botId } : {}) };
+  const where = {
+    status: query.status,
+    ...(query.botId ? { botId: query.botId } : {}),
+    // An active trade is never archived; the filter applies to History only.
+    ...(query.status === "closed" ? archivedWhere(query.archived ?? "exclude") : {}),
+  };
   const [total, trades] = await Promise.all([
     prisma.smartTrade.count({ where }),
     prisma.smartTrade.findMany({
@@ -109,6 +121,7 @@ export async function listBotViewTrades(query: {
       },
     }),
   ]);
+  const blockers = query.status === "closed" ? await findArchiveBlockers(trades) : new Map<string, ArchiveBlock>();
   return {
     total,
     page: query.page,
@@ -135,6 +148,9 @@ export async function listBotViewTrades(query: {
         : null,
       createdAt: trade.createdAt,
       closedAt: trade.closedAt,
+      // Feature B: presentation state, and why Archive would be refused (null = allowed).
+      archivedAt: trade.archivedAt,
+      archiveBlocked: blockers.get(trade.id) ?? null,
     })),
   };
 }

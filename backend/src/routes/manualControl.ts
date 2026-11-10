@@ -45,6 +45,7 @@ import {
 import { countUnresolvedBotIntents, setBotStatus } from "./bots.js";
 import { buildControlCapabilities } from "../services/controlCapabilities.js";
 import { EXECUTION_FEED_MAX_LIMIT, readExecutionFeed } from "../services/executionEvents.js";
+import { TradeArchiveRefusal, setTradeArchived } from "../services/tradeArchive.js";
 
 export const manualControlRouter = Router();
 
@@ -111,6 +112,12 @@ const entriesSchema = z.discriminatedUnion("paused", [
 ]);
 
 const closeSchema = z.object({ actor: actorSchema }).strict();
+
+// Feature B: archive (`true`) or restore (`false`) a closed trade.
+const archiveSchema = z.object({
+  archived: z.boolean(),
+  actor: actorSchema,
+}).strict();
 
 const partialSchema = z.object({
   pct: z.number().int().min(1).max(99),
@@ -434,6 +441,31 @@ manualControlRouter.post("/trades/:id/partial-close", asyncHandler(async (req, r
   }, async (ctx) => ({ body: await partialCloseStrategyTrade(id, body.pct, {
     onAttemptOpened: (attemptId) => ctx.recordOrderRef({ attemptId }),
   }) }));
+}));
+
+// ── Feature B POST /trades/:id/archive ──────────────────────────────────────
+
+/**
+ * Archive or restore one closed trade — presentation state only, the same
+ * `setTradeArchived` the dashboard uses. Never touches P&L, the daily-loss
+ * window or the halt. Idempotent; a refusal (not closed, unresolved orders,
+ * needs attention) is typed and stored like any other command result.
+ */
+manualControlRouter.post("/trades/:id/archive", asyncHandler(async (req, res) => {
+  const id = pathId(req, res);
+  if (!id) return;
+  const body = parseBody(archiveSchema, req, res);
+  if (!body) return;
+  await runAndSend(req, res, {
+    kind: "trade_archive", target: `trade:${id}`, params: { archived: body.archived }, actor: body.actor,
+  }, async () => {
+    try {
+      return { body: await setTradeArchived(id, body.archived, `platform:${body.actor.platformUserId}`) };
+    } catch (e) {
+      if (e instanceof TradeArchiveRefusal) throw new ControlRefusal(e.status, e.code, e.message);
+      throw e;
+    }
+  });
 }));
 
 // ── C8 GET /commands/:requestId ─────────────────────────────────────────────
