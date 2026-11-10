@@ -319,6 +319,9 @@ model ManualOrder {
   /// X7: false while the last applied BUY snapshot could not be netted of its
   /// base-asset commission (the trades lookup failed); a sweep waits for it.
   fillsNetted           Boolean           @default(true)
+  /// P-81: DRY_RUN / TESTNET / MAINNET, decided when the row is created from
+  /// the same inputs that route the order. Null on older rows (read UNKNOWN).
+  executionEnvironment  String?
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
 
@@ -681,6 +684,9 @@ model ExchangeOrderAttempt {
   submittedAt     DateTime?
   /// Last exchange status observed for this attempt. Evidence, never a decision.
   exchangeStatus  String?
+  /// P-81: where this exit is routed, recorded when the attempt is opened.
+  /// Null on older rows (read UNKNOWN).
+  executionEnvironment String?
 
   @@unique([intentKey, attempt])
   @@index([intentKey, status])
@@ -738,6 +744,22 @@ model ExchangeEnrollment {
  * signal it gives. While no row exists, new events are v1 and stored v2 rows
  * are held aside (retried only when no v1 row is due).
  */
+/**
+ * P-81: one row per CONFIRMED execution (a fill the ledger has booked),
+ * appended in the same transaction that books it. Never updated or deleted
+ * by trading code (only aged out after 30 days). `seq` is the feed cursor the
+ * Platform reads with `GET /control/executions?after=`; `id` is the stable
+ * event identity (per fill), unique so a replayed booking can never append twice.
+ */
+model ExecutionEvent {
+  seq       Int      @id @default(autoincrement())
+  id        String   @unique
+  payload   String
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
 model PlatformCapability {
   name   String   @id
   seenAt DateTime

@@ -49,6 +49,8 @@ export interface OpenAttemptInput {
   sellPercent?: number;
   /** What to stamp on the trade if this exit ends up covering the position. */
   closedReason?: string;
+  /** P-81: where this exit is routed (DRY_RUN / TESTNET / MAINNET). */
+  executionEnvironment?: string;
 }
 
 /**
@@ -95,6 +97,7 @@ export async function openOrderAttempt(input: OpenAttemptInput): Promise<Exchang
         requestedBaseQty: input.requestedBaseQty,
         sellPercent: input.sellPercent,
         closedReason: input.closedReason,
+        executionEnvironment: input.executionEnvironment ?? null,
       }});
     } catch (error) {
       if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") {

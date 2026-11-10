@@ -1,4 +1,5 @@
 import { config, assertConfig } from "./config.js";
+import { pruneExecutionEvents } from "./services/executionEvents.js";
 import { createApp } from "./app.js";
 import { checkTakeProfitStopLoss } from "./services/smartTrade.js";
 import { detectManualCloses } from "./services/manualCloseSync.js";
@@ -58,6 +59,7 @@ async function pruneWebhookLogs(): Promise<void> {
 }
 pruneWebhookLogs().catch(console.error);
 startInterval("webhook-log-prune", 24 * 60 * 60 * 1000, pruneWebhookLogs);
+startInterval("execution-event-prune", 24 * 60 * 60 * 1000, async () => { await pruneExecutionEvents(); });
 
 // ─── Crash guard ──────────────────────────────────────────────────────────────
 // Node exits the process on an unhandled rejection. For a live trading daemon

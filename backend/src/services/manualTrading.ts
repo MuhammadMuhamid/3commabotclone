@@ -14,6 +14,8 @@ import {
 } from "./manualExchange.js";
 import { abandonOrderAttempt, settleOrderAttempt } from "./orderAttempt.js";
 import { sendExecutionNotification } from "./push.js";
+import { confirmedEnvironment, recordExecutionEvent } from "./executionEvents.js";
+import { manualExecutionEnvironment } from "./executionEnvironment.js";
 import { SUBMITTED_ABSENCE_SETTLE_MS } from "./strategyOrderIntent.js";
 import {
   type BotOrderOrigin, type BotRiskLimits, evaluateBotHalt, evaluateBotRisk, getBotRiskLimits,
@@ -328,19 +330,22 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
     let protectionState = manualProtectionState(
       before.takeProfitPrice, before.stopLossPrice, executedBase);
     let error: string | null = durableFlag(before.error);
+    // P-81: the position this fill belongs to, for the execution event.
+    let eventTradeId: string | null = before.side === "SELL" ? before.linkedPositionId : null;
 
     if (before.side === "BUY") {
       const existing = await tx.smartTrade.findUnique({ where: { manualOrderId: before.id } });
+      eventTradeId = existing?.id ?? null;
       const pricing = { entryPrice: snapshot.averagePrice, currentPrice: snapshot.averagePrice,
         buyPrice: snapshot.averagePrice, exchangeOrderId };
       if (!existing) {
         if (executedBase > 0) {
-          await tx.smartTrade.create({ data: { source: "manual", exchangeAccountId: before.exchangeAccountId,
+          eventTradeId = (await tx.smartTrade.create({ data: { source: "manual", exchangeAccountId: before.exchangeAccountId,
             botName: "Manual", pair: before.symbol, direction: "long", status: "active", ...pricing,
             quantity: executedBase, quoteSpent: snapshot.executedQuoteQuantity,
             clientOrderId: before.clientOrderId, manualTpPrice: before.takeProfitPrice,
             manualSlPrice: before.stopLossPrice, protectionType: "bot-managed", protectionState,
-            manualOrderId: before.id } });
+            manualOrderId: before.id } })).id;
         }
       } else if (existing.status === "active") {
         if (Math.abs(deltaBase) > QTY_EPSILON || deltaQuote > QTY_EPSILON) {
@@ -374,6 +379,7 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
           const late = await recordLateEntryFill(tx, before, existing, deltaBase, deltaQuote,
             snapshot, executedBase, !isComplete(status), engaged);
           error = late.message;
+          eventTradeId = late.positionId;
           afterCommit.push(() => {
             console.error(`[manual] ${late.message}`);
             void sendExecutionNotification({ side: "buy", symbol: before.symbol, quantity: deltaBase,
@@ -425,6 +431,31 @@ export async function applyManualSnapshot(orderId: string, snapshot: ManualOrder
         error = message;
         afterCommit.push(() => console.error(`[manual] ${message}`));
       }
+    }
+
+    /*
+     * P-81: one event per newly booked fill increment (I2 makes every snapshot
+     * a delta, so a duplicate, older or unchanged snapshot books nothing and
+     * records nothing). A netting correction only lowers the base figure of
+     * fills already announced: it is not an execution.
+     */
+    if (!nettingCorrection && deltaBase > QTY_EPSILON && deltaQuote > QTY_EPSILON) {
+      await recordExecutionEvent(tx, {
+        eventId: `manual:${before.id}:${snapshot.executedQuoteQuantity.toFixed(8)}`,
+        side: before.side === "BUY" ? "BUY" : "SELL",
+        symbol: before.symbol,
+        executedBaseQty: deltaBase,
+        executedQuoteQty: deltaQuote,
+        averagePrice: deltaQuote / deltaBase,
+        environment: confirmedEnvironment(before.executionEnvironment, { exchangeOrderId }),
+        source: before.side === "SELL" && before.protectionType === "bot-managed" ? "manual-protection" : "manual",
+        orderComplete: isComplete(status),
+        cumulativeBaseQty: executedBase,
+        botId: null,
+        botName: "Manual",
+        smartTradeId: eventTradeId,
+        exchangeOrderId: exchangeOrderId || null,
+      });
     }
 
     return tx.manualOrder.update({ where: { id: orderId }, data: {
@@ -1530,6 +1561,7 @@ async function submitManualOrderLocked(input: SubmitManualOrderInput, account: E
         shariahContext,
         clientOrderId: clientOrderId(`manual:${input.requestId}`),
         error: [exitNote, refreshFlag].filter((note) => note).join(" ") || null,
+        executionEnvironment: manualExecutionEnvironment(account, adapter),
       }});
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {

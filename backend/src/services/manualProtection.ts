@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { manualExecutionEnvironment } from "./executionEnvironment.js";
 import { prisma } from "../lib/prisma.js";
 import { acquireTradeClose, releaseTradeClose } from "../lib/tradeCloseLock.js";
 import type { ExchangeAccount, ManualOrder, SmartTrade } from "@prisma/client";
@@ -315,6 +316,9 @@ async function runManualExit(fresh: SmartTrade, plan: ManualExitPlan, exchange: 
    * for whatever exposure the fill did not remove.
    */
   const closedReason = plan.closedReason;
+  // P-81: recorded on the attempt and its order, never re-derived later.
+  const executionEnvironment = manualExecutionEnvironment(
+    await prisma.exchangeAccount.findUnique({ where: { id: accountId }, select: { testnet: true } }), exchange);
   const attempt = await openOrderAttempt({
     intentKey: plan.intentKey, symbol: fresh.pair, side: "SELL",
     // BOT-P1-5: owner and domain, so an unresolved manual exit is visible to
@@ -324,6 +328,7 @@ async function runManualExit(fresh: SmartTrade, plan: ManualExitPlan, exchange: 
     // one reports it, and applies nothing.
     smartTradeId: fresh.id, origin: plan.attemptOrigin,
     requestedBaseQty: Math.min(fresh.quantity, plan.sizeCap), closedReason,
+    executionEnvironment,
   });
   const requestId = `${plan.intentKey}#${attempt.attempt}`;
   let exit: ManualOrder | null = await prisma.manualOrder.findUnique({ where: { requestId } });
@@ -399,6 +404,7 @@ async function runManualExit(fresh: SmartTrade, plan: ManualExitPlan, exchange: 
         quantityType: "base", requestedBaseQty: capacity,
         protectionType: "bot-managed", protectionState: plan.rowState,
         clientOrderId: attempt.clientOrderId, error: plan.flag,
+        executionEnvironment: attempt.executionEnvironment ?? executionEnvironment,
       }});
       if (attempt.attempt > 1) {
         // The signal the old behaviour never gave. Re-arming is correct — an

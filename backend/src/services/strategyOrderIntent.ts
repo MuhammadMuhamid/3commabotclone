@@ -11,6 +11,7 @@ import {
   clearanceForFirstSubmission, clearanceForPersistedEntry, shariahScopeForBot,
 } from "./shariah.js";
 import { persistStrategyRealization } from "./realizationEvents.js";
+import { confirmedEnvironment, recordExecutionEvent } from "./executionEvents.js";
 import { executionEnvironmentForBot } from "./executionEnvironment.js";
 import {
   entriesPausedDecision, evaluateBotRisk, getBotRiskLimits, readBotRiskSnapshot, setBotTradingHalted,
@@ -562,6 +563,25 @@ async function applyAuthoritativeResult(
         }
       }
     }
+
+    // P-81: the confirmed execution, booked with the fill (never before it).
+    await recordExecutionEvent(tx, {
+      eventId: `strategy:${intent.id}`,
+      side: intent.side === "BUY" ? "BUY" : "SELL",
+      symbol: intent.symbol,
+      executedBaseQty: result.executedQty,
+      executedQuoteQty: result.cummulativeQuoteQty,
+      averagePrice: result.avgPrice,
+      environment: confirmedEnvironment(intent.executionEnvironment,
+        { simulated: result.simulated, exchangeOrderId: result.orderId }),
+      source: "strategy",
+      orderComplete: true,
+      cumulativeBaseQty: result.executedQty,
+      botId: intent.botId,
+      botName: intent.botName,
+      smartTradeId: smartTradeId ?? null,
+      exchangeOrderId: result.orderId || null,
+    });
 
     const reconciled = await tx.strategyOrderIntent.update({ where: { id: intent.id }, data: {
       ...resultData,

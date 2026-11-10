@@ -39,6 +39,7 @@ import {
   resolveSellQuantity, type BinanceClient,
 } from "./binance.js";
 import { config } from "../config.js";
+import { executionEnvironmentForBot } from "./executionEnvironment.js";
 import { sendExecutionNotification } from "./push.js";
 import { markOrderAttemptSubmitted, openOrderAttempt } from "./orderAttempt.js";
 import { applyExitFill, exitAttemptProbe, resolveUnresolvedExitAttempts } from "./exitSettlement.js";
@@ -342,6 +343,7 @@ export async function partialCloseStrategyTrade(
       intentKey: `partial:${trade.id}:${pct}`, symbol: trade.pair, side: "SELL",
       smartTradeId: trade.id, origin: "partial", sellPercent: pct,
       requestedBaseQty: sellQty, closedReason: "partial_close",
+      executionEnvironment: await executionEnvironmentForBot(trade.bot),
     });
     // Observation only, before anything is sent (R1).
     await observer.onAttemptOpened?.(attempt.id);
