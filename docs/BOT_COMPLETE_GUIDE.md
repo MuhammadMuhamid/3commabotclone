@@ -448,10 +448,11 @@ All dashboard routes are gated behind `requireAuth`. Login is two-step: password
 
 | Method | Path | Behavior |
 |--------|------|----------|
-| GET | `/` | Query `status` (`active` \| `history`→`closed`), optional `botId`; calls `refreshAllActivePnL()` first |
+| GET | `/` | Query `status` (`active` \| `history`→`closed`), optional `botId`, `archived` (`exclude` default \| `include` \| `only`, History only); each History row carries `archivedAt` and `archiveBlocked` (`{code, message}` or null) |
 | POST | `/:id/close` | `closeStrategyTrade` (shared with C6): strategy trades only; trade-id targeted; typed refusals `trade_manual`, `bot_deleted`, `exit_unresolved`, `exit_recent`; an unknown outcome answers 202 `pending` |
 | POST | `/:id/partial-close` | `partialCloseStrategyTrade` (shared with C7): `pct` 1–99; records a `PartialClose` row; refuses manual and deleted-bot trades; an uncertain exchange answer is 202 `pending`, never `exchange_rejected` |
-| DELETE | `/:id` | Removes a **closed** trade record (history cleanup; does not touch the exchange; an active trade is refused). Note: removing a closed trade also removes it from the daily-loss window |
+| POST | `/:id/archive`, `/:id/restore` | `setTradeArchived` (shared with the control channel): hides / shows a closed trade in History. Presentation state only: P&L, totals, the daily-loss window and the halt latch still count it. Idempotent. Refusals: 409 `trade_not_closed`, `trade_has_unresolved_orders` (open exit attempt, unresolved strategy intent, pending manual order or owed entry cancel), `trade_needs_attention` (an unresolved operator flag), 404 `not_found`, 400 `invalid_id`. Restore is always allowed |
+| DELETE | `/:id` | **Removed.** Answers 410 `trade_delete_removed` and deletes nothing (use Archive) |
 
 #### `webhooksRouter` — prefix `/api/webhooks`
 
@@ -497,6 +498,7 @@ Trading Scene's signed operator controls, mounted after `requireManualAuth`:
 | C5 | POST | `/bots/:id/status` | `setBotStatus`, a target state, plus `unresolvedIntents` |
 | C6 | POST | `/trades/:id/close` | `closeStrategyTrade` (§3.3) |
 | C7 | POST | `/trades/:id/partial-close` | `partialCloseStrategyTrade` (§3.3) |
+| Archive | POST | `/trades/:id/archive` | `setTradeArchived`: `{archived, actor}`; capability `tradeArchive.v1` |
 | C8 | GET | `/commands/:requestId` | The `BotControlCommand` row, with the live intent/attempt state when pending |
 | C9 | POST | `/entries` | OD-3 pause or resume new entries (BUYs only; exits, TP/SL, cancels and sweeps continue). Opt-in `cancelWorkingEntries` |
 | C10 to C14 | POST/GET/PATCH | `/bots`, `/bots/:id`, `/bots/:id/delete`, `/bots/:id/rotate-secret` | Bot admin through shared `services/botAdmin.ts` (also used by the Classic routes); the secret is in the live reply only |
@@ -1339,7 +1341,7 @@ below was re-checked against this checkout.
 | 7 | **Dedupe across replicas** | The close lock is in-process. Two backend replicas would not share it, and nothing prevents running two. |
 | 8 | **Pine** | `deploy/pine-exit-webhook.snippet.pine` is deprecated; use `deploy/SR-Trend-v5-custom-webhook-ALERTS.pine`. Its entry (`longSignal` BUY) alerts are refused (403) since direct TradingView BUY authority was removed; only its exits act. |
 | 9 | **Close on paused / deleted / same-pair trades** | Resolved in V3: Close and Partial are trade-id targeted. Only a deleted bot's trade and a manual trade are refused. This relaxation of a money path is covered by tests and an independent review, not by a real-exchange run. |
-| 10 | **Deleting a closed trade (P-70)** | `DELETE /api/trades/:id` on a closed trade removes it from the daily-loss window, lowering the figure. Operator-only; a guard is recommended, not built. |
+| 10 | **Deleting a closed trade (P-70)** | Resolved (Feature B): the delete was replaced by Archive, which is presentation state only. `DELETE /api/trades/:id` answers 410 and deletes nothing; an archived trade stays in P&L, totals and the daily-loss window. |
 | 11 | **Partly filled LIMIT when TP/SL fires (OD-1)** | Implemented as cancel first, then sweep (README, "A closed manual trade is never reopened"). No zero-exposure guarantee for an unknown cancel; Binance cancel semantics are unverified against a real exchange; legacy flagged entries are not auto-cancelled. |
 | 12 | **Halt and TP/SL (owner decision OD-3)** | A halt stops both TP/SL pollers. One switch for Platform and Bot, or a Bot halt that keeps TP/SL running, is an owner decision; not implemented. |
 | 13 | **`BotControlCommand` actor** | The actor on a control command is a claim signed by the Platform's key, not independent proof of who acted. |
