@@ -485,7 +485,16 @@ Trading Scene's signed operator controls, mounted after `requireManualAuth`:
 - **Authentication.** The manual HMAC covers method, path, timestamp, nonce,
   request id and body, with a ±60 s window and a durable single-use nonce.
 - **Control plane.** The prefix works while `MANUAL_TRADING_ENABLED=false`.
-- **Capabilities.** C0 lists `capabilities` (`entries.v1`, `bots.v1`, `accounts.v1`, `enroll.v1`, `operatorExit.v1`, `manualPositionFull.v1`); Trading Scene hides a feature the Bot does not list.
+- **Capabilities.** C0 lists `capabilities` (`entries.v1`, `bots.v1`, `accounts.v1`, `enroll.v1`, `operatorExit.v1`, `manualPositionFull.v1`, `executions.v1`, `tradeArchive.v1`); Trading Scene hides a feature the Bot does not list.
+- **Execution events (P-81, `executions.v1`).**
+  - **Source.** `ExecutionEvent` (migration `20261111090000_execution_events`) gets one immutable row per confirmed fill. It is appended in the transaction that books the fill:
+    - `applyAuthoritativeResult`, as `strategy:<intentId>`;
+    - `applyExitFill`, as `exit:<attemptId>`;
+    - `applyManualSnapshot`, one row per fill increment, as `manual:<orderId>:<cumulativeQuote>`.
+  - **Never an event:** a submitted, rejected, unknown, zero-fill or cancel-only order, or the X7 netting correction. A replayed booking appends nothing.
+  - **Environment.** `ManualOrder.executionEnvironment` and `ExchangeOrderAttempt.executionEnvironment` are new. They are recorded when the row is created; null (older rows) reads UNKNOWN. MAINNET needs a recorded MAINNET route and a non-`dry-` id.
+  - **Retention.** Rows are pruned after 30 days; the newest row always stays.
+  - **Classic Bot-origin push** (`services/push.ts`) is unchanged.
 - **Rate limits.** The routes have their own limiters: 120 reads and 60 writes
   per minute. A 429 carries `code: "bot_rate_limited"`; nothing was executed.
 
@@ -499,6 +508,7 @@ Trading Scene's signed operator controls, mounted after `requireManualAuth`:
 | C6 | POST | `/trades/:id/close` | `closeStrategyTrade` (§3.3) |
 | C7 | POST | `/trades/:id/partial-close` | `partialCloseStrategyTrade` (§3.3) |
 | Archive | POST | `/trades/:id/archive` | `setTradeArchived`: `{archived, actor}`; capability `tradeArchive.v1` |
+| Executions | GET | `/executions?after=&limit=` | `readExecutionFeed` (`services/executionEvents.ts`); capability `executions.v1`; see §"Execution events" below |
 | C8 | GET | `/commands/:requestId` | The `BotControlCommand` row, with the live intent/attempt state when pending |
 | C9 | POST | `/entries` | OD-3 pause or resume new entries (BUYs only; exits, TP/SL, cancels and sweeps continue). Opt-in `cancelWorkingEntries` |
 | C10 to C14 | POST/GET/PATCH | `/bots`, `/bots/:id`, `/bots/:id/delete`, `/bots/:id/rotate-secret` | Bot admin through shared `services/botAdmin.ts` (also used by the Classic routes); the secret is in the live reply only |

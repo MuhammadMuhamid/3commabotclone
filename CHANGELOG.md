@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-11-09 (closeout) — execution-event feed for Trading Scene push; Archive replaces closed-trade delete
+
+### Added: confirmed-execution feed `executions.v1` (P-81)
+
+- **Feed.** A new `ExecutionEvent` table (migration `20261111090000_execution_events`, additive) holds one immutable row per confirmed fill. It is written inside the transaction that books the fill:
+  - strategy BUY/SELL, including reconciler recovery;
+  - TP/SL and partial exits;
+  - manual orders, with one row per fill increment.
+- **Never an event:** submitted, rejected, unknown or zero-fill orders. Replays append nothing.
+- **Environment.** New nullable `ManualOrder.executionEnvironment` and `ExchangeOrderAttempt.executionEnvironment`, recorded at creation. Older rows read UNKNOWN; REAL needs a recorded MAINNET route and an exchange-assigned id.
+- **Read route.** `GET /api/manual-trading/control/executions?after=<seq>` is signed, read-only and control plane. Trading Scene polls it to send its own push notifications to opted-in admins.
+- **Independence.** The Bot never calls the Platform for this, and trading never waits on it.
+- **Classic push.** The Classic dashboard's own Bot-origin push is unchanged.
+
+### Changed: Archive replaces deleting a closed trade (P-70)
+
+- **Delete removed.** `DELETE /api/trades/:id` now answers 410 `trade_delete_removed` and deletes nothing. The old route could erase realised P&L and unlatch a daily-loss halt.
+- **Archive.** `POST /api/trades/:id/archive` and `/restore` (Classic), and the signed `POST /control/trades/:id/archive` (`tradeArchive.v1`), set `SmartTrade.archivedAt` (migration `20261111100000_trade_archive`). This is presentation state only: P&L, totals, the daily-loss window and the halt still count the trade.
+- **Refusals.** Archive refuses a trade that is not closed, has unresolved orders, or needs attention. Restore is always allowed.
+- **Classic History.** The trash icon is now Archive/Restore, with a "Show archived" toggle. Totals include archived trades.
+
 ## 2026-11-09 — Trading Scene control routes, uncertain outcomes, late fills, dashboard truth
 
 ### Added: signed control routes for Trading Scene's `/bot`
